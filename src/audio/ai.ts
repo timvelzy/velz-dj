@@ -234,6 +234,8 @@ export class LoopQueue {
         firstBeat: 0,
         tempoStability: 1,
         method: 'manual',
+        beats: [],
+        bpmCurve: [],
       };
       void spb;
     } else {

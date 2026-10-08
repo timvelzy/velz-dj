@@ -2,6 +2,12 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { engine } from './audio/engine';
 import { analyzeTrack } from './audio/analysis';
 import { detectKey } from './audio/keydetect';
+import {
+  parseNml,
+  findTraktorTrack,
+  refineTraktorGrid,
+  type TraktorCollection,
+} from './audio/traktor';
 import { DemoSynthBackend, LoopQueue, type GeneratedLoop } from './audio/ai';
 import type { TrackInfo } from './types';
 import Deck, { type DeckState } from './components/Deck';
@@ -48,7 +54,11 @@ export default function App() {
   const [aiLoop, setAiLoop] = useState<GeneratedLoop | null>(null);
   const [aiBuffer, setAiBuffer] = useState<AudioBuffer | null>(null);
   const [aiPlaying, setAiPlaying] = useState(false);
+  // Traktor collection.nml — source of truth for beat grids when imported
+  const [traktor, setTraktor] = useState<TraktorCollection | null>(null);
+  const [traktorFileName, setTraktorFileName] = useState('');
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const nmlInputRef = useRef<HTMLInputElement>(null);
 
   const queue = useMemo(() => new LoopQueue(new DemoSynthBackend()), []);
   const deckState = useCallback((k: 'A' | 'B') => (k === 'A' ? deckA : deckB), [deckA, deckB]);
@@ -83,7 +93,28 @@ export default function App() {
     engine.setMaster(masterDeck);
   }, [masterDeck]);
 
+  // ─── Traktor collection.nml import ────────────────────────────────────
+  const importNml = useCallback(async (file: File) => {
+    try {
+      const text = await file.text();
+      const collection = parseNml(text);
+      setTraktor(collection);
+      setTraktorFileName(file.name);
+      const withGrids = collection.tracks.filter((t) => t.grid.beats.length > 0).length;
+      alert(
+        `Imported ${collection.tracks.length} tracks from ${file.name} — ${withGrids} with beat grids.\n` +
+        'Matching tracks now load with your Traktor grids + hotcues, no re-analysis.',
+      );
+    } catch (e) {
+      console.error('NML import failed', e);
+      alert(`Could not parse ${file.name}: ${e instanceof Error ? e.message : e}`);
+    }
+  }, []);
+
   // ─── Track loading + analysis (ALWAYS runs — never hardcoded BPM) ─────────
+  // Traktor is the source of truth: a matching collection entry loads its
+  // hand-fixed grid + hotcues with zero re-analysis. Our analyzer is the
+  // fallback for tracks Traktor doesn't know.
   const loadTrack = useCallback(async (deckKey: 'A' | 'B', file: File) => {
     const deckId = `deck${deckKey}` as 'deckA' | 'deckB';
     const d = engine.decks.get(deckId);
@@ -94,35 +125,58 @@ export default function App() {
     try {
       const raw = await file.arrayBuffer();
       const buffer = await engine.ctx.decodeAudioData(raw);
-      const { grid, spectralData } = await analyzeTrack(buffer, (p) =>
-        setDeckState(deckKey, { ...deckInit(), analyzing: true, analysisProgress: p * 0.85 }),
-      );
-      const keyRes = detectKey(buffer);
-      const track: TrackInfo = {
-        id: `t${++trackSeq}`,
-        title: file.name.replace(/\.[^.]+$/, ''),
-        artist: '',
-        duration: buffer.duration,
-        bpm: grid.bpm,
-        key: keyRes.key,
-        beatGrid: grid,
-        spectralData,
-        file,
-      };
+      const traktorTrack = traktor ? findTraktorTrack(traktor, file) : undefined;
+
+      let track: TrackInfo;
+      let hotcues: (number | null)[] = [null, null, null, null];
+      if (traktorTrack) {
+        // Traktor wins — no analysis at all
+        const grid = refineTraktorGrid(traktorTrack, buffer.duration);
+        const keyRes = detectKey(buffer);
+        track = {
+          id: `t${++trackSeq}`,
+          title: traktorTrack.title || file.name.replace(/\.[^.]+$/, ''),
+          artist: traktorTrack.artist,
+          duration: buffer.duration,
+          bpm: grid.bpm,
+          key: keyRes.key,
+          beatGrid: grid,
+          file,
+        };
+        for (const hc of traktorTrack.hotcues) {
+          if (hc.slot < 4) hotcues[hc.slot] = hc.position;
+        }
+      } else {
+        const { grid, spectralData } = await analyzeTrack(buffer, (p) =>
+          setDeckState(deckKey, { ...deckInit(), analyzing: true, analysisProgress: p * 0.85 }),
+        );
+        const keyRes = detectKey(buffer);
+        track = {
+          id: `t${++trackSeq}`,
+          title: file.name.replace(/\.[^.]+$/, ''),
+          artist: '',
+          duration: buffer.duration,
+          bpm: grid.bpm,
+          key: keyRes.key,
+          beatGrid: grid,
+          spectralData,
+          file,
+        };
+      }
       d.buffer = buffer;
-      d.grid = grid;
+      d.grid = track.beatGrid;
       d.userTempo = 1;
       d.syncBaseTempo = 1;
       d.syncCorr = 1;
       d.nudge = 0;
       setTracks((ts) => [...ts.filter((t) => t.id !== track.id), track]);
-      setDeckState(deckKey, { ...deckInit(), track, buffer });
+      setDeckState(deckKey, { ...deckInit(), track, buffer, hotcues });
     } catch (e) {
       console.error('Load failed', e);
       setDeckState(deckKey, deckInit());
       alert(`Could not load ${file.name}: ${e instanceof Error ? e.message : e}`);
     }
-  }, [setDeckState]);
+  }, [setDeckState, traktor]);
 
   const loadLibraryTrack = useCallback((trackId: string, deckKey: 'A' | 'B') => {
     const t = tracks.find((x) => x.id === trackId);
@@ -135,28 +189,43 @@ export default function App() {
       alert('No audio files in that drop.');
       return;
     }
-    // Add to library without loading to a deck
+    // Add to library without loading to a deck.
+    // Traktor matches skip analysis entirely — the collection grid is the grid.
     void (async () => {
       for (const file of audio) {
         const raw = await file.arrayBuffer();
         const buffer = await engine.ctx.decodeAudioData(raw.slice(0));
-        const { grid, spectralData } = await analyzeTrack(buffer);
+        const traktorTrack = traktor ? findTraktorTrack(traktor, file) : undefined;
         const keyRes = detectKey(buffer);
-        const track: TrackInfo = {
-          id: `t${++trackSeq}`,
-          title: file.name.replace(/\.[^.]+$/, ''),
-          artist: '',
-          duration: buffer.duration,
-          bpm: grid.bpm,
-          key: keyRes.key,
-          beatGrid: grid,
-          spectralData,
-          file,
-        };
+        const track: TrackInfo = traktorTrack
+          ? {
+              id: `t${++trackSeq}`,
+              title: traktorTrack.title || file.name.replace(/\.[^.]+$/, ''),
+              artist: traktorTrack.artist,
+              duration: buffer.duration,
+              bpm: traktorTrack.grid.bpm,
+              key: keyRes.key,
+              beatGrid: refineTraktorGrid(traktorTrack, buffer.duration),
+              file,
+            }
+          : await (async () => {
+              const { grid, spectralData } = await analyzeTrack(buffer);
+              return {
+                id: `t${++trackSeq}`,
+                title: file.name.replace(/\.[^.]+$/, ''),
+                artist: '',
+                duration: buffer.duration,
+                bpm: grid.bpm,
+                key: keyRes.key,
+                beatGrid: grid,
+                spectralData,
+                file,
+              } satisfies TrackInfo;
+            })();
         setTracks((ts) => [...ts, track]);
       }
     })();
-  }, []);
+  }, [traktor]);
 
   // ─── Transport ────────────────────────────────────────────────────────────
   const togglePlay = useCallback((deckKey: 'A' | 'B') => {
@@ -389,6 +458,26 @@ export default function App() {
           >
             🎛 MIDI
           </button>
+          <button
+            onClick={() => nmlInputRef.current?.click()}
+            className="rounded bg-emerald-800 px-3 py-1.5 text-xs font-bold text-white hover:bg-emerald-700"
+            title="Import Traktor collection.nml — matching tracks use your Traktor beat grids + hotcues, no re-analysis"
+          >
+            ♻ Traktor
+          </button>
+          {traktor && (
+            <span
+              className="rounded bg-emerald-950 px-2 py-1 text-[10px] font-bold text-emerald-300"
+              title={traktorFileName}
+            >
+              {traktor.tracks.length} in collection
+            </span>
+          )}
+          <input
+            ref={nmlInputRef}
+            type="file" accept=".nml,application/xml,text/xml" className="hidden"
+            onChange={(e) => { if (e.target.files?.[0]) void importNml(e.target.files[0]); e.target.value = ''; }}
+          />
           <button
             onClick={() => fileInputRef.current?.click()}
             className="rounded bg-sky-700 px-3 py-1.5 text-xs font-bold text-white hover:bg-sky-600"

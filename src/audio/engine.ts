@@ -366,10 +366,11 @@ export class DJEngine {
     if (!d) return;
     d.syncOn = on;
     if (on) {
-      // Immediate tempo match
+      // Immediate tempo match against the slave's local BPM
       const mBpm = this.masterEffectiveBpm();
       if (mBpm && d.grid && d.grid.bpm > 0) {
-        d.syncBaseTempo = clamp(mBpm / d.grid.bpm, 0.5, 2);
+        const slaveBpm = this.bpmAtPosition(d, this.position(d.id));
+        d.syncBaseTempo = clamp(mBpm / slaveBpm, 0.5, 2);
       }
       d.syncCorr = 1;
       this.applyTempo(d);
@@ -398,21 +399,92 @@ export class DJEngine {
     if (!this.masterDeckId) return null;
     const d = this.decks.get(this.masterDeckId);
     if (!d || !d.grid || d.grid.bpm <= 0 || !d.source) return null;
-    const off = d.grid.downbeatOffset >= 0 ? d.grid.downbeatOffset : d.grid.firstBeat;
-    return (this.position(d.id) - off) / (60 / d.grid.bpm);
+    return this.beatsAtPosition(d, this.position(d.id));
+  }
+
+  /**
+   * Fractional beat position at a track time, using the beat map when
+   * available (Traktor import or analyzed beat map) and falling back to
+   * straight extrapolation from bpm + firstBeat.
+   */
+  private beatsAtPosition(d: DeckNodes, posSec: number): number {
+    const g = d.grid!;
+    if (g.beats.length >= 2) {
+      // Binary search the beat map
+      let lo = 0;
+      let hi = g.beats.length - 1;
+      if (posSec <= g.beats[0]) {
+        // Before the first mapped beat: extrapolate backward
+        const spb = 60 / g.bpm;
+        return (posSec - g.beats[0]) / spb;
+      }
+      if (posSec >= g.beats[hi]) {
+        const spb = 60 / (g.bpmCurve[hi - 1] ?? g.bpm);
+        return hi + (posSec - g.beats[hi]) / spb;
+      }
+      while (hi - lo > 1) {
+        const mid = (lo + hi) >> 1;
+        if (g.beats[mid] <= posSec) lo = mid; else hi = mid;
+      }
+      const spb = 60 / (g.bpmCurve[lo] ?? g.bpm);
+      return lo + (posSec - g.beats[lo]) / spb;
+    }
+    const off = g.downbeatOffset >= 0 ? g.downbeatOffset : g.firstBeat;
+    return (posSec - off) / (60 / g.bpm);
+  }
+
+  /**
+   * Instantaneous BPM at a track time from the beat map / curve.
+   * Falls back to the flat grid BPM.
+   */
+  private bpmAtPosition(d: DeckNodes, posSec: number): number {
+    const g = d.grid!;
+    if (g.beats.length >= 2 && g.bpmCurve.length > 0) {
+      let lo = 0;
+      let hi = g.beats.length - 1;
+      if (posSec <= g.beats[0] || posSec >= g.beats[hi]) return g.bpmCurve[0] ?? g.bpm;
+      while (hi - lo > 1) {
+        const mid = (lo + hi) >> 1;
+        if (g.beats[mid] <= posSec) lo = mid; else hi = mid;
+      }
+      return g.bpmCurve[lo] ?? g.bpm;
+    }
+    return g.bpm;
   }
 
   /**
    * One-shot bar alignment: given a desired cue offset on `id`, return the
    * nearest offset at/after it whose bar phase matches the master's.
+   * Uses the deck's beat map when available so drifting/flexible grids
+   * (Traktor, beat-mapped analysis) align on real beats, not flat math.
    */
   barAlignedOffset(id: string, cuePoint: number): number {
     const d = this.decks.get(id);
     const mBeats = this.masterBeats();
     if (!d || !d.grid || d.grid.bpm <= 0 || mBeats === null) return cuePoint;
+    const masterBarPhase = Math.round((((mBeats % 4) + 4) % 4)) % 4;
+
+    const beats = d.grid.beats;
+    if (beats.length > 0) {
+      // Binary search: first beat at/after cuePoint
+      let lo = 0, hi = beats.length - 1, first = beats.length;
+      while (lo <= hi) {
+        const mid = (lo + hi) >> 1;
+        if (beats[mid] >= cuePoint) { first = mid; hi = mid - 1; }
+        else lo = mid + 1;
+      }
+      if (first < beats.length) {
+        // Nearest beat at/after `first` whose bar phase matches the master
+        const phase = ((first % 4) + 4) % 4;
+        const delta = (masterBarPhase - phase + 4) % 4;
+        const j = first + delta;
+        if (j < beats.length) return beats[j];
+        // Ran off the end — fall through to flat math
+      }
+    }
+
     const sOff = d.grid.downbeatOffset >= 0 ? d.grid.downbeatOffset : d.grid.firstBeat;
     const sSpb = 60 / d.grid.bpm;
-    const masterBarPhase = ((mBeats % 4) + 4) % 4;
     const k = Math.ceil(((cuePoint - sOff) / sSpb - masterBarPhase) / 4);
     const target = sOff + (k * 4 + masterBarPhase) * sSpb;
     if (d.buffer && target >= d.buffer.duration) {
@@ -436,15 +508,18 @@ export class DJEngine {
 
     for (const d of this.decks.values()) {
       if (!d.syncOn || d.id === this.masterDeckId || !d.source || !d.grid || d.grid.bpm <= 0) continue;
-      // Tempo follow
-      const want = clamp(mBpm / d.grid.bpm, 0.5, 2);
+      // Tempo follow — against the slave's LOCAL bpm from its beat map,
+      // so drifting tracks stay matched instead of fighting a flat average.
+      const slaveBpm = this.bpmAtPosition(d, this.position(d.id));
+      const want = clamp(mBpm / slaveBpm, 0.5, 2);
       if (Math.abs(want - d.syncBaseTempo) > 0.0005) {
         this.rebase(d);
         d.syncBaseTempo = want;
       }
       // Phase correction (in beats, wrapped to ±2 = half a bar)
-      const sOff = d.grid.downbeatOffset >= 0 ? d.grid.downbeatOffset : d.grid.firstBeat;
-      const sBeats = (this.position(d.id) - sOff) / (60 / d.grid.bpm);
+      // Uses the slave's beat map when available, so drift inside the
+      // track doesn't fight the correction.
+      const sBeats = this.beatsAtPosition(d, this.position(d.id));
       const sBarPhase = ((sBeats % 4) + 4) % 4;
       const err = wrapCentered(sBarPhase - masterBarPhase, 4); // + = slave ahead
       const corr = clamp(1 - err * 0.15, 0.985, 1.015); // ±1.5% max correction

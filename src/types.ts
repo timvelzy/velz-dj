@@ -7,7 +7,7 @@ export interface SpectralData {
 }
 
 export interface BeatGrid {
-  /** Beats per minute (analyzed, at rate 1.0) */
+  /** Beats per minute (analyzed, at rate 1.0) — dominant/average tempo for display */
   bpm: number;
   /** Confidence 0..1 — below 0.4 the UI flags it for manual fixing */
   confidence: number;
@@ -18,7 +18,18 @@ export interface BeatGrid {
   /** Tempo stability 0..1 */
   tempoStability: number;
   /** How the grid was derived */
-  method: 'electronic' | 'general' | 'manual';
+  method: 'electronic' | 'general' | 'manual' | 'traktor';
+  /**
+   * Full beat timestamp map in seconds, from track start.
+   * When present, sync phase-locks against these real positions instead of
+   * extrapolating from bpm + firstBeat. Empty = fall back to extrapolation.
+   */
+  beats: number[];
+  /**
+   * Per-beat BPM curve, same length as beats (BPM between beats[i] and beats[i+1]).
+   * Captures tempo drift within the track. Empty = constant bpm.
+   */
+  bpmCurve: number[];
 }
 
 export interface TrackInfo {
