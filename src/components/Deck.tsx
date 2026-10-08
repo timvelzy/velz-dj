@@ -183,6 +183,24 @@ export default function Deck(props: DeckProps) {
             {bpmNow > 0 ? bpmNow.toFixed(1) : '—'}
             <span className="text-[10px] text-zinc-500"> BPM</span>
           </div>
+          {grid && grid.bpm > 0 && (
+            <div
+              className={`inline-block rounded px-1 text-[9px] font-bold uppercase tracking-wide ${
+                grid.method === 'traktor'
+                  ? 'bg-emerald-900 text-emerald-300'
+                  : grid.method === 'manual'
+                    ? 'bg-violet-900 text-violet-300'
+                    : 'bg-zinc-800 text-zinc-400'
+              }`}
+              title={
+                grid.method === 'traktor'
+                  ? `Traktor beat grid — ${grid.beats.length} mapped beats`
+                  : `Analyzed (${grid.method}) — ${grid.beats.length} mapped beats, ${Math.round(grid.confidence * 100)}% confidence`
+              }
+            >
+              {grid.method === 'traktor' ? '♻ Traktor' : grid.method}
+            </div>
+          )}
           <div className="font-mono">
             {elapsed} / {state.track ? fmtDur(state.track.duration) : '—'}
           </div>

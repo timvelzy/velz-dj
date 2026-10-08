@@ -79,6 +79,11 @@ export default function Library({ tracks, onAddFiles, onLoadToDeck }: LibraryPro
                     ) : t.beatGrid ? (
                       <span className={t.beatGrid.confidence < 0.4 ? 'text-amber-400' : ''}>
                         {t.beatGrid.bpm.toFixed(1)}
+                        {t.beatGrid.method === 'traktor' && (
+                          <span className="ml-1 rounded bg-emerald-900 px-1 text-[9px] font-bold text-emerald-300" title="Traktor beat grid">
+                            T
+                          </span>
+                        )}
                       </span>
                     ) : '—'}
                   </td>

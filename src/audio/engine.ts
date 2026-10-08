@@ -455,14 +455,36 @@ export class DJEngine {
   /**
    * One-shot bar alignment: given a desired cue offset on `id`, return the
    * nearest offset at/after it whose bar phase matches the master's.
+   * Uses the deck's beat map when available so drifting/flexible grids
+   * (Traktor, beat-mapped analysis) align on real beats, not flat math.
    */
   barAlignedOffset(id: string, cuePoint: number): number {
     const d = this.decks.get(id);
     const mBeats = this.masterBeats();
     if (!d || !d.grid || d.grid.bpm <= 0 || mBeats === null) return cuePoint;
+    const masterBarPhase = Math.round((((mBeats % 4) + 4) % 4)) % 4;
+
+    const beats = d.grid.beats;
+    if (beats.length > 0) {
+      // Binary search: first beat at/after cuePoint
+      let lo = 0, hi = beats.length - 1, first = beats.length;
+      while (lo <= hi) {
+        const mid = (lo + hi) >> 1;
+        if (beats[mid] >= cuePoint) { first = mid; hi = mid - 1; }
+        else lo = mid + 1;
+      }
+      if (first < beats.length) {
+        // Nearest beat at/after `first` whose bar phase matches the master
+        const phase = ((first % 4) + 4) % 4;
+        const delta = (masterBarPhase - phase + 4) % 4;
+        const j = first + delta;
+        if (j < beats.length) return beats[j];
+        // Ran off the end — fall through to flat math
+      }
+    }
+
     const sOff = d.grid.downbeatOffset >= 0 ? d.grid.downbeatOffset : d.grid.firstBeat;
     const sSpb = 60 / d.grid.bpm;
-    const masterBarPhase = ((mBeats % 4) + 4) % 4;
     const k = Math.ceil(((cuePoint - sOff) / sSpb - masterBarPhase) / 4);
     const target = sOff + (k * 4 + masterBarPhase) * sSpb;
     if (d.buffer && target >= d.buffer.duration) {

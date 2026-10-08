@@ -107,26 +107,52 @@ export default function Waveform({
       }
       ctx.globalAlpha = 1;
 
-      // Beat grid
+      // Beat grid — draw real mapped beats when we have them (Traktor grids,
+      // beat-mapped analysis), so the lines match what sync phase-locks to.
       if (grid && grid.bpm > 0) {
-        const spb = 60 / grid.bpm;
-        const off = grid.downbeatOffset >= 0 ? grid.downbeatOffset : grid.firstBeat;
-        const firstIdx = Math.max(0, Math.ceil((viewStart - off) / spb));
-        const lastIdx = Math.floor((viewEnd - off) / spb);
+        const beats = grid.beats;
         ctx.font = '9px monospace';
-        for (let i = firstIdx; i <= lastIdx; i++) {
-          const t = off + i * spb;
-          const x = t2x(t);
-          const isDown = i % 4 === 0;
-          ctx.strokeStyle = isDown ? 'rgba(255,255,255,0.55)' : 'rgba(255,255,255,0.18)';
-          ctx.lineWidth = isDown ? 1.5 : 1;
-          ctx.beginPath();
-          ctx.moveTo(x, 0);
-          ctx.lineTo(x, h);
-          ctx.stroke();
-          if (isDown && zoom > 40) {
-            ctx.fillStyle = 'rgba(255,255,255,0.5)';
-            ctx.fillText(`${Math.floor(i / 4) + 1}`, x + 3, 10);
+        if (beats.length > 0) {
+          // Binary search for the first beat in view
+          let lo = 0, hi = beats.length - 1, first = beats.length;
+          while (lo <= hi) {
+            const mid = (lo + hi) >> 1;
+            if (beats[mid] >= viewStart) { first = mid; hi = mid - 1; }
+            else lo = mid + 1;
+          }
+          for (let i = first; i < beats.length && beats[i] <= viewEnd; i++) {
+            const x = t2x(beats[i]);
+            const isDown = ((i % 4) + 4) % 4 === 0;
+            ctx.strokeStyle = isDown ? 'rgba(255,255,255,0.55)' : 'rgba(255,255,255,0.18)';
+            ctx.lineWidth = isDown ? 1.5 : 1;
+            ctx.beginPath();
+            ctx.moveTo(x, 0);
+            ctx.lineTo(x, h);
+            ctx.stroke();
+            if (isDown && zoom > 40) {
+              ctx.fillStyle = 'rgba(255,255,255,0.5)';
+              ctx.fillText(`${Math.floor(i / 4) + 1}`, x + 3, 10);
+            }
+          }
+        } else {
+          const spb = 60 / grid.bpm;
+          const off = grid.downbeatOffset >= 0 ? grid.downbeatOffset : grid.firstBeat;
+          const firstIdx = Math.max(0, Math.ceil((viewStart - off) / spb));
+          const lastIdx = Math.floor((viewEnd - off) / spb);
+          for (let i = firstIdx; i <= lastIdx; i++) {
+            const t = off + i * spb;
+            const x = t2x(t);
+            const isDown = i % 4 === 0;
+            ctx.strokeStyle = isDown ? 'rgba(255,255,255,0.55)' : 'rgba(255,255,255,0.18)';
+            ctx.lineWidth = isDown ? 1.5 : 1;
+            ctx.beginPath();
+            ctx.moveTo(x, 0);
+            ctx.lineTo(x, h);
+            ctx.stroke();
+            if (isDown && zoom > 40) {
+              ctx.fillStyle = 'rgba(255,255,255,0.5)';
+              ctx.fillText(`${Math.floor(i / 4) + 1}`, x + 3, 10);
+            }
           }
         }
         ctx.lineWidth = 1;

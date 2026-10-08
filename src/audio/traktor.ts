@@ -15,8 +15,9 @@
  *   </ENTRY>
  *
  * Cue positions (START/LEN) are in milliseconds. TYPE=4 marks beatgrid
- * anchors; the grid runs at TEMPO BPM from the first anchor. Multiple
- * TYPE=4 anchors = flexible beatgrid (tempo changes between anchors).
+ * anchors (downbeats); the grid runs at TEMPO BPM from the first anchor.
+ * Multiple TYPE=4 anchors = re-anchored grid: beat positions snap exactly
+ * to each marker, with the span subdivided at the nominal tempo.
  */
 
 import type { BeatGrid } from '../types';
@@ -66,9 +67,16 @@ function numAttr(el: Element, name: string, fallback = 0): number {
 
 /**
  * Build a BeatGrid from Traktor's tempo + grid anchors.
- * Anchors are TYPE=4 CUE_V2 markers sorted by position. Between anchors,
- * beats run at the BPM implied by the anchor spacing (flexible grid);
- * with a single anchor, beats run at the track BPM throughout.
+ * Anchors are TYPE=4 CUE_V2 markers sorted by position — each sits on a
+ * downbeat where the user (re-)anchored the grid. The beat count inside a
+ * span is derived from the nominal tempo: round(span / secondsPerBeat).
+ * This handles both phase re-anchor markers (the common case: same tempo,
+ * phase snapped at each marker) and markers placed a few beats apart.
+ *
+ * Limitation: if the track genuinely changes tempo between two markers,
+ * we approximate that span at the nominal tempo — NML doesn't encode the
+ * beat count, so the exact mid-span tempo is unrecoverable. Beat positions
+ * AT the markers are always exact.
  */
 function buildGridFromAnchors(
   bpm: number,
@@ -83,27 +91,21 @@ function buildGridFromAnchors(
     return { bpm, confidence: 0.5, downbeatOffset: -1, firstBeat: 0, tempoStability: 1, beats: [], bpmCurve: [] };
   }
 
-  if (anchors.length === 1) {
-    // Fixed grid: extrapolate at track BPM
-    const spb = 60 / bpm;
-    for (let t = firstBeat; t < durationHint; t += spb) beats.push(t);
-    for (let i = 0; i < Math.max(0, beats.length - 1); i++) bpmCurve.push(bpm);
-  } else {
-    // Flexible grid: each anchor-to-anchor span gets its own tempo.
-    // Traktor anchors sit on downbeats, so subdivide each span into 4 beats.
-    for (let a = 0; a < anchors.length; a++) {
-      const start = anchors[a];
-      const end = a + 1 < anchors.length ? anchors[a + 1] : durationHint;
-      const spanBeats = a + 1 < anchors.length ? 4 : Math.max(1, Math.round((end - start) / (60 / bpm)));
-      const localSpb = (end - start) / spanBeats;
-      const localBpm = 60 / localSpb;
-      for (let b = 0; b < spanBeats && start + b * localSpb < end; b++) {
-        beats.push(start + b * localSpb);
-        bpmCurve.push(localBpm);
-      }
+  // Every span — anchor-to-anchor or anchor-to-end — is subdivided at the
+  // nominal tempo, with endpoints snapped exactly to the markers.
+  const spbNominal = 60 / bpm;
+  for (let a = 0; a < anchors.length; a++) {
+    const start = anchors[a];
+    const end = a + 1 < anchors.length ? anchors[a + 1] : durationHint;
+    const spanBeats = Math.max(1, Math.round((end - start) / spbNominal));
+    const localSpb = (end - start) / spanBeats;
+    const localBpm = 60 / localSpb;
+    for (let b = 0; b < spanBeats && start + b * localSpb < end; b++) {
+      beats.push(start + b * localSpb);
+      bpmCurve.push(localBpm);
     }
-    if (bpmCurve.length >= beats.length) bpmCurve.length = Math.max(0, beats.length - 1);
   }
+  if (bpmCurve.length >= beats.length) bpmCurve.length = Math.max(0, beats.length - 1);
 
   // Downbeat = first anchor (Traktor grid markers sit on bar starts)
   return {
