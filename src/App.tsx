@@ -8,6 +8,11 @@ import {
   refineTraktorGrid,
   type TraktorCollection,
 } from './audio/traktor';
+import {
+  saveTraktorCollection,
+  loadTraktorCollection,
+  clearTraktorCollection,
+} from './audio/traktorStore';
 import { DemoSynthBackend, LoopQueue, type GeneratedLoop } from './audio/ai';
 import type { TrackInfo } from './types';
 import Deck, { type DeckState } from './components/Deck';
@@ -54,11 +59,30 @@ export default function App() {
   const [aiLoop, setAiLoop] = useState<GeneratedLoop | null>(null);
   const [aiBuffer, setAiBuffer] = useState<AudioBuffer | null>(null);
   const [aiPlaying, setAiPlaying] = useState(false);
-  // Traktor collection.nml — source of truth for beat grids when imported
+  // Traktor collection.nml — source of truth for beat grids when imported.
+  // Persisted in IndexedDB so the import survives reloads (import once).
   const [traktor, setTraktor] = useState<TraktorCollection | null>(null);
   const [traktorFileName, setTraktorFileName] = useState('');
+  const [traktorSavedAt, setTraktorSavedAt] = useState('');
   const fileInputRef = useRef<HTMLInputElement>(null);
   const nmlInputRef = useRef<HTMLInputElement>(null);
+
+  // Restore a previously imported Traktor collection on startup
+  useEffect(() => {
+    let cancelled = false;
+    loadTraktorCollection()
+      .then((loaded) => {
+        if (loaded && !cancelled) {
+          setTraktor(loaded.collection);
+          setTraktorFileName(loaded.fileName);
+          setTraktorSavedAt(loaded.savedAt);
+        }
+      })
+      .catch((e) => console.warn('Traktor collection restore failed', e));
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const queue = useMemo(() => new LoopQueue(new DemoSynthBackend()), []);
   const deckState = useCallback((k: 'A' | 'B') => (k === 'A' ? deckA : deckB), [deckA, deckB]);
@@ -100,15 +124,36 @@ export default function App() {
       const collection = parseNml(text);
       setTraktor(collection);
       setTraktorFileName(file.name);
+      const savedAt = new Date().toISOString();
+      setTraktorSavedAt(savedAt);
+      // Persist so this survives reloads — import once
+      try {
+        await saveTraktorCollection(collection, file.name);
+      } catch (e) {
+        console.warn('Could not persist Traktor collection (session-only)', e);
+      }
       const withGrids = collection.tracks.filter((t) => t.grid.beats.length > 0).length;
       alert(
         `Imported ${collection.tracks.length} tracks from ${file.name} — ${withGrids} with beat grids.\n` +
-        'Matching tracks now load with your Traktor grids + hotcues, no re-analysis.',
+        'Matching tracks now load with your Traktor grids + hotcues, no re-analysis.\n' +
+        'Saved in this browser — you won’t need to import again.',
       );
     } catch (e) {
       console.error('NML import failed', e);
       alert(`Could not parse ${file.name}: ${e instanceof Error ? e.message : e}`);
     }
+  }, []);
+
+  const forgetTraktor = useCallback(async () => {
+    if (!window.confirm('Forget the imported Traktor collection? Matching tracks will fall back to analysis.')) return;
+    try {
+      await clearTraktorCollection();
+    } catch (e) {
+      console.warn('Could not clear stored Traktor collection', e);
+    }
+    setTraktor(null);
+    setTraktorFileName('');
+    setTraktorSavedAt('');
   }, []);
 
   // ─── Track loading + analysis (ALWAYS runs — never hardcoded BPM) ─────────
@@ -467,10 +512,17 @@ export default function App() {
           </button>
           {traktor && (
             <span
-              className="rounded bg-emerald-950 px-2 py-1 text-[10px] font-bold text-emerald-300"
-              title={traktorFileName}
+              className="flex items-center gap-1 rounded bg-emerald-950 px-2 py-1 text-[10px] font-bold text-emerald-300"
+              title={`${traktorFileName}${traktorSavedAt ? ` · imported ${new Date(traktorSavedAt).toLocaleDateString()}` : ''} — click ✕ to forget (re-import to replace)`}
             >
               {traktor.tracks.length} in collection
+              <button
+                onClick={forgetTraktor}
+                className="ml-1 rounded px-0.5 text-emerald-500 hover:bg-emerald-900 hover:text-emerald-200"
+                title="Forget the imported Traktor collection"
+              >
+                ✕
+              </button>
             </span>
           )}
           <input
