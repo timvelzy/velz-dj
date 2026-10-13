@@ -82,6 +82,16 @@ export const BINDABLE_CONTROLS: BindableControl[] = [
   // AI deck
   { id: 'deckC.play', label: 'AI start / stop', group: 'AI Deck' },
   { id: 'deckC.drop', label: 'AI drop on bar', group: 'AI Deck' },
+  // Sampler
+  { id: 'sampler.pad1', label: 'Pad 1', group: 'Sampler' },
+  { id: 'sampler.pad2', label: 'Pad 2', group: 'Sampler' },
+  { id: 'sampler.pad3', label: 'Pad 3', group: 'Sampler' },
+  { id: 'sampler.pad4', label: 'Pad 4', group: 'Sampler' },
+  { id: 'sampler.pad5', label: 'Pad 5', group: 'Sampler' },
+  { id: 'sampler.pad6', label: 'Pad 6', group: 'Sampler' },
+  { id: 'sampler.pad7', label: 'Pad 7', group: 'Sampler' },
+  { id: 'sampler.pad8', label: 'Pad 8', group: 'Sampler' },
+  { id: 'sampler.quantize', label: 'Quantize toggle', group: 'Sampler' },
 ];
 
 /**

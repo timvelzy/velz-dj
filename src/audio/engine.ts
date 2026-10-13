@@ -55,6 +55,13 @@ const wrapCentered = (v: number, range: number) => {
   return r >= range / 2 ? r - range : r;
 };
 
+export interface SamplerPad {
+  buffer: AudioBuffer | null;
+  name: string;
+  volume: number; // 0..1
+  source: AudioBufferSourceNode | null; // currently playing voice (for retrigger)
+}
+
 export class DJEngine {
   ctx!: AudioContext;
   private workletReady = false;
@@ -69,6 +76,14 @@ export class DJEngine {
   private masterToPhones!: GainNode;
   private masterAnalyser!: AnalyserNode;
   private phonesAnalyser!: AnalyserNode;
+
+  // Sampler — 8 one-shot pads
+  private samplerBus!: GainNode;
+  private samplerMaster!: GainNode;
+  pads: SamplerPad[] = Array.from({ length: 8 }, () => ({
+    buffer: null, name: '', volume: 0.8, source: null,
+  }));
+  samplerQuantize = false;
 
   // Device routing (master + headphones on separate devices via setSinkId)
   private masterDest!: MediaStreamAudioDestinationNode;
@@ -93,6 +108,13 @@ export class DJEngine {
 
     this.masterBus = this.ctx.createGain();
     this.cueBus = this.ctx.createGain();
+
+    // Sampler bus → master (post-compressor, pre-master-gain for independent level)
+    this.samplerBus = this.ctx.createGain();
+    this.samplerMaster = this.ctx.createGain();
+    this.samplerMaster.gain.value = 0.9;
+    this.samplerBus.connect(this.samplerMaster);
+    this.samplerMaster.connect(this.masterBus);
 
     this.compressor = this.ctx.createDynamicsCompressor();
     this.compressor.threshold.value = -18;
@@ -713,6 +735,102 @@ export class DJEngine {
 
   phonesLevel(): number {
     return this.meter(this.phonesAnalyser);
+  }
+
+  // ─── Sampler ────────────────────────────────────────────────────────────
+
+  /** Load an AudioBuffer into a pad. Returns false if index out of range. */
+  loadSample(padIndex: number, buffer: AudioBuffer, name: string): boolean {
+    if (padIndex < 0 || padIndex > 7 || !this.ctx) return false;
+    const pad = this.pads[padIndex];
+    pad.buffer = buffer;
+    pad.name = name;
+    return true;
+  }
+
+  /** Decode and load from a File/Blob. */
+  async loadSampleFromFile(padIndex: number, file: File): Promise<boolean> {
+    if (!this.ctx) return false;
+    try {
+      const ab = await file.arrayBuffer();
+      const buffer = await this.ctx.decodeAudioData(ab);
+      return this.loadSample(padIndex, buffer, file.name.replace(/\.[^.]+$/, ''));
+    } catch {
+      return false;
+    }
+  }
+
+  clearSample(padIndex: number): void {
+    if (padIndex < 0 || padIndex > 7) return;
+    const pad = this.pads[padIndex];
+    try { pad.source?.stop(); } catch { /* already stopped */ }
+    pad.source = null;
+    pad.buffer = null;
+    pad.name = '';
+  }
+
+  setPadVolume(padIndex: number, v: number): void {
+    if (padIndex < 0 || padIndex > 7) return;
+    this.pads[padIndex].volume = Math.min(1, Math.max(0, v));
+  }
+
+  setSamplerMaster(v: number): void {
+    if (!this.ctx) return;
+    this.samplerMaster.gain.setTargetAtTime(Math.min(1, Math.max(0, v)), this.ctx.currentTime, 0.02);
+  }
+
+  setSamplerQuantize(on: boolean): void {
+    this.samplerQuantize = on;
+  }
+
+  /** Find seconds until the next beat on the reference deck (master or first playing deck with a grid). */
+  private secondsToNextBeat(): number | null {
+    const refId = (this.masterDeckId && this.isPlaying(this.masterDeckId))
+      ? this.masterDeckId
+      : [...this.decks.keys()].find((id) => this.isPlaying(id) && this.decks.get(id)?.grid);
+    if (!refId) return null;
+    const deck = this.decks.get(refId);
+    const grid = deck?.grid;
+    if (!deck || !grid?.beats?.length) return null;
+    const pos = this.position(refId); // track seconds
+    // Find first beat timestamp after current position
+    const next = grid.beats.find((b) => b > pos);
+    if (next == null) return null;
+    // Convert track-time delta to real-time delta (account for tempo rate)
+    const rate = deck.posRate || 1;
+    return Math.max(0, (next - pos) / rate);
+  }
+
+  /** Trigger a pad. Retriggers if already playing. Quantize snaps to next beat. */
+  triggerSample(padIndex: number): boolean {
+    if (!this.ctx || padIndex < 0 || padIndex > 7) return false;
+    const pad = this.pads[padIndex];
+    if (!pad.buffer) return false;
+
+    // Retrigger: stop current voice
+    try { pad.source?.stop(); } catch { /* already stopped */ }
+
+    let when = this.ctx.currentTime;
+    if (this.samplerQuantize) {
+      const delay = this.secondsToNextBeat();
+      if (delay != null) when += delay;
+    }
+
+    const src = this.ctx.createBufferSource();
+    src.buffer = pad.buffer;
+    const g = this.ctx.createGain();
+    g.gain.value = pad.volume;
+    src.connect(g);
+    g.connect(this.samplerBus);
+    src.onended = () => { if (pad.source === src) pad.source = null; };
+    pad.source = src;
+    try {
+      src.start(when);
+      return true;
+    } catch {
+      pad.source = null;
+      return false;
+    }
   }
 
   // ─── Devices ──────────────────────────────────────────────────────────────

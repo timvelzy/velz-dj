@@ -18,6 +18,7 @@ import type { TrackInfo } from './types';
 import Deck, { type DeckState } from './components/Deck';
 import Mixer, { defaultChannel, type ChannelState } from './components/Mixer';
 import AIDeck from './components/AIDeck';
+import Sampler from './components/Sampler';
 import Library from './components/Library';
 import GridEditorModal from './components/GridEditorModal';
 import MidiPanel from './components/MidiPanel';
@@ -595,8 +596,13 @@ export default function App() {
       </div>
 
       {/* Library */}
-      <div className="px-3 pb-6">
+      <div className="px-3 pb-3">
         <Library tracks={tracks} onAddFiles={addFiles} onLoadToDeck={loadLibraryTrack} />
+      </div>
+
+      {/* Sampler */}
+      <div className="px-3 pb-6 max-w-2xl">
+        <Sampler />
       </div>
 
       {/* Modals */}
