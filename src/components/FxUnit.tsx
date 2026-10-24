@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { engine, type FxBeatDivision, type FxType } from '../audio/engine';
 import { midi } from '../midi';
 import { Knob } from './Mixer';
@@ -25,6 +25,13 @@ export default function FxUnit() {
   const [wet, setWet] = useState(0.5);
   const [division, setDivision] = useState<FxBeatDivision>('1/2');
   const [params, setParams] = useState<[number, number, number]>([0.45, 0.5, 0]);
+  const enabledRef = useRef(true);
+
+  const toggleEnabled = () => {
+    enabledRef.current = !enabledRef.current;
+    setEnabled(enabledRef.current);
+    engine.setFxEnabled(enabledRef.current);
+  };
 
   const select = (t: FxType) => {
     const fx = EFFECTS.find((e) => e.id === t)!;
@@ -56,7 +63,7 @@ export default function FxUnit() {
       midi.registerControl('fx.param3', { kind: 'knob', onAbsolute: (v) => setParam(2, v) }),
       midi.registerControl('fx.enable', {
         kind: 'button',
-        onButton: (p) => { if (p) { setEnabled((on) => { engine.setFxEnabled(!on); return !on; }); } },
+        onButton: (p) => { if (p) toggleEnabled(); },
       }),
       midi.registerControl('fx.selectNext', { kind: 'button', onButton: (p) => { if (p) cycle(); } }),
     ];
@@ -70,7 +77,7 @@ export default function FxUnit() {
     <div className={`rounded-xl border p-3 ${enabled ? 'border-fuchsia-900/60 bg-zinc-950' : 'border-zinc-800 bg-zinc-950 opacity-80'}`}>
       <div className="flex flex-wrap items-center gap-3">
         <button
-          onClick={() => { setEnabled(!enabled); engine.setFxEnabled(!enabled); }}
+          onClick={toggleEnabled}
           className={`h-9 rounded-lg px-3 text-sm font-black ${enabled ? 'bg-fuchsia-600 text-white' : 'bg-zinc-800 text-zinc-500'}`}
           title="FX bypass"
         >

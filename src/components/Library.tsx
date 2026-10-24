@@ -1,5 +1,6 @@
-import { useRef } from 'react';
+import { useRef, useState } from 'react';
 import type { TrackInfo } from '../types';
+import { matchTracklist, type MatchResult } from '../audio/spotifyMatch';
 
 interface LibraryProps {
   tracks: TrackInfo[];
@@ -9,6 +10,8 @@ interface LibraryProps {
 
 export default function Library({ tracks, onAddFiles, onLoadToDeck }: LibraryProps) {
   const inputRef = useRef<HTMLInputElement>(null);
+  const [pasteText, setPasteText] = useState('');
+  const [matches, setMatches] = useState<MatchResult[] | null>(null);
 
   const fmtDur = (d: number) => {
     const m = Math.floor(d / 60);
@@ -112,6 +115,55 @@ export default function Library({ tracks, onAddFiles, onLoadToDeck }: LibraryPro
       <div className="mt-1 text-[11px] text-zinc-600">
         Tip: drag a row onto Deck A or B. Amber BPM = low analysis confidence — open “Edit beat grid” on the deck.
       </div>
+
+      {/* Spotify playlist matching — metadata only. Spotify audio can't
+          feed the decks (encrypted stream, no raw audio, terms), but a
+          pasted playlist tells you what you already own locally. */}
+      <details className="mt-2 rounded-lg border border-zinc-800 bg-zinc-900/40 p-2">
+        <summary className="cursor-pointer text-xs font-bold text-zinc-400">
+          🎧 Match a Spotify playlist against this library (metadata only)
+        </summary>
+        <div className="mt-2 flex flex-col gap-2">
+          <textarea
+            value={pasteText}
+            onChange={(e) => setPasteText(e.target.value)}
+            placeholder={'Paste playlist tracks, one per line:\nArtist - Title\nTitle – Artist'}
+            className="h-24 w-full rounded bg-zinc-900 p-2 font-mono text-xs text-zinc-200 placeholder:text-zinc-600"
+          />
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => setMatches(matchTracklist(pasteText, tracks))}
+              disabled={!pasteText.trim() || tracks.length === 0}
+              className="rounded bg-emerald-700 px-3 py-1 text-xs font-bold text-white disabled:opacity-40 hover:bg-emerald-600"
+            >
+              Match {tracks.length} local tracks
+            </button>
+            {matches && (
+              <span className="text-xs text-zinc-400">
+                {matches.filter((m) => m.status === 'matched').length} matched ·{' '}
+                {matches.filter((m) => m.status === 'missing').length} not in library
+              </span>
+            )}
+          </div>
+          {matches && (
+            <ul className="max-h-40 overflow-y-auto text-xs">
+              {matches.map((m, i) => (
+                <li key={i} className="flex gap-2 border-t border-zinc-900 py-1">
+                  <span>{m.status === 'matched' ? '✅' : '❌'}</span>
+                  <span className="min-w-0 flex-1 truncate text-zinc-300" title={m.line}>{m.line}</span>
+                  {m.status === 'matched' ? (
+                    <span className="truncate text-emerald-400" title={m.track!.title}>
+                      → {m.track!.artist ? `${m.track!.artist} — ` : ''}{m.track!.title}
+                    </span>
+                  ) : (
+                    <span className="text-zinc-600">not owned locally</span>
+                  )}
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      </details>
     </div>
   );
 }

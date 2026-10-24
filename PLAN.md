@@ -291,7 +291,12 @@ workflow-scoped token or via the web UI, per DEPLOY.md.
 Source: GitHub Actions) — documented in DEPLOY.md. SW caching a stale
 shell during dev — register only in prod builds.
 
-## Phase 8 — SPOTIFY, metadata only (LAST, optional) · status: TODO
+## Phase 8 — SPOTIFY, metadata only (LAST, optional) · status: DONE
+
+Implemented as specced: `spotifyMatch.ts` (normalize + token-overlap
+matching, pure functions) + a paste-a-playlist panel in the Library
+reporting matched/missing against local tracks. No playback integration
+attempted, per the hard boundary above.
 
 **Hard boundary:** Spotify's Web Playback SDK streams encrypted audio —
 no raw samples, no analysis, no sync, no recording, and Spotify's terms
