@@ -82,6 +82,16 @@ export const BINDABLE_CONTROLS: BindableControl[] = [
   // AI deck
   { id: 'deckC.play', label: 'AI start / stop', group: 'AI Deck' },
   { id: 'deckC.drop', label: 'AI drop on bar', group: 'AI Deck' },
+  // FX unit
+  { id: 'fx.wet', label: 'FX wet / dry', group: 'FX' },
+  { id: 'fx.param1', label: 'FX param 1', group: 'FX' },
+  { id: 'fx.param2', label: 'FX param 2', group: 'FX' },
+  { id: 'fx.param3', label: 'FX param 3', group: 'FX' },
+  { id: 'fx.sendA', label: 'FX send A', group: 'FX' },
+  { id: 'fx.sendB', label: 'FX send B', group: 'FX' },
+  { id: 'fx.sendC', label: 'FX send AI', group: 'FX' },
+  { id: 'fx.enable', label: 'FX on / bypass', group: 'FX' },
+  { id: 'fx.selectNext', label: 'FX next effect', group: 'FX' },
   // Sampler
   { id: 'sampler.pad1', label: 'Pad 1', group: 'Sampler' },
   { id: 'sampler.pad2', label: 'Pad 2', group: 'Sampler' },

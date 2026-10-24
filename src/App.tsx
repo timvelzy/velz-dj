@@ -21,6 +21,7 @@ import type { BandPeaks, TrackInfo } from './types';
 import Deck, { type DeckState } from './components/Deck';
 import Mixer, { defaultChannel, type ChannelState } from './components/Mixer';
 import AIDeck from './components/AIDeck';
+import FxUnit from './components/FxUnit';
 import Sampler from './components/Sampler';
 import Library from './components/Library';
 import GridEditorModal from './components/GridEditorModal';
@@ -708,6 +709,11 @@ export default function App() {
           <Deck {...deckProps('B')} />
         </div>
       </main>
+
+      {/* FX unit — beat-synced send/return */}
+      <div className="px-3 pb-3">
+        <FxUnit />
+      </div>
 
       {/* AI deck — full width */}
       <div className="px-3 pb-3">

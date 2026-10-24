@@ -30,6 +30,7 @@ export interface DeckNodes {
   filter: BiquadFilterNode;
   analyser: AnalyserNode;
   fader: GainNode;
+  fxSend: GainNode;
   xfade: GainNode;
   cueGain: GainNode;
   buffer: AudioBuffer | null;
@@ -76,6 +77,13 @@ export function pllCorrection(errBeats: number, integral: number): number {
   return clamp(1 - errBeats * 0.05 - integral, 0.98, 1.02);
 }
 
+export type FxType = 'delay' | 'reverb' | 'bitcrush' | 'flanger';
+export type FxBeatDivision = '1/4' | '3/8' | '1/2' | '3/4' | '1';
+/** Beat length of each division (a 1/4 note = 1 beat). */
+export const FX_DIVISION_BEATS: Record<FxBeatDivision, number> = {
+  '1/4': 1, '3/8': 1.5, '1/2': 2, '3/4': 3, '1': 4,
+};
+
 export interface SamplerPad {
   buffer: AudioBuffer | null;
   name: string;
@@ -97,6 +105,38 @@ export class DJEngine {
   private masterToPhones!: GainNode;
   private masterAnalyser!: AnalyserNode;
   private phonesAnalyser!: AnalyserNode;
+
+  // FX unit (Phase 6, specs/sampler-and-fx.md §2) — send/return
+  private fxBus!: GainNode;
+  private fxReturn!: GainNode;
+  private fxInDelay!: GainNode;
+  private fxInReverb!: GainNode;
+  private fxInCrush!: GainNode;
+  private fxInFlanger!: GainNode;
+  private fxDelay!: DelayNode;
+  private fxDelay2!: DelayNode;
+  private fxDelayFb!: GainNode;
+  private fxDelayTone!: BiquadFilterNode;
+  private fxDelay2Gain!: GainNode;
+  private fxConvolver!: ConvolverNode;
+  private fxReverbDamp!: BiquadFilterNode;
+  private fxReverbPre!: DelayNode;
+  private fxShaper!: WaveShaperNode;
+  private fxCrushTone!: BiquadFilterNode;
+  private fxCrushOut!: GainNode;
+  private fxFlangeDelay!: DelayNode;
+  private fxFlangeFb!: GainNode;
+  private fxFlangeLfo!: OscillatorNode;
+  private fxFlangeLfoGain!: GainNode;
+  fx = {
+    type: 'delay' as FxType,
+    wet: 0.5,
+    enabled: true,
+    division: '1/2' as FxBeatDivision,
+    params: [0.45, 0.5, 0] as [number, number, number],
+    bpm: 124, // last known tempo for FX timing
+  };
+  private fxIrTimer: number | null = null;
 
   // Sampler — 8 one-shot pads
   private samplerBus!: GainNode;
@@ -130,6 +170,7 @@ export class DJEngine {
 
     this.masterBus = this.ctx.createGain();
     this.cueBus = this.ctx.createGain();
+    this.buildFxUnit();
 
     // Sampler bus → master (post-compressor, pre-master-gain for independent level)
     this.samplerBus = this.ctx.createGain();
@@ -211,6 +252,219 @@ export class DJEngine {
     this.syncTimer = null;
   }
 
+  // ─── FX unit ────────────────────────────────────────────────────────────
+  // Send/return: [channel fader] → fxSend[N] → fxBus → [active effect] →
+  // fxReturn → masterBus (pre-limiter, so FX are recorded + limited too).
+
+  private buildFxUnit(): void {
+    const ctx = this.ctx;
+    this.fxBus = ctx.createGain();
+    this.fxReturn = ctx.createGain();
+    this.fxReturn.gain.value = this.fx.enabled ? this.fx.wet : 0;
+    this.fxReturn.connect(this.masterBus);
+
+    const mkIn = () => {
+      const g = ctx.createGain();
+      g.gain.value = 0;
+      this.fxBus.connect(g);
+      return g;
+    };
+    this.fxInDelay = mkIn();
+    this.fxInReverb = mkIn();
+    this.fxInCrush = mkIn();
+    this.fxInFlanger = mkIn();
+
+    // Delay: two taps (main + 0.75× echo) with filtered feedback
+    this.fxDelay = ctx.createDelay(4);
+    this.fxDelay2 = ctx.createDelay(4);
+    this.fxDelayFb = ctx.createGain();
+    this.fxDelayTone = ctx.createBiquadFilter();
+    this.fxDelayTone.type = 'lowpass';
+    this.fxDelay2Gain = ctx.createGain();
+    this.fxDelay2Gain.gain.value = 0;
+    this.fxInDelay.connect(this.fxDelay);
+    this.fxInDelay.connect(this.fxDelay2);
+    this.fxDelay.connect(this.fxDelayTone);
+    this.fxDelayTone.connect(this.fxDelayFb);
+    this.fxDelayFb.connect(this.fxDelay);
+    this.fxDelay.connect(this.fxReturn);
+    this.fxDelay2.connect(this.fxDelay2Gain);
+    this.fxDelay2Gain.connect(this.fxReturn);
+
+    // Reverb: predelay → damping lowpass → convolver (synthetic IR)
+    this.fxReverbPre = ctx.createDelay(0.25);
+    this.fxReverbPre.delayTime.value = 0;
+    this.fxReverbDamp = ctx.createBiquadFilter();
+    this.fxReverbDamp.type = 'lowpass';
+    this.fxReverbDamp.frequency.value = 9000;
+    this.fxConvolver = ctx.createConvolver();
+    this.fxConvolver.buffer = this.makeImpulse(2.8);
+    this.fxInReverb.connect(this.fxReverbPre);
+    this.fxReverbPre.connect(this.fxReverbDamp);
+    this.fxReverbDamp.connect(this.fxConvolver);
+    this.fxConvolver.connect(this.fxReturn);
+
+    // Bitcrush: waveshaper quantization → tone → out trim
+    this.fxShaper = ctx.createWaveShaper();
+    this.fxShaper.oversample = 'none';
+    this.fxCrushTone = ctx.createBiquadFilter();
+    this.fxCrushTone.type = 'lowpass';
+    this.fxCrushTone.frequency.value = 16000;
+    this.fxCrushOut = ctx.createGain();
+    this.fxInCrush.connect(this.fxShaper);
+    this.fxShaper.connect(this.fxCrushTone);
+    this.fxCrushTone.connect(this.fxCrushOut);
+    this.fxCrushOut.connect(this.fxReturn);
+
+    // Flanger: short modulated delay + feedback (wet-only; it combs
+    // against the dry channel path, classic send-flange)
+    this.fxFlangeDelay = ctx.createDelay(0.05);
+    this.fxFlangeDelay.delayTime.value = 0.003;
+    this.fxFlangeFb = ctx.createGain();
+    this.fxFlangeFb.gain.value = 0.35;
+    this.fxFlangeLfo = ctx.createOscillator();
+    this.fxFlangeLfo.type = 'sine';
+    this.fxFlangeLfoGain = ctx.createGain();
+    this.fxFlangeLfoGain.gain.value = 0.0012;
+    this.fxFlangeLfo.connect(this.fxFlangeLfoGain);
+    this.fxFlangeLfoGain.connect(this.fxFlangeDelay.delayTime);
+    this.fxInFlanger.connect(this.fxFlangeDelay);
+    this.fxFlangeDelay.connect(this.fxFlangeFb);
+    this.fxFlangeFb.connect(this.fxFlangeDelay);
+    this.fxFlangeDelay.connect(this.fxReturn);
+    this.fxFlangeLfo.start();
+
+    this.selectFx(this.fx.type);
+    this.applyFxParams();
+    this.updateFxTiming();
+  }
+
+  /** Synthetic exponentially-decaying noise impulse (no IR files to ship). */
+  private makeImpulse(decaySec: number): AudioBuffer {
+    const sr = this.ctx.sampleRate;
+    const len = Math.max(1, Math.floor(sr * decaySec));
+    const buf = this.ctx.createBuffer(2, len, sr);
+    for (let ch = 0; ch < 2; ch++) {
+      const data = buf.getChannelData(ch);
+      for (let i = 0; i < len; i++) {
+        data[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, 2.8);
+      }
+    }
+    return buf;
+  }
+
+  private crushCurve(bits: number): Float32Array {
+    const n = 1024;
+    const curve = new Float32Array(n);
+    const steps = Math.pow(2, bits - 1);
+    for (let i = 0; i < n; i++) {
+      const x = (i / (n - 1)) * 2 - 1;
+      curve[i] = Math.round(x * steps) / steps;
+    }
+    return curve;
+  }
+
+  selectFx(type: FxType): void {
+    this.fx.type = type;
+    if (!this.fxInDelay) return;
+    const t = this.ctx.currentTime;
+    const on = (g: GainNode, isOn: boolean) => g.gain.setTargetAtTime(isOn ? 1 : 0, t, 0.03);
+    on(this.fxInDelay, type === 'delay');
+    on(this.fxInReverb, type === 'reverb');
+    on(this.fxInCrush, type === 'bitcrush');
+    on(this.fxInFlanger, type === 'flanger');
+    this.applyFxParams();
+  }
+
+  setFxEnabled(on: boolean): void {
+    this.fx.enabled = on;
+    if (!this.fxReturn) return;
+    this.fxReturn.gain.setTargetAtTime(on ? this.fx.wet : 0, this.ctx.currentTime, 0.03);
+  }
+
+  setFxWet(v: number): void {
+    this.fx.wet = clamp(v, 0, 1);
+    if (!this.fxReturn) return;
+    if (this.fx.enabled) {
+      this.fxReturn.gain.setTargetAtTime(this.fx.wet, this.ctx.currentTime, 0.03);
+    }
+  }
+
+  setFxSend(channelId: string, v: number): void {
+    const d = this.decks.get(channelId);
+    if (!d) return;
+    d.fxSend.gain.setTargetAtTime(clamp(v, 0, 1), this.ctx.currentTime, 0.03);
+  }
+
+  setFxBeatDivision(div: FxBeatDivision): void {
+    this.fx.division = div;
+    this.updateFxTiming();
+  }
+
+  /**
+   * Generic param slots; meaning depends on the selected effect:
+   *  delay:    [feedback 0–0.85, loop tone, echo-2 level]
+   *  reverb:   [decay 0.4–6 s, damping, predelay 0–120 ms]
+   *  bitcrush: [bits 16→4, tone, out trim 0–1.5]
+   *  flanger:  [depth, feedback 0–0.7, rate × 0.25–2]
+   */
+  setFxParam(index: 0 | 1 | 2, v: number): void {
+    this.fx.params[index] = clamp(v, 0, 1);
+    this.applyFxParams();
+  }
+
+  private applyFxParams(): void {
+    if (!this.fxDelay) return;
+    const [p1, p2, p3] = this.fx.params;
+    const t = this.ctx.currentTime;
+    switch (this.fx.type) {
+      case 'delay':
+        this.fxDelayFb.gain.setTargetAtTime(p1 * 0.85, t, 0.03);
+        this.fxDelayTone.frequency.setTargetAtTime(800 * Math.pow(15, p2), t, 0.03);
+        this.fxDelay2Gain.gain.setTargetAtTime(p3 * 0.8, t, 0.03);
+        break;
+      case 'reverb': {
+        this.fxReverbDamp.frequency.setTargetAtTime(1500 * Math.pow(12, p2), t, 0.03);
+        this.fxReverbPre.delayTime.setTargetAtTime(p3 * 0.12, t, 0.03);
+        // Regenerate the IR at the new decay (debounced — knobs stream)
+        if (this.fxIrTimer !== null) window.clearTimeout(this.fxIrTimer);
+        const decay = 0.4 + p1 * 5.6;
+        this.fxIrTimer = window.setTimeout(() => {
+          this.fxConvolver.buffer = this.makeImpulse(decay);
+          this.fxIrTimer = null;
+        }, 150);
+        break;
+      }
+      case 'bitcrush': {
+        const bits = 16 - Math.round(p1 * 12);
+        this.fxShaper.curve = this.crushCurve(bits);
+        this.fxCrushTone.frequency.setTargetAtTime(1000 * Math.pow(18, p2), t, 0.03);
+        this.fxCrushOut.gain.setTargetAtTime(0.25 + p3 * 1.25, t, 0.03);
+        break;
+      }
+      case 'flanger':
+        this.fxFlangeLfoGain.gain.setTargetAtTime(p1 * 0.0025, t, 0.03);
+        this.fxFlangeFb.gain.setTargetAtTime(p2 * 0.7, t, 0.03);
+        this.updateFxTiming(); // p3 = rate multiplier
+        break;
+    }
+  }
+
+  /** Keep delay times + flanger rate locked to the master tempo. */
+  private updateFxTiming(): void {
+    if (!this.fxDelay) return;
+    const bpm = this.masterEffectiveBpm() || this.fx.bpm || 124;
+    this.fx.bpm = bpm;
+    const spb = 60 / bpm;
+    const beats = FX_DIVISION_BEATS[this.fx.division];
+    const t = this.ctx.currentTime;
+    this.fxDelay.delayTime.setTargetAtTime(Math.min(3.9, spb * beats), t, 0.05);
+    this.fxDelay2.delayTime.setTargetAtTime(Math.min(3.9, spb * beats * 0.75), t, 0.05);
+    const rateMult = 0.25 + this.fx.params[2] * 1.75;
+    const cycleSec = spb * beats * 2; // one full LFO sweep per 2 divisions
+    this.fxFlangeLfo.frequency.setTargetAtTime(rateMult / cycleSec, t, 0.05);
+  }
+
   // ─── Deck graph ───────────────────────────────────────────────────────────
 
   initDeck(id: string): void {
@@ -236,6 +490,8 @@ export class DJEngine {
     analyser.fftSize = 256;
     const fader = ctx.createGain();
     fader.gain.value = 0.8;
+    const fxSend = ctx.createGain();
+    fxSend.gain.value = 0; // FX sends start closed (Phase 6)
     const xfade = ctx.createGain();
     xfade.gain.value = 1;
     const cueGain = ctx.createGain();
@@ -243,6 +499,7 @@ export class DJEngine {
 
     // Chain: source → stretch → trim → EQ → filter → analyser → fader → xfade → masterBus
     //                                                              ↳ cueGain → cueBus
+    //                                                              ↳ fxSend → fxBus (post-fader send)
     stretch.connect(trim);
     trim.connect(eqLow);
     eqLow.connect(eqMid);
@@ -254,12 +511,14 @@ export class DJEngine {
     xfade.connect(this.masterBus);
     analyser.connect(cueGain);
     cueGain.connect(this.cueBus);
+    fader.connect(fxSend);
+    fxSend.connect(this.fxBus);
 
     this.decks.set(id, {
       id,
       source: null,
       stretch,
-      trim, eqLow, eqMid, eqHigh, filter, analyser, fader, xfade, cueGain,
+      trim, eqLow, eqMid, eqHigh, filter, analyser, fader, fxSend, xfade, cueGain,
       buffer: null,
       grid: null,
       posBase: 0, posBaseTime: ctx.currentTime, posRate: 1,
@@ -589,6 +848,8 @@ export class DJEngine {
         this.clearNudge(d.id);
       }
     }
+    // Beat-synced FX follow the master tempo live (Phase 6)
+    this.updateFxTiming();
 
     const mBpm = this.masterEffectiveBpm();
     const mBeats = this.masterBeats();

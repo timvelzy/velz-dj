@@ -13,13 +13,14 @@ export interface ChannelState {
   highKill: boolean;
   filter: number;
   cue: boolean;
+  fxSend: number;
 }
 
 export const defaultChannel = (): ChannelState => ({
   fader: 0.8, trim: 1,
   eqLow: 0, eqMid: 0, eqHigh: 0,
   lowKill: false, midKill: false, highKill: false,
-  filter: 0, cue: false,
+  filter: 0, cue: false, fxSend: 0,
 });
 
 interface MixerProps {
@@ -37,7 +38,7 @@ interface MixerProps {
   setPhonesLevel: (v: number) => void;
 }
 
-function Knob({ value, onChange, label, size = 44, min = -1, max = 1 }: {
+export function Knob({ value, onChange, label, size = 44, min = -1, max = 1 }: {
   value: number; onChange: (v: number) => void; label: string; size?: number; min?: number; max?: number;
 }) {
   const ref = useRef<HTMLDivElement>(null);
@@ -109,11 +110,12 @@ function Meter({ getLevel, color = '#22c55e' }: { getLevel: () => number; color?
   );
 }
 
-function ChannelStrip({ id, label, accent, ch, set, deckId, midiPrefix }: {
+function ChannelStrip({ id, label, accent, ch, set, deckId, midiPrefix, fxMidiId }: {
   id: string; label: string; accent: string;
   ch: ChannelState; set: (c: ChannelState) => void;
   deckId: 'deckA' | 'deckB' | 'deckC';
   midiPrefix: string;
+  fxMidiId: string;
 }) {
   const upd = (p: Partial<ChannelState>) => {
     const next = { ...ch, ...p };
@@ -125,6 +127,7 @@ function ChannelStrip({ id, label, accent, ch, set, deckId, midiPrefix }: {
     engine.setEq(deckId, 'high', next.eqHigh, next.highKill);
     engine.setFilter(deckId, next.filter);
     engine.setCue(deckId, next.cue);
+    engine.setFxSend(deckId, next.fxSend);
   };
 
   useEffect(() => {
@@ -135,10 +138,11 @@ function ChannelStrip({ id, label, accent, ch, set, deckId, midiPrefix }: {
       midi.registerControl(`${midiPrefix}.eqHigh`, { kind: 'knob', onAbsolute: (v) => upd({ eqHigh: v * 2 - 1 }) }),
       midi.registerControl(`${midiPrefix}.filter`, { kind: 'knob', onAbsolute: (v) => upd({ filter: v * 2 - 1 }) }),
       midi.registerControl(`${midiPrefix}.cue`, { kind: 'button', onButton: (p) => { if (p) upd({ cue: !ch.cue }); } }),
+      midi.registerControl(fxMidiId, { kind: 'knob', onAbsolute: (v) => upd({ fxSend: v }) }),
     ];
     return () => regs.forEach((u) => u());
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [midiPrefix, ch.cue, ch.fader, ch.eqLow, ch.eqMid, ch.eqHigh, ch.filter]);
+  }, [midiPrefix, fxMidiId, ch.cue, ch.fader, ch.eqLow, ch.eqMid, ch.eqHigh, ch.filter]);
 
   const killBtn = (active: boolean, onClick: () => void, label: string) => (
     <button
@@ -169,6 +173,7 @@ function ChannelStrip({ id, label, accent, ch, set, deckId, midiPrefix }: {
         {killBtn(ch.lowKill, () => upd({ lowKill: !ch.lowKill }), 'K')}
       </div>
       <Knob label="filter" value={ch.filter} onChange={(v) => upd({ filter: v })} size={44} />
+      <Knob label="fx send" value={ch.fxSend} min={0} max={1} onChange={(v) => upd({ fxSend: v })} size={36} />
       <Meter getLevel={() => engine.deckLevel(deckId)} />
       <input
         type="range" min={0} max={1} step={0.01} value={ch.fader}
@@ -213,9 +218,9 @@ export default function Mixer(props: MixerProps) {
     <div className="flex flex-col gap-2 rounded-xl border border-zinc-800 bg-zinc-950 p-3">
       <div className="text-center text-xs font-bold uppercase tracking-widest text-zinc-500">Mixer</div>
       <div className="flex justify-center gap-2">
-        <ChannelStrip id="chA" label="A" accent="#38bdf8" ch={props.chA} set={props.setChA} deckId="deckA" midiPrefix="mixer.chA" />
-        <ChannelStrip id="chC" label="AI" accent="#c084fc" ch={props.chC} set={props.setChC} deckId="deckC" midiPrefix="mixer.chC" />
-        <ChannelStrip id="chB" label="B" accent="#fb923c" ch={props.chB} set={props.setChB} deckId="deckB" midiPrefix="mixer.chB" />
+        <ChannelStrip id="chA" label="A" accent="#38bdf8" ch={props.chA} set={props.setChA} deckId="deckA" midiPrefix="mixer.chA" fxMidiId="fx.sendA" />
+        <ChannelStrip id="chC" label="AI" accent="#c084fc" ch={props.chC} set={props.setChC} deckId="deckC" midiPrefix="mixer.chC" fxMidiId="fx.sendC" />
+        <ChannelStrip id="chB" label="B" accent="#fb923c" ch={props.chB} set={props.setChB} deckId="deckB" midiPrefix="mixer.chB" fxMidiId="fx.sendB" />
       </div>
 
       {/* Crossfader */}

@@ -168,7 +168,16 @@ proportional bar-phase correction clamped to ±1.5%. Nudge is momentary
 **Risks:** PLL gain changes can oscillate — keep clamps (±1.5%) and the
 100 ms cadence; changes are deliberately incremental.
 
-## Phase 6 — BEAT-SYNCED FX · status: TODO
+## Phase 6 — BEAT-SYNCED FX · status: DONE
+
+Built to spec §2: post-fader sends per channel → shared FX bus → active
+effect → return into masterBus (pre-limiter, so FX record too). Delay
+(2 taps, filtered feedback), reverb (synthetic IR, debounced regen),
+bitcrush (waveshaper), flanger (LFO delay) — timing refreshed from
+`masterEffectiveBpm()` inside the 100 ms engine tick. FxUnit panel +
+per-strip send knobs + full MIDI learn set (`fx.*`). One deviation:
+`setFxParam` takes a slot index (0–2) instead of a string name; the
+per-effect meaning is documented on the method and labeled in the UI.
 
 Per `specs/sampler-and-fx.md` §2 (approved 2026-10-12), send/return design:
 
