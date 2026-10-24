@@ -42,7 +42,9 @@ export interface DeckNodes {
   userTempo: number; // from the tempo fader
   syncBaseTempo: number; // tempo-follow value while synced
   syncCorr: number; // continuous phase correction multiplier (~1.0)
+  syncInt: number; // PLL integral term (Phase 5), clamped ±0.003
   nudge: number; // momentary pitch bend, e.g. ±0.05
+  nudgeDeadline: number; // ctx time after which a nudge auto-expires (anti-latch)
   keyLock: boolean;
   syncOn: boolean;
   loopStart: number | null;
@@ -55,6 +57,24 @@ const wrapCentered = (v: number, range: number) => {
   const r = ((v % range) + range) % range;
   return r >= range / 2 ? r - range : r;
 };
+
+/**
+ * Signed phase error in beats between master and slave beat counters,
+ * wrapped to ±range/2 (range 4 = bar alignment). Positive = slave ahead.
+ * Pure — extracted for reasoning/tests (Phase 5).
+ */
+export function phaseErrorBeats(masterBeats: number, slaveBeats: number, range = 4): number {
+  return wrapCentered(slaveBeats - masterBeats, range);
+}
+
+/**
+ * PLL correction multiplier from a phase error + integral term.
+ * Proportional gain 0.05/beat gives a true proportional band (a 0.3-beat
+ * error → 1.5% pull, not a bang-bang clamp); hard clamp ±2%. Pure.
+ */
+export function pllCorrection(errBeats: number, integral: number): number {
+  return clamp(1 - errBeats * 0.05 - integral, 0.98, 1.02);
+}
 
 export interface SamplerPad {
   buffer: AudioBuffer | null;
@@ -243,7 +263,7 @@ export class DJEngine {
       buffer: null,
       grid: null,
       posBase: 0, posBaseTime: ctx.currentTime, posRate: 1,
-      userTempo: 1, syncBaseTempo: 1, syncCorr: 1, nudge: 0,
+      userTempo: 1, syncBaseTempo: 1, syncCorr: 1, syncInt: 0, nudge: 0, nudgeDeadline: 0,
       keyLock: true,
       syncOn: false,
       loopStart: null, loopEnd: null,
@@ -271,6 +291,18 @@ export class DJEngine {
       d.stretch.port.postMessage({ type: 'setTempo', tempo: 1 });
       if (d.source) d.source.playbackRate.setTargetAtTime(eff, t, 0.02);
     }
+    // Phase 5 fix: freeze the position integrator and adopt the NEW rate.
+    // Previously every caller rebased BEFORE mutating tempo values and
+    // posRate was never updated here, so after any tempo/nudge/sync change
+    // the playhead (and the PLL's phase readings) integrated at the stale
+    // rate until the next incidental rebase — the classic drift bug.
+    // Decks with a scheduled future start (AI drop-ins) keep their base;
+    // only their rate is updated.
+    if (d.posBaseTime <= t) {
+      d.posBase = this.position(d.id);
+      d.posBaseTime = t;
+    }
+    d.posRate = eff;
   }
 
   /** Rebase position integration before a rate change. */
@@ -341,6 +373,7 @@ export class DJEngine {
     d.source = null;
     d.posBaseTime = this.ctx.currentTime;
     d.nudge = 0; // momentary bend never survives a pause
+    d.nudgeDeadline = 0;
   }
 
   seek(id: string, time: number): void {
@@ -367,12 +400,22 @@ export class DJEngine {
     this.applyTempo(d);
   }
 
-  /** Momentary pitch bend. MUST be paired with clearNudge on release. */
+  /**
+   * Momentary pitch bend. Pair with clearNudge on release — and as a
+   * safety net every nudge carries a deadline (3 s for held bends, or an
+   * explicit hold time via setNudgeFor) that the sync tick enforces, so a
+   * lost pointer-up / MIDI note-off can never leave a bend latched.
+   */
   setNudge(id: string, amount: number): void {
+    this.setNudgeFor(id, amount, 3000);
+  }
+
+  setNudgeFor(id: string, amount: number, holdMs: number): void {
     const d = this.decks.get(id);
     if (!d || !d.source) return;
     this.rebase(d);
     d.nudge = amount;
+    d.nudgeDeadline = this.ctx.currentTime + holdMs / 1000;
     this.applyTempo(d);
   }
 
@@ -382,6 +425,7 @@ export class DJEngine {
     if (d.nudge === 0) return;
     this.rebase(d);
     d.nudge = 0;
+    d.nudgeDeadline = 0;
     this.applyTempo(d);
   }
 
@@ -405,11 +449,13 @@ export class DJEngine {
         d.syncBaseTempo = clamp(mBpm / slaveBpm, 0.5, 2);
       }
       d.syncCorr = 1;
+      d.syncInt = 0;
       this.applyTempo(d);
     } else {
       // Release: keep current effective tempo as the user tempo
       d.userTempo = clamp(this.effectiveTempo(d), 0.5, 2);
       d.syncCorr = 1;
+      d.syncInt = 0;
       this.applyTempo(d);
     }
   }
@@ -529,14 +575,24 @@ export class DJEngine {
 
   /**
    * Continuous sync: phase-locked loop. Every 100ms, for each synced slave,
-   * tempo-follow the master and apply a small proportional correction toward
-   * zero bar-phase error. This is what keeps decks from drifting apart.
+   * tempo-follow the master and apply a proportional + integral correction
+   * toward zero bar-phase error. This is what keeps decks from drifting
+   * apart. Phase 5: applyTempo is now called whenever EITHER the follow
+   * tempo or the correction changed (previously a follow-only change never
+   * reached the audio rate), and the P-gain is a true proportional band.
    */
   private syncTick(): void {
+    // Nudge anti-latch enforcement (runs even without a master)
+    const now = this.ctx.currentTime;
+    for (const d of this.decks.values()) {
+      if (d.nudge !== 0 && d.nudgeDeadline > 0 && now > d.nudgeDeadline) {
+        this.clearNudge(d.id);
+      }
+    }
+
     const mBpm = this.masterEffectiveBpm();
     const mBeats = this.masterBeats();
     if (!mBpm || mBeats === null) return;
-    const masterBarPhase = ((mBeats % 4) + 4) % 4;
 
     for (const d of this.decks.values()) {
       if (!d.syncOn || d.id === this.masterDeckId || !d.source || !d.grid || d.grid.bpm <= 0) continue;
@@ -544,23 +600,56 @@ export class DJEngine {
       // so drifting tracks stay matched instead of fighting a flat average.
       const slaveBpm = this.bpmAtPosition(d, this.position(d.id));
       const want = clamp(mBpm / slaveBpm, 0.5, 2);
+      let changed = false;
       if (Math.abs(want - d.syncBaseTempo) > 0.0005) {
-        this.rebase(d);
         d.syncBaseTempo = want;
+        changed = true;
       }
-      // Phase correction (in beats, wrapped to ±2 = half a bar)
-      // Uses the slave's beat map when available, so drift inside the
-      // track doesn't fight the correction.
+      // Phase correction from the beat counters (map-aware on both sides).
+      // Bar-range wrap: being a whole bar ahead is alignment, not error.
       const sBeats = this.beatsAtPosition(d, this.position(d.id));
-      const sBarPhase = ((sBeats % 4) + 4) % 4;
-      const err = wrapCentered(sBarPhase - masterBarPhase, 4); // + = slave ahead
-      const corr = clamp(1 - err * 0.15, 0.985, 1.015); // ±1.5% max correction
+      const err = phaseErrorBeats(mBeats, sBeats, 4); // + = slave ahead
+      // Integral term: slow accumulation kills steady-state offset.
+      d.syncInt = clamp(d.syncInt + err * 0.0015, -0.003, 0.003);
+      const corr = pllCorrection(err, d.syncInt);
       if (Math.abs(corr - d.syncCorr) > 0.0002) {
-        this.rebase(d);
         d.syncCorr = corr;
-        this.applyTempo(d);
+        changed = true;
       }
+      if (changed) this.applyTempo(d);
     }
+  }
+
+  /**
+   * Snap a track time to the nearest beat on this deck's grid (Phase 5
+   * quantize). Uses the beat map when present; falls back to
+   * bpm + firstBeat math. No grid → returns the time unchanged.
+   */
+  quantizeToBeat(id: string, time: number): number {
+    const d = this.decks.get(id);
+    if (!d || !d.grid || d.grid.bpm <= 0) return time;
+    const g = d.grid;
+    const dur = d.buffer?.duration ?? time;
+    let snapped = time;
+    if (g.beats.length > 0) {
+      // Binary search for the insertion point, then pick the nearer neighbor
+      let lo = 0;
+      let hi = g.beats.length - 1;
+      if (time <= g.beats[0]) snapped = g.beats[0];
+      else if (time >= g.beats[hi]) snapped = g.beats[hi];
+      else {
+        while (hi - lo > 1) {
+          const mid = (lo + hi) >> 1;
+          if (g.beats[mid] <= time) lo = mid; else hi = mid;
+        }
+        snapped = time - g.beats[lo] <= g.beats[hi] - time ? g.beats[lo] : g.beats[hi];
+      }
+    } else {
+      const off = g.downbeatOffset >= 0 ? g.downbeatOffset : g.firstBeat;
+      const spb = 60 / g.bpm;
+      snapped = off + Math.round((time - off) / spb) * spb;
+    }
+    return clamp(snapped, 0, dur);
   }
 
   /** Audio time (ctx.currentTime) of the next master bar boundary ≥ `minAheadSec` out. */
@@ -682,6 +771,7 @@ export class DJEngine {
       d.userTempo = tempo;
       d.syncBaseTempo = tempo;
       d.syncCorr = 1;
+      d.syncInt = 0;
       d.nudge = 0;
       d.loopStart = 0;
       d.loopEnd = buffer.duration;
@@ -701,6 +791,7 @@ export class DJEngine {
     d.userTempo = tempo;
     d.syncBaseTempo = tempo;
     d.syncCorr = 1;
+    d.syncInt = 0;
     d.nudge = 0;
     d.loopStart = 0;
     d.loopEnd = buffer.duration;

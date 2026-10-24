@@ -34,6 +34,7 @@ const deckInit = (): DeckState => ({
   tempo: 1,
   keyLock: true,
   syncActive: false,
+  quantize: true,
   hotcues: [null, null, null, null],
   loop: null,
   pendingLoopIn: null,
@@ -488,17 +489,22 @@ export default function App() {
           hcs[i] = engine.position(deckId);
           setDeckState(deckKey, { ...st, hotcues: hcs });
         } else if (hcs[i] !== null) {
-          const wasPlaying = engine.isPlaying(deckId);
-          engine.seek(deckId, hcs[i]!);
-          if (!wasPlaying) {
-            // stay paused at the hotcue
-          }
+          const target = st.quantize ? engine.quantizeToBeat(deckId, hcs[i]!) : hcs[i]!;
+          engine.seek(deckId, target);
         }
       },
-      onLoopIn: () => setDeckState(deckKey, { ...st, pendingLoopIn: engine.position(deckId) }),
+      onLoopIn: () => {
+        const raw = engine.position(deckId);
+        const t = st.quantize ? engine.quantizeToBeat(deckId, raw) : raw;
+        setDeckState(deckKey, { ...st, pendingLoopIn: t });
+      },
       onLoopOut: () => {
         if (st.pendingLoopIn !== null) {
-          const out = engine.position(deckId);
+          const raw = engine.position(deckId);
+          let out = st.quantize ? engine.quantizeToBeat(deckId, raw) : raw;
+          if (out <= st.pendingLoopIn + 0.05 && st.track && st.track.bpm > 0) {
+            out = st.pendingLoopIn + 60 / st.track.bpm; // at least one beat
+          }
           if (out > st.pendingLoopIn + 0.05) {
             engine.setLoop(deckId, st.pendingLoopIn, out);
             setDeckState(deckKey, { ...st, loop: { start: st.pendingLoopIn, end: out }, pendingLoopIn: null });
@@ -509,6 +515,7 @@ export default function App() {
         engine.setLoop(deckId, null, null);
         setDeckState(deckKey, { ...st, loop: null, pendingLoopIn: null });
       },
+      onToggleQuantize: () => setDeckState(deckKey, { ...st, quantize: !st.quantize }),
       onDropFiles: (files: FileList) => {
         const f = [...files].find((x) => x.type.startsWith('audio/') || /\.(mp3|wav|flac|ogg|m4a|aac)$/i.test(x.name));
         if (f) void loadTrack(deckKey, f);

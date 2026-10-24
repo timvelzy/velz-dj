@@ -12,6 +12,8 @@ export interface DeckState {
   tempo: number;
   keyLock: boolean;
   syncActive: boolean;
+  /** Quantize hotcue jumps + loop points to the beat grid (Phase 5). */
+  quantize: boolean;
   hotcues: (number | null)[];
   loop: { start: number; end: number } | null;
   pendingLoopIn: number | null;
@@ -36,6 +38,7 @@ interface DeckProps {
   onLoopIn: () => void;
   onLoopOut: () => void;
   onLoopExit: () => void;
+  onToggleQuantize: () => void;
   onDropFiles: (files: FileList) => void;
   onEditGrid: () => void;
   onNudgeStart: (dir: -1 | 1) => void;
@@ -122,8 +125,9 @@ export default function Deck(props: DeckProps) {
         kind: 'jog',
         onRelative: (d) => {
           if (engine.isPlaying(deckId)) {
-            engine.setNudge(deckId, clamp(d * 0.004, -0.06, 0.06));
-            window.setTimeout(() => engine.clearNudge(deckId), 60);
+            // Deadline-based nudge: repeated jog ticks extend it, and it
+            // can never latch if a clear is missed (Phase 5).
+            engine.setNudgeFor(deckId, clamp(d * 0.004, -0.06, 0.06), 120);
           } else {
             engine.seek(deckId, engine.position(deckId) + d * 0.02);
           }
@@ -351,6 +355,13 @@ export default function Deck(props: DeckProps) {
         <button onClick={props.onLoopIn} className="h-8 rounded bg-zinc-800 px-2 text-xs font-bold text-zinc-300 hover:bg-zinc-700">IN</button>
         <button onClick={props.onLoopOut} className="h-8 rounded bg-zinc-800 px-2 text-xs font-bold text-zinc-300 hover:bg-zinc-700">OUT</button>
         <button onClick={props.onLoopExit} className={`h-8 rounded px-2 text-xs font-bold ${state.loop ? 'bg-sky-600 text-white' : 'bg-zinc-800 text-zinc-500'}`}>LOOP</button>
+        <button
+          onClick={props.onToggleQuantize}
+          className={`h-8 rounded px-2 text-xs font-bold ${state.quantize ? 'bg-violet-600 text-white' : 'bg-zinc-800 text-zinc-500'}`}
+          title="Quantize: hotcue jumps and loop points snap to the beat grid"
+        >
+          Q
+        </button>
       </div>
     </div>
   );

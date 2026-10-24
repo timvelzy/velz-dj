@@ -120,7 +120,17 @@ Phase 5 (stale `posRate`).
 sidestepped by using a separate database. Spectral render cost is the same
 offline pass analysis already pays.
 
-## Phase 5 — SYNC ENGINE hardening · status: TODO
+## Phase 5 — SYNC ENGINE hardening · status: DONE
+
+Both bugs fixed: `applyTempo()` now freezes the integrator and adopts the
+new rate (scheduled future starts keep their base); `syncTick` applies
+tempo whenever follow OR correction changed. PLL now P(0.05/beat, ±2%
+clamp) + integral (±0.3%) via pure helpers `phaseErrorBeats` /
+`pllCorrection` (verified by reasoning: zero error → corr 1.0; +0.3 beat
+error → 1.5% pull; whole-bar offset wraps to 0 = aligned). Nudge carries
+an enforced deadline (jog 120 ms, held bends 3 s cap) — cannot latch.
+Quantize toggle per deck (default on): hotcue jumps + loop IN/OUT snap via
+`engine.quantizeToBeat` (beat map first, bpm math fallback).
 
 **Current state (better than feared):** `engine.syncTick()` already runs a
 100 ms PLL: tempo-follow against the slave's local beat-map BPM + a
