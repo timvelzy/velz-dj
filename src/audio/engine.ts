@@ -118,9 +118,17 @@ export class DJEngine {
     this.samplerBus.connect(this.samplerMaster);
     this.samplerMaster.connect(this.masterBus);
 
+    // Master limiter (Phase 3): the old −18 dB / 12:1 settings were a gentle
+    // bus compressor that still let summed decks clip the output (and any
+    // recording). Tuned as a transparent ceiling instead: −3 dB threshold,
+    // 20:1, hard knee, fast attack, musical release. Everything downstream
+    // (device out + recorder tap) is post-limiter by construction.
     this.compressor = this.ctx.createDynamicsCompressor();
-    this.compressor.threshold.value = -18;
-    this.compressor.ratio.value = 12;
+    this.compressor.threshold.value = -3;
+    this.compressor.knee.value = 0;
+    this.compressor.ratio.value = 20;
+    this.compressor.attack.value = 0.002;
+    this.compressor.release.value = 0.24;
 
     this.masterGain = this.ctx.createGain();
     this.masterGain.gain.value = 0.8;

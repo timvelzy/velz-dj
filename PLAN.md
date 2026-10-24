@@ -54,7 +54,12 @@ File System Access types — TS DOM lib doesn't ship them).
 - `showSaveFilePicker` must be called inside the click handler (user
   activation); the flow is: click REC → picker → worklet starts.
 
-## Phase 3 — MASTER SAFETY + ENGINE · status: TODO
+## Phase 3 — MASTER SAFETY + ENGINE · status: DONE
+
+As planned: compressor retuned to a −3 dB / 20:1 limiter, staging documented
+in README. WSOLA left untouched (evaluation in the scope above stands);
+Rubber Band WASM remains a proposal, not implemented (licensing + build
+weight vs. tribute deadline).
 
 **Scope**
 - Retune the existing master `DynamicsCompressor` into a transparent

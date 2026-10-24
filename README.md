@@ -15,6 +15,7 @@ Two-deck DJ mixer with real time-stretch beat sync and a full-width AI third cha
 - **Sample-accurate position tracking.** Track position integrates tempo over audio-clock time, so the waveform playhead never drifts when tempo/nudge change.
 - **Signal chain per deck:** source → WSOLA stretch → trim → 3-band EQ → filter → analyser → channel fader → crossfader → master bus (compressor → master gain); cue bus is isolated (cue gain only carries cued decks).
 - **Equal-power crossfader** (no center dip).
+- **Master limiter + gain staging.** Chain: deck trim (0–2×) → EQ (±~22 dB shelves) → channel fader → crossfader → master bus → **limiter** (−3 dB ceiling, 20:1) → master gain → out. Two decks at full fader + sampler can sum past 0 dBFS into the bus by design (that's what trim is for); the limiter is the hard ceiling, so the master meter can kiss red without the output — or a recording — ever clipping. If the limiter is constantly working, pull trims back, not the master.
 
 ## Analysis (never hardcoded)
 
