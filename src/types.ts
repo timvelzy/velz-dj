@@ -32,6 +32,26 @@ export interface BeatGrid {
   bpmCurve: number[];
 }
 
+/**
+ * Precomputed waveform peaks (Phase 4): per-bucket envelope + band energy,
+ * computed once at analysis time and cached in IndexedDB so waveforms are
+ * instant (and identical) on every subsequent load.
+ */
+export interface BandPeaks {
+  /** Buckets per second (100). */
+  rate: number;
+  duration: number;
+  /** Per-bucket min/max of the mono-summed signal. */
+  min: Float32Array;
+  max: Float32Array;
+  /** Per-bucket RMS of the mono-summed signal. */
+  rms: Float32Array;
+  /** Per-bucket peak energy per band (low <200Hz, mid ~1kHz, high >2kHz). */
+  low: Float32Array;
+  mid: Float32Array;
+  high: Float32Array;
+}
+
 export interface TrackInfo {
   id: string;
   title: string;
@@ -42,6 +62,8 @@ export interface TrackInfo {
   key?: string; // Camelot, e.g. "8A"
   beatGrid: BeatGrid;
   spectralData?: SpectralData;
+  /** Precomputed band peaks for waveform rendering (Phase 4, IDB-cached). */
+  peaks?: BandPeaks;
   /** Original file — kept so tracks can be (re)loaded to decks */
   file?: File;
   /** True while background analysis is still running */

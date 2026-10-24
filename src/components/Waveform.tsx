@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { engine } from '../audio/engine';
-import type { BeatGrid } from '../types';
+import type { BandPeaks, BeatGrid } from '../types';
+import { bandColor, resamplePeaks } from '../audio/peaks';
 
 interface WaveformProps {
   deckId: 'deckA' | 'deckB' | 'deckC';
@@ -11,6 +12,8 @@ interface WaveformProps {
   loop: { start: number; end: number } | null;
   hotcues: (number | null)[];
   onSeek: (t: number) => void;
+  /** Precomputed band peaks (Phase 4) — band-colored rendering when present. */
+  peaks?: BandPeaks | null;
 }
 
 /** Downsample peaks for fast canvas drawing. */
@@ -32,7 +35,7 @@ function computePeaks(buffer: AudioBuffer, buckets: number): Float32Array {
 }
 
 export default function Waveform({
-  deckId, buffer, grid, color, height = 96, loop, hotcues, onSeek,
+  deckId, buffer, grid, color, height = 96, loop, hotcues, onSeek, peaks: bandPeaks,
 }: WaveformProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
@@ -91,21 +94,40 @@ export default function Waveform({
         ctx.strokeRect(t2x(loop.start) + 0.5, 0.5, (loop.end - loop.start) * pxPerSec - 1, h - 1);
       }
 
-      // Waveform
+      // Waveform — band-colored when precomputed peaks are available
+      // (Rekordbox-style: color = dominant frequency band per bucket),
+      // otherwise the classic single-color mono peaks.
       const midY = h / 2;
-      ctx.fillStyle = color;
-      const bucketDur = dur / peaks.length;
-      const x0 = Math.max(0, Math.floor(viewStart / bucketDur));
-      const x1 = Math.min(peaks.length - 1, Math.ceil(viewEnd / bucketDur));
-      for (let b = x0; b <= x1; b++) {
-        const t = b * bucketDur;
-        const x = t2x(t);
-        const bw = Math.max(1, bucketDur * pxPerSec);
-        const amp = peaks[b] * (h / 2 - 4);
-        ctx.globalAlpha = 0.9;
-        ctx.fillRect(x, midY - amp, bw, amp * 2);
+      const halfH = h / 2 - 4;
+      if (bandPeaks) {
+        const rate = bandPeaks.rate;
+        const b0 = Math.max(0, Math.floor(viewStart * rate));
+        const b1 = Math.min(bandPeaks.min.length - 1, Math.ceil(viewEnd * rate));
+        const bw = Math.max(1, pxPerSec / rate);
+        for (let b = b0; b <= b1; b++) {
+          const x = t2x(b / rate);
+          const top = Math.min(1, bandPeaks.max[b]) * halfH;
+          const bot = Math.min(1, -bandPeaks.min[b]) * halfH;
+          ctx.fillStyle = bandColor(bandPeaks, b);
+          ctx.globalAlpha = 0.95;
+          ctx.fillRect(x, midY - top, bw, Math.max(1, top + bot));
+        }
+        ctx.globalAlpha = 1;
+      } else {
+        ctx.fillStyle = color;
+        const bucketDur = dur / peaks.length;
+        const x0 = Math.max(0, Math.floor(viewStart / bucketDur));
+        const x1 = Math.min(peaks.length - 1, Math.ceil(viewEnd / bucketDur));
+        for (let b = x0; b <= x1; b++) {
+          const t = b * bucketDur;
+          const x = t2x(t);
+          const bw = Math.max(1, bucketDur * pxPerSec);
+          const amp = peaks[b] * halfH;
+          ctx.globalAlpha = 0.9;
+          ctx.fillRect(x, midY - amp, bw, amp * 2);
+        }
+        ctx.globalAlpha = 1;
       }
-      ctx.globalAlpha = 1;
 
       // Beat grid — draw real mapped beats when we have them (Traktor grids,
       // beat-mapped analysis), so the lines match what sync phase-locks to.
@@ -182,7 +204,7 @@ export default function Waveform({
     };
     raf = requestAnimationFrame(draw);
     return () => cancelAnimationFrame(raf);
-  }, [buffer, peaks, grid, zoom, follow, deckId, color, height, loop, hotcues]);
+  }, [buffer, peaks, bandPeaks, grid, zoom, follow, deckId, color, height, loop, hotcues]);
 
   const seekFromEvent = (e: React.MouseEvent) => {
     if (!buffer || !wrapRef.current) return;
@@ -240,6 +262,131 @@ export default function Waveform({
           </span>
         )}
       </div>
+    </div>
+  );
+}
+
+// ─── Full-track overview strip ─────────────────────────────────────────────
+// Whole track at a glance: band-colored peaks (or mono fallback), downbeat
+// ticks, loop region, hotcues, played/unplayed shading and the playhead.
+// Click seeks. Drawn from the same cached BandPeaks as the main waveform.
+
+interface OverviewProps {
+  deckId: 'deckA' | 'deckB' | 'deckC';
+  buffer: AudioBuffer | null;
+  peaks: BandPeaks | null;
+  grid: BeatGrid | null;
+  color: string;
+  loop: { start: number; end: number } | null;
+  hotcues: (number | null)[];
+  onSeek: (t: number) => void;
+}
+
+export function OverviewWaveform({ deckId, buffer, peaks, grid, color, loop, hotcues, onSeek }: OverviewProps) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const wrapRef = useRef<HTMLDivElement>(null);
+  const height = 30;
+
+  const small = useMemo(() => (peaks ? resamplePeaks(peaks, 720) : null), [peaks]);
+  const mono = useMemo(
+    () => (buffer && !peaks ? computePeaks(buffer, 720) : null),
+    [buffer, peaks],
+  );
+
+  useEffect(() => {
+    let raf = 0;
+    const draw = () => {
+      raf = requestAnimationFrame(draw);
+      const canvas = canvasRef.current;
+      const wrap = wrapRef.current;
+      if (!canvas || !wrap || !buffer) return;
+      const w = wrap.clientWidth;
+      if (canvas.width !== w * 2) {
+        canvas.width = w * 2;
+        canvas.height = height * 2;
+      }
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return;
+      ctx.setTransform(2, 0, 0, 2, 0, 0);
+      const dur = buffer.duration;
+      const pos = engine.position(deckId);
+      const t2x = (t: number) => (t / dur) * w;
+      const midY = height / 2;
+
+      ctx.fillStyle = '#0a0e14';
+      ctx.fillRect(0, 0, w, height);
+
+      if (loop && loop.end > loop.start) {
+        ctx.fillStyle = 'rgba(56,189,248,0.15)';
+        ctx.fillRect(t2x(loop.start), 0, t2x(loop.end) - t2x(loop.start), height);
+      }
+
+      if (small) {
+        const n = small.min.length;
+        const bw = Math.max(1, w / n);
+        for (let b = 0; b < n; b++) {
+          const x = (b / n) * w;
+          const top = Math.min(1, small.max[b]) * (midY - 2);
+          const bot = Math.min(1, -small.min[b]) * (midY - 2);
+          ctx.fillStyle = bandColor(small, b);
+          ctx.globalAlpha = 0.9;
+          ctx.fillRect(x, midY - top, bw, Math.max(1, top + bot));
+        }
+        ctx.globalAlpha = 1;
+      } else if (mono) {
+        ctx.fillStyle = color;
+        const n = mono.length;
+        const bw = Math.max(1, w / n);
+        for (let b = 0; b < n; b++) {
+          const amp = mono[b] * (midY - 2);
+          ctx.globalAlpha = 0.85;
+          ctx.fillRect((b / n) * w, midY - amp, bw, Math.max(1, amp * 2));
+        }
+        ctx.globalAlpha = 1;
+      }
+
+      // Downbeat ticks (every 4th mapped beat)
+      if (grid && grid.beats.length > 0) {
+        ctx.fillStyle = 'rgba(255,255,255,0.35)';
+        for (let i = 0; i < grid.beats.length; i += 4) {
+          ctx.fillRect(t2x(grid.beats[i]), 0, 1, 4);
+        }
+      }
+
+      // Unplayed region dimmed
+      ctx.fillStyle = 'rgba(0,0,0,0.45)';
+      ctx.fillRect(t2x(pos), 0, w - t2x(pos), height);
+
+      // Hotcues
+      hotcues.forEach((hc, i) => {
+        if (hc === null) return;
+        ctx.fillStyle = ['#f472b6', '#fbbf24', '#a3e635', '#22d3ee'][i % 4];
+        ctx.fillRect(t2x(hc) - 1, 0, 2, height);
+      });
+
+      // Playhead
+      ctx.fillStyle = '#fff';
+      ctx.fillRect(t2x(pos) - 0.5, 0, 1.5, height);
+    };
+    raf = requestAnimationFrame(draw);
+    return () => cancelAnimationFrame(raf);
+  }, [buffer, small, mono, grid, deckId, color, loop, hotcues]);
+
+  if (!buffer) return null;
+  return (
+    <div
+      ref={wrapRef}
+      className="relative cursor-pointer rounded border border-zinc-800"
+      style={{ height }}
+      title="Overview — click to seek"
+      onClick={(e) => {
+        const rect = wrapRef.current?.getBoundingClientRect();
+        if (!rect || !buffer) return;
+        const t = ((e.clientX - rect.left) / rect.width) * buffer.duration;
+        onSeek(Math.max(0, Math.min(buffer.duration, t)));
+      }}
+    >
+      <canvas ref={canvasRef} className="h-full w-full" />
     </div>
   );
 }

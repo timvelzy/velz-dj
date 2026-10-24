@@ -15,7 +15,9 @@ import {
 } from './audio/traktorStore';
 import { DemoSynthBackend, LoopQueue, type GeneratedLoop } from './audio/ai';
 import { SetRecorder, downloadBlob, formatElapsed, type TracklistEntry } from './audio/recorder';
-import type { TrackInfo } from './types';
+import { computeBandPeaks, peaksKey } from './audio/peaks';
+import { loadPeaks, savePeaks } from './audio/peaksStore';
+import type { BandPeaks, TrackInfo } from './types';
 import Deck, { type DeckState } from './components/Deck';
 import Mixer, { defaultChannel, type ChannelState } from './components/Mixer';
 import AIDeck from './components/AIDeck';
@@ -97,6 +99,32 @@ export default function App() {
   const setDeckState = useCallback((k: 'A' | 'B', s: DeckState) => {
     (k === 'A' ? setDeckA : setDeckB)(s);
   }, []);
+  const deckStateRef = useRef({ A: deckA, B: deckB });
+  deckStateRef.current = { A: deckA, B: deckB };
+
+  // ─── Waveform peaks (Phase 4): attach computed/cached peaks to a track
+  // wherever it lives (library + either deck), computing at most once.
+  const applyPeaks = useCallback((trackId: string, peaks: BandPeaks) => {
+    setTracks((ts) => ts.map((t) => (t.id === trackId ? { ...t, peaks } : t)));
+    (['A', 'B'] as const).forEach((k) => {
+      const st = deckStateRef.current[k];
+      if (st.track?.id === trackId) setDeckState(k, { ...st, track: { ...st.track, peaks } });
+    });
+  }, [setDeckState]);
+
+  const ensurePeaks = useCallback((track: TrackInfo, buffer: AudioBuffer) => {
+    if (track.peaks) return;
+    const key = track.file ? peaksKey(track.file) : null;
+    void (async () => {
+      if (key) {
+        const cached = await loadPeaks(key);
+        if (cached) { applyPeaks(track.id, cached); return; }
+      }
+      const peaks = await computeBandPeaks(buffer, track.spectralData);
+      if (key) await savePeaks(key, peaks);
+      applyPeaks(track.id, peaks);
+    })().catch((e) => console.warn('Peaks computation failed', e));
+  }, [applyPeaks]);
 
   const start = async () => {
     setStarting(true);
@@ -291,12 +319,13 @@ export default function App() {
       recorderRef.current?.noteTrack({
         deck: deckKey, title: track.title, artist: track.artist, bpm: track.bpm, key: track.key ?? '',
       });
+      ensurePeaks(track, buffer);
     } catch (e) {
       console.error('Load failed', e);
       setDeckState(deckKey, deckInit());
       alert(`Could not load ${file.name}: ${e instanceof Error ? e.message : e}`);
     }
-  }, [setDeckState, traktor]);
+  }, [setDeckState, traktor, ensurePeaks]);
 
   const loadLibraryTrack = useCallback((trackId: string, deckKey: 'A' | 'B') => {
     const t = tracks.find((x) => x.id === trackId);
@@ -343,9 +372,10 @@ export default function App() {
               } satisfies TrackInfo;
             })();
         setTracks((ts) => [...ts, track]);
+        ensurePeaks(track, buffer);
       }
     })();
-  }, [traktor]);
+  }, [traktor, ensurePeaks]);
 
   // ─── Transport ────────────────────────────────────────────────────────────
   const togglePlay = useCallback((deckKey: 'A' | 'B') => {

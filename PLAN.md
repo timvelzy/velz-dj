@@ -84,7 +84,13 @@ weight vs. tribute deadline).
 **Risks:** Limiter pumping on already-mastered tracks if threshold too low —
 −3 dB with fast attack/slow release is conservative; peaks only.
 
-## Phase 4 — WAVEFORMS · status: TODO
+## Phase 4 — WAVEFORMS · status: DONE
+
+BandPeaks (min/max + RMS + low/mid/high at 100 buckets/s) computed at load,
+cached in IndexedDB (`velz-dj-peaks`), band-colored scrolling waveform +
+full-track overview strip with grid/loop/hotcue markers and played shading.
+Mono fallback retained for the AI deck. Playhead accuracy fix lands with
+Phase 5 (stale `posRate`).
 
 **Scope**
 - `src/audio/peaks.ts`: compute per-track band peaks at analysis time —

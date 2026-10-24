@@ -336,7 +336,7 @@ async function detectGeneral(buffer: AudioBuffer): Promise<Omit<BeatGrid, 'metho
 
 // ─── Spectral data (real 3-band, via OfflineAudioContext) ────────────────────
 
-async function analyzeSpectrum(buffer: AudioBuffer): Promise<SpectralData | undefined> {
+export async function analyzeSpectrum(buffer: AudioBuffer): Promise<SpectralData | undefined> {
   try {
     const targetRate = 100;
     const renderRate = 8000;

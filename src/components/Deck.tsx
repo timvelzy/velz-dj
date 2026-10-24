@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { engine } from '../audio/engine';
 import { midi } from '../midi';
 import type { BeatGrid, TrackInfo } from '../types';
-import Waveform from './Waveform';
+import Waveform, { OverviewWaveform } from './Waveform';
 
 export interface DeckState {
   track: TrackInfo | null;
@@ -214,7 +214,17 @@ export default function Deck(props: DeckProps) {
         </div>
       )}
 
-      {/* Waveform */}
+      {/* Waveform — overview strip + scrolling detail */}
+      <OverviewWaveform
+        deckId={deckId}
+        buffer={state.buffer}
+        peaks={state.track?.peaks ?? null}
+        grid={grid}
+        color={accent}
+        loop={state.loop}
+        hotcues={state.hotcues}
+        onSeek={props.onSeek}
+      />
       <Waveform
         deckId={deckId}
         buffer={state.buffer}
@@ -223,6 +233,7 @@ export default function Deck(props: DeckProps) {
         loop={state.loop}
         hotcues={state.hotcues}
         onSeek={props.onSeek}
+        peaks={state.track?.peaks ?? null}
       />
       {grid && (
         <button onClick={props.onEditGrid} className="self-start text-[11px] text-zinc-500 underline hover:text-zinc-300">
