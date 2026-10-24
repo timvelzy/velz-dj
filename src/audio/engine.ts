@@ -17,6 +17,7 @@
 
 import type { BeatGrid } from '../types';
 import wsolaWorkletUrl from './wsola-processor.ts?worker&url';
+import recorderWorkletUrl from './recorder-processor.ts?worker&url';
 
 export interface DeckNodes {
   id: string;
@@ -104,6 +105,7 @@ export class DJEngine {
     this.ctx = new AC({ latencyHint: 'interactive' });
 
     await this.ctx.audioWorklet.addModule(wsolaWorkletUrl);
+    await this.ctx.audioWorklet.addModule(recorderWorkletUrl);
     this.workletReady = true;
 
     this.masterBus = this.ctx.createGain();
@@ -709,6 +711,26 @@ export class DJEngine {
 
     src.start(barTime, 0);
     return barTime;
+  }
+
+  // ─── Recorder tap ─────────────────────────────────────────────────────────
+  // The recorder worklet taps masterGain (post-limiter, post-master-volume:
+  // exactly what the master output carries) and outputs silence into the
+  // master stream destination so the graph keeps pulling it.
+
+  private recorderNode: AudioWorkletNode | null = null;
+
+  createRecorderTap(): AudioWorkletNode {
+    if (this.recorderNode) return this.recorderNode;
+    const node = new AudioWorkletNode(this.ctx, 'velz-recorder', {
+      numberOfInputs: 1,
+      numberOfOutputs: 1,
+      outputChannelCount: [2],
+    });
+    this.masterGain.connect(node);
+    node.connect(this.masterDest);
+    this.recorderNode = node;
+    return node;
   }
 
   // ─── Metering ─────────────────────────────────────────────────────────────

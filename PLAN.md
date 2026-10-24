@@ -14,7 +14,7 @@ no pre-existing errors. No fixes needed.
 
 ---
 
-## Phase 2 — RECORDING (highest priority) · status: TODO
+## Phase 2 — RECORDING (highest priority) · status: DONE (26389f0 → this phase)
 
 **Scope**
 - New AudioWorklet recorder (`src/audio/recorder-processor.ts`, name

@@ -14,6 +14,7 @@ import {
   clearTraktorCollection,
 } from './audio/traktorStore';
 import { DemoSynthBackend, LoopQueue, type GeneratedLoop } from './audio/ai';
+import { SetRecorder, downloadBlob, formatElapsed, type TracklistEntry } from './audio/recorder';
 import type { TrackInfo } from './types';
 import Deck, { type DeckState } from './components/Deck';
 import Mixer, { defaultChannel, type ChannelState } from './components/Mixer';
@@ -67,6 +68,12 @@ export default function App() {
   const [traktorSavedAt, setTraktorSavedAt] = useState('');
   const fileInputRef = useRef<HTMLInputElement>(null);
   const nmlInputRef = useRef<HTMLInputElement>(null);
+  // Set recorder (Phase 2) — records the master out to WAV + auto-tracklist
+  const recorderRef = useRef<SetRecorder | null>(null);
+  const [recOn, setRecOn] = useState(false);
+  const [recElapsed, setRecElapsed] = useState(0);
+  const [recSaving, setRecSaving] = useState(false);
+  const [recNote, setRecNote] = useState('');
 
   // Restore a previously imported Traktor collection on startup
   useEffect(() => {
@@ -110,9 +117,73 @@ export default function App() {
     const id = window.setInterval(() => {
       setMasterBpm(engine.masterEffectiveBpm());
       setAiPlaying(engine.isPlaying('deckC'));
+      const rec = recorderRef.current;
+      if (rec?.recording) setRecElapsed(rec.elapsed());
     }, 250);
     return () => window.clearInterval(id);
   }, [ready]);
+
+  // Never lose a set to an accidental tab close
+  useEffect(() => {
+    if (!recOn) return;
+    const warn = (e: BeforeUnloadEvent) => { e.preventDefault(); };
+    window.addEventListener('beforeunload', warn);
+    return () => window.removeEventListener('beforeunload', warn);
+  }, [recOn]);
+
+  // ─── Set recording ──────────────────────────────────────────────────────
+  const toggleRecord = useCallback(async () => {
+    const rec = recorderRef.current ?? (recorderRef.current = new SetRecorder());
+    if (rec.recording) {
+      setRecSaving(true);
+      try {
+        const { wavBlob, fileName } = await rec.stop();
+        if (wavBlob) downloadBlob(wavBlob, fileName);
+        const base = fileName.replace(/\.wav$/i, '');
+        downloadBlob(new Blob([rec.tracklistText()], { type: 'text/plain' }), `${base}-tracklist.txt`);
+        downloadBlob(
+          new Blob([JSON.stringify(rec.tracklist, null, 2)], { type: 'application/json' }),
+          `${base}-tracklist.json`,
+        );
+        setRecNote(rec.streamError ?? (rec.mode === 'stream' ? 'Saved to your chosen file.' : 'Downloaded.'));
+      } finally {
+        setRecSaving(false);
+        setRecOn(false);
+        setRecElapsed(0);
+      }
+      return;
+    }
+    // Starting: get the save-file handle FIRST, inside this click's user
+    // activation, so a long set streams straight to disk when possible.
+    let handle: FileSystemFileHandle | null = null;
+    if (typeof window.showSaveFilePicker === 'function') {
+      try {
+        handle = await window.showSaveFilePicker({
+          suggestedName: rec.suggestedFileName(),
+          types: [{ description: 'WAV audio', accept: { 'audio/wav': ['.wav'] } }],
+        });
+      } catch {
+        return; // user cancelled the picker — don't start half a flow
+      }
+    }
+    const seed: Omit<TracklistEntry, 'elapsed'>[] = [];
+    for (const k of ['A', 'B'] as const) {
+      const t = (k === 'A' ? deckA : deckB).track;
+      if (t) seed.push({ deck: k, title: t.title, artist: t.artist, bpm: t.bpm, key: t.key ?? '' });
+    }
+    if (aiLoop) {
+      seed.push({ deck: 'AI', title: aiLoop.spec.style, artist: 'AI channel', bpm: aiLoop.grid.bpm, key: aiLoop.key });
+    }
+    const tap = engine.createRecorderTap();
+    await rec.start(engine.ctx, tap, handle, seed);
+    setRecNote(
+      rec.mode === 'stream'
+        ? 'Streaming to disk.'
+        : 'Recording to memory (no disk streaming in this browser) — the WAV downloads when you stop.',
+    );
+    setRecElapsed(0);
+    setRecOn(true);
+  }, [deckA, deckB, aiLoop]);
 
   useEffect(() => {
     engine.setMaster(masterDeck);
@@ -217,6 +288,9 @@ export default function App() {
       d.nudge = 0;
       setTracks((ts) => [...ts.filter((t) => t.id !== track.id), track]);
       setDeckState(deckKey, { ...deckInit(), track, buffer, hotcues });
+      recorderRef.current?.noteTrack({
+        deck: deckKey, title: track.title, artist: track.artist, bpm: track.bpm, key: track.key ?? '',
+      });
     } catch (e) {
       console.error('Load failed', e);
       setDeckState(deckKey, deckInit());
@@ -337,6 +411,9 @@ export default function App() {
     const tempo = masterBpm > 0 && loop.grid.bpm > 0 ? masterBpm / loop.grid.bpm : 1;
     const at = engine.playAiLoop(deckId, loop.buffer, loop.grid, tempo);
     if (at !== null) {
+      recorderRef.current?.noteTrack({
+        deck: 'AI', title: loop.spec.style, artist: 'AI channel', bpm: loop.grid.bpm, key: loop.key,
+      });
       setAiLoop(loop);
       setAiBuffer(loop.buffer);
       // Make sure the AI channel is audible
@@ -498,6 +575,20 @@ export default function App() {
               )}
             </div>
           </details>
+          <button
+            onClick={() => void toggleRecord()}
+            disabled={recSaving}
+            className={`flex items-center gap-2 rounded px-3 py-1.5 text-xs font-bold disabled:opacity-50 ${
+              recOn ? 'bg-red-600 text-white hover:bg-red-500' : 'bg-zinc-800 text-zinc-300 hover:bg-zinc-700'
+            }`}
+            title={recOn ? 'Stop recording and save the set (WAV + tracklist)' : 'Record the set — master out to WAV with an auto-tracklist'}
+          >
+            <span className={`h-2 w-2 rounded-full ${recOn ? 'animate-pulse bg-white' : 'bg-red-500'}`} />
+            {recSaving ? 'Saving…' : recOn ? formatElapsed(recElapsed) : 'REC'}
+          </button>
+          {recNote && (
+            <span className="max-w-56 truncate text-[10px] text-zinc-500" title={recNote}>{recNote}</span>
+          )}
           <button
             onClick={() => setMidiOpen(true)}
             className="rounded bg-zinc-800 px-3 py-1.5 text-xs text-zinc-300 hover:bg-zinc-700"
