@@ -248,7 +248,20 @@ master bar via `engine.playAiLoop`. Queue UI already shows BPM/key/bars.
 **Risks:** Chord layer muddying the loop — keep pad level low (−12 dB vs
 drums) and lowpassed.
 
-## Phase 9 — DEPLOYABLE (outranks Phase 8) · status: TODO
+## Phase 9 — DEPLOYABLE (outranks Phase 8) · status: DONE
+
+Hand-rolled PWA (manifest + runtime cache-first SW, prod-only
+registration), `base: './'` verified — dist/ is fully self-contained with
+relative asset refs (worklets included). GitHub Actions → Pages workflow
+added; DEPLOY.md covers Pages + Cloudflare/Netlify/Azure alternatives,
+custom domain/HTTPS, and the secure-context requirements (Web MIDI,
+File System Access, AudioWorklet). **Tim's one manual step:** repo
+Settings → Pages → Source: GitHub Actions (see DEPLOY.md).
+**Push caveat:** the workflow file itself could not be pushed from this
+machine — GitHub rejected it because the local OAuth token lacks the
+`workflow` scope. `deploy.yml` sits in the working tree (excluded from
+sweep commits via .git/info/exclude); Tim commits it once with a
+workflow-scoped token or via the web UI, per DEPLOY.md.
 
 **Scope**
 - **PWA, hand-rolled (no plugin):** `public/manifest.webmanifest`
