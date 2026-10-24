@@ -211,7 +211,15 @@ Mixer.tsx` (send knobs + `fxSend` in `ChannelState`), `src/midi.ts`,
 return passes the master limiter. Reverb IR regenerated only when decay
 param changes (debounced), not per-frame.
 
-## Phase 7 — AI DECK LOOP QUEUE · status: TODO
+## Phase 7 — AI DECK LOOP QUEUE · status: DONE
+
+Procedural generator enriched: detuned-saw pad chords (diatonic
+progression per Camelot key) + per-call variation seed (bass pattern,
+progression rotation, open-hat placement). `ApiLoopBackend` stub added —
+typed config, `isConfigured=false` without an endpoint, `generate()`
+throws the hint; swap point is one line in `App.tsx`. Queue header now
+states the prepared-for BPM/key. Drop-in path unchanged (bar-quantized
+via `engine.playAiLoop`, already working).
 
 **Current state:** `LoopQueue` + `DemoSynthBackend` already implement the
 pre-generated queue: loops are generated ahead at the master BPM/key,

@@ -137,7 +137,13 @@ export default function AIDeck({ queue, masterBpm, masterKey, onDropLoop, isPlay
       )}
 
       {/* Queue */}
-      <div className="mt-2 flex gap-2">
+      <div className="mt-2 mb-1 text-[11px] uppercase tracking-wide text-zinc-500">
+        Queue — prepared for{' '}
+        <span className="font-mono text-violet-300">{targetBpm.toFixed(1)} BPM</span>
+        {masterKey && <span className="font-mono text-amber-300"> · {masterKey}</span>}
+        <span className="text-zinc-600"> · drops land on the next master bar</span>
+      </div>
+      <div className="flex gap-2">
         {qs.loops.length === 0 && !qs.generating && (
           <span className="text-xs text-zinc-600">
             {backend.isConfigured

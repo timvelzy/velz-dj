@@ -75,12 +75,16 @@ function camelotToRootFreq(camelot: string): number {
 }
 
 export class DemoSynthBackend implements AIGenerationBackend {
-  readonly name = 'Demo Synth (built-in)';
+  readonly name = 'Built-in Synth (procedural)';
   readonly isConfigured = true;
   readonly knownExactBpm = true;
-  readonly statusHint = 'Synthesized demo loops — real audio, simple patterns.';
+  readonly statusHint = 'Procedurally synthesized loops — real audio generated in-engine, no network needed.';
+  private callCount = 0;
 
   async generate(spec: LoopSpec, ctx: BaseAudioContext): Promise<AudioBuffer> {
+    // Variation seed: each call varies the bass rhythm, progression
+    // rotation and hat placement so queued loops aren't identical.
+    const seed = ++this.callCount;
     const spb = 60 / spec.bpm;
     const beats = spec.bars * 4;
     const dur = beats * spb;
@@ -148,21 +152,63 @@ export class DemoSynthBackend implements AIGenerationBackend {
     // Pattern: 4-on-the-floor kick, offbeat hats, snare on 2&4, sub bass on root
     const stepsPerBeat = 2; // 8th notes
     const totalSteps = beats * stepsPerBeat;
+    const openHatEvery = seed % 2 === 0 ? 8 : 16; // steps between open hats (variation)
     for (let s = 0; s < totalSteps; s++) {
       const t = s * (spb / stepsPerBeat);
       const beatInBar = (s / stepsPerBeat) % 4;
       if (s % stepsPerBeat === 0) kick(t);
       if (s % stepsPerBeat === stepsPerBeat / 2) hat(t, false);
       if (beatInBar === 1 || beatInBar === 3) snare(t);
-      if (s % (stepsPerBeat * 4) === stepsPerBeat * 8) hat(t, true); // open hat each 2 bars
+      if (s % openHatEvery === openHatEvery - 1) hat(t, true);
     }
-    // Bassline: root, root, fifth, root pattern per bar
+    // Bassline: per-seed rhythm variant around root / fifth movement
+    const bassPatterns: number[][] = [
+      [0, 1, 1.5, 1], // beats within the bar, ×root (1.5 = fifth)
+      [0, 0.5, 1, 1.5],
+      [0, 1, 1, 1.189], // fifth, fifth, minor third-ish color
+    ];
+    const bassPat = bassPatterns[seed % bassPatterns.length];
     for (let bar = 0; bar < spec.bars; bar++) {
       const bt = bar * 4 * spb;
       bass(bt, 1, root);
-      bass(bt + spb, 1, root);
-      bass(bt + 2 * spb, 1, root * 1.5);
-      bass(bt + 3 * spb, 1, root);
+      bass(bt + spb, 1, root * bassPat[1]);
+      bass(bt + 2 * spb, 1, root * bassPat[2]);
+      bass(bt + 3 * spb, 1, root * bassPat[3]);
+    }
+
+    // Pad: detuned saw triad per 2 bars, slow swell, lowpassed, quiet —
+    // gives the loop a harmonic bed in the target key.
+    const keyMatch = /^(\d{1,2})([AB])$/i.exec(spec.key.trim());
+    const isMinor = !keyMatch || keyMatch[2].toUpperCase() === 'A';
+    const prog: { semi: number; minor: boolean }[] = isMinor
+      ? [{ semi: 0, minor: true }, { semi: 3, minor: false }, { semi: 8, minor: false }, { semi: 10, minor: false }]
+      : [{ semi: 0, minor: false }, { semi: 7, minor: false }, { semi: 9, minor: true }, { semi: 5, minor: false }];
+    const pad = (t: number, durBeats: number, chordRoot: number, chordMinor: boolean) => {
+      const third = Math.pow(2, (chordMinor ? 3 : 4) / 12);
+      for (const f of [chordRoot, chordRoot * third, chordRoot * 1.5]) {
+        for (const det of [0.998, 1.002]) {
+          const o = off.createOscillator();
+          o.type = 'sawtooth';
+          o.frequency.value = f * det;
+          const flt = off.createBiquadFilter();
+          flt.type = 'lowpass';
+          flt.frequency.value = 850;
+          const g = off.createGain();
+          const d = durBeats * spb;
+          g.gain.setValueAtTime(0.0001, t);
+          g.gain.exponentialRampToValueAtTime(0.045, t + Math.min(0.5, d * 0.3));
+          g.gain.setValueAtTime(0.045, t + d * 0.7);
+          g.gain.exponentialRampToValueAtTime(0.001, t + d);
+          o.connect(flt); flt.connect(g); g.connect(master);
+          o.start(t); o.stop(t + d + 0.05);
+        }
+      }
+    };
+    const padBase = root * 4; // two octaves above the sub root
+    const rot = seed % prog.length;
+    for (let slot = 0; slot * 2 < spec.bars; slot++) {
+      const chord = prog[(slot + rot) % prog.length];
+      pad(slot * 8 * spb, 8, padBase * Math.pow(2, chord.semi / 12), chord.minor);
     }
 
     const rendered = await off.startRendering();
@@ -174,6 +220,38 @@ export class DemoSynthBackend implements AIGenerationBackend {
       return trimmed;
     }
     return rendered;
+  }
+}
+
+// ─── API backend slot (Phase 7) ─────────────────────────────────────────────
+// Typed, DISABLED-BY-DEFAULT stub for an external generation API
+// (Stable Audio, Lyria, a self-hosted endpoint, …). To enable: construct
+// with a real endpoint (+ key) and pass it to LoopQueue in App.tsx instead
+// of DemoSynthBackend. knownExactBpm stays false, so anything it returns
+// is re-measured by the beat detector before it can be dropped.
+
+export interface ApiLoopConfig {
+  endpoint?: string;
+  apiKey?: string;
+}
+
+export class ApiLoopBackend implements AIGenerationBackend {
+  readonly name = 'API backend (not configured)';
+  readonly knownExactBpm = false;
+  readonly statusHint =
+    'No API endpoint configured. The built-in procedural synth is the working generator; ' +
+    'to use an external model, construct ApiLoopBackend with an endpoint in src/audio/ai.ts.';
+
+  constructor(private config: ApiLoopConfig = {}) {}
+
+  get isConfigured(): boolean {
+    return typeof this.config.endpoint === 'string' && this.config.endpoint.length > 0;
+  }
+
+  async generate(_spec: LoopSpec, _ctx: BaseAudioContext): Promise<AudioBuffer> {
+    // Intentionally unimplemented until an endpoint is configured —
+    // no fake generation path.
+    throw new Error(this.statusHint);
   }
 }
 
