@@ -128,6 +128,27 @@ export default function Deck(props: DeckProps) {
 
   const isPlaying = engine.isPlaying(deckId);
 
+  // CUE preview guard: cueUp must only fire for a press that STARTED on
+  // this button. Previously onPointerUp/Leave/Cancel all fired
+  // unconditionally, so a stray release (pointer pressed elsewhere, e.g.
+  // the Q toggle, then released over CUE) fired cueUp — and cueUp while
+  // playing pauses + seeks to cue, i.e. a "deck quit" with no CUE press.
+  // Track the pressing pointerId; ignore releases/leaves/cancels from any
+  // pointer that did not start here. Genuine presses are unchanged: down
+  // previews, drag-off stops the preview (leave fires for the same id),
+  // release while paused is a no-op in the cueUp handler itself.
+  const cuePointerId = useRef<number | null>(null);
+  const cueDownOnButton = (e: React.PointerEvent) => {
+    e.preventDefault();
+    cuePointerId.current = e.pointerId;
+    props.onCueDown();
+  };
+  const cueUpIfPressed = (e: React.PointerEvent) => {
+    if (cuePointerId.current === null || cuePointerId.current !== e.pointerId) return;
+    cuePointerId.current = null;
+    props.onCueUp();
+  };
+
   // Camelot compatibility of this deck's key against the master's key.
   // Direction: master -> candidate, so ENERGY means this track lifts +2.
   const keyTier = !isMaster && props.masterKey && state.track?.key
@@ -313,10 +334,10 @@ export default function Deck(props: DeckProps) {
               {isPlaying ? '❚❚' : '▶'}
             </button>
             <button
-              onPointerDown={(e) => { e.preventDefault(); props.onCueDown(); }}
-              onPointerUp={props.onCueUp}
-              onPointerLeave={props.onCueUp}
-              onPointerCancel={props.onCueUp}
+              onPointerDown={cueDownOnButton}
+              onPointerUp={cueUpIfPressed}
+              onPointerLeave={cueUpIfPressed}
+              onPointerCancel={cueUpIfPressed}
               onContextMenu={(e) => e.preventDefault()}
               title="Hold to preview from cue point"
               className="h-11 w-14 touch-none select-none rounded-lg bg-zinc-700 font-bold text-amber-300 hover:bg-zinc-600 active:bg-amber-600 active:text-black"

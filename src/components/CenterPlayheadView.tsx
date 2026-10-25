@@ -103,6 +103,11 @@ export interface TopDeckView {
   /** Tempo stability 0..1, from the beat grid. */
   stability?: number;
   isPlaying: boolean;
+  /** True while a quantized launch is queued for this deck (engine
+   * pendingLaunchAt non-null). Shown as a QUEUED badge on the row so a DJ
+   * watching the top view sees why the deck is silent. Omitted for the AI
+   * row, whose drops do not use playQuantized. */
+  queued?: boolean;
   onPlayPause: () => void;
   onCueDown: () => void;
   onCueUp: () => void;
@@ -217,6 +222,20 @@ function TopWaveformRow({ deck, pxPerSec, height }: RowProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
   const dragRef = useRef(false);
+  // Same CUE stray-release guard as Deck.tsx: cueUp only fires for a press
+  // that started on this button (same pointerId). A release landing over
+  // CUE after a press elsewhere is ignored instead of stopping the deck.
+  const cuePointerId = useRef<number | null>(null);
+  const cueDownOnButton = (e: React.PointerEvent) => {
+    e.preventDefault();
+    cuePointerId.current = e.pointerId;
+    deck.onCueDown();
+  };
+  const cueUpIfPressed = (e: React.PointerEvent) => {
+    if (cuePointerId.current === null || cuePointerId.current !== e.pointerId) return;
+    cuePointerId.current = null;
+    deck.onCueUp();
+  };
 
   const mono = useMemo(
     () => (deck.buffer && !deck.peaks ? computePeaks(deck.buffer, Math.max(512, Math.floor(deck.buffer.duration * 40))) : null),
@@ -491,6 +510,9 @@ function TopWaveformRow({ deck, pxPerSec, height }: RowProps) {
               </span>
             )}
           </div>
+          {deck.queued && (
+            <div className="font-mono text-[10px] text-amber-300">▸ QUEUED — drops on the bar</div>
+          )}
           <div className="flex items-center gap-1.5">
             <LoopSizeControl deck={deck} />
           </div>
@@ -503,10 +525,10 @@ function TopWaveformRow({ deck, pxPerSec, height }: RowProps) {
               {deck.isPlaying ? '❚❚' : '▶'}
             </button>
             <button
-              onPointerDown={(e) => { e.preventDefault(); deck.onCueDown(); }}
-              onPointerUp={deck.onCueUp}
-              onPointerLeave={deck.onCueUp}
-              onPointerCancel={deck.onCueUp}
+              onPointerDown={cueDownOnButton}
+              onPointerUp={cueUpIfPressed}
+              onPointerLeave={cueUpIfPressed}
+              onPointerCancel={cueUpIfPressed}
               disabled={!deck.buffer}
               className="h-7 rounded bg-orange-900/60 px-2.5 text-xs font-bold text-orange-300 hover:bg-orange-800 disabled:opacity-40"
             >
