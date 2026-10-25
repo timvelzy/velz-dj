@@ -24,6 +24,7 @@ import {
   barsToOutro,
   bassState,
   downbeatAtOrBefore,
+  holdLoopFor,
   outroStartSeconds,
   pickNextTrack,
   planTransition,
@@ -867,6 +868,11 @@ export default function App() {
     teaseEqSnap: number | null;
     /** Extend: loop released at a downbeat into the main part. */
     extendReleased: boolean;
+    /** Live bass swap: audio time + duration + from-values of the executed swap (the UI mirror replays it). */
+    swapStartAt: number | null;
+    swapDur: number;
+    swapFromOut: number;
+    swapFromIn: number;
   }
   const [apOn, setApOn] = useState(false);
   const [apQueueIds, setApQueueIds] = useState<string[]>([]);
@@ -935,6 +941,10 @@ export default function App() {
     teasePrevIn: 0,
     teaseEqSnap: null,
     extendReleased: false,
+    swapStartAt: null,
+    swapDur: 0,
+    swapFromOut: 0,
+    swapFromIn: -1,
   });
 
   const pushApStatus = (s: ApStatus) => {
@@ -961,6 +971,46 @@ export default function App() {
     engine.setCrossfader(v);
   };
 
+  /**
+   * Round 7 — VISIBLE AUTOMATION. During a scheduled/crossfading blend
+   * the audible moves live on AudioParam curves (they survive a
+   * throttled tab), but the DJ must SEE them: this tick-rate mirror
+   * replays the same curves into React state ONLY — never engine calls,
+   * which would fight the scheduled automation. Crossfader interpolates
+   * fromV→toV over the blend; low EQ replays the schedule (incoming
+   * held at −1 until the swap window, then ramped to its pre-blend
+   * value; outgoing mirrored). A live swap re-times the window from the
+   * values apLiveSwapCheck recorded. Before blendStartAt nothing has
+   * moved yet, so the mirror stays out of the way.
+   */
+  const apMirrorUi = (m: ApMachine, nowAudio: number) => {
+    if ((m.phase !== 'scheduled' && m.phase !== 'crossfading') || !m.automated) return;
+    if (nowAudio < m.blendStartAt) return;
+    const p = Math.min(1, Math.max(0, (nowAudio - m.blendStartAt) / Math.max(0.1, m.blendSec)));
+    const v = m.fromV + (m.toV - m.fromV) * p;
+    if (Math.abs(v - crossfaderRef.current) > 0.005) setCrossfader(v);
+    if (!m.eqSnap) return;
+    const pSt = deckStateRef.current[m.playingKey];
+    const barSec = pSt.track ? barSeconds(pSt.track.beatGrid) : 0.5;
+    const beatSec = barSec / 4;
+    const live = m.bassSwapped && m.swapStartAt != null;
+    const ws = live ? m.swapStartAt! : m.blendEndAt - Math.min(beatSec, m.blendSec);
+    const we = live ? m.swapStartAt! + m.swapDur : m.blendEndAt;
+    const f = nowAudio < ws ? 0 : nowAudio >= we ? 1 : (nowAudio - ws) / Math.max(0.05, we - ws);
+    const fromOut = live ? m.swapFromOut : m.eqSnap.outLow;
+    const fromIn = live ? m.swapFromIn : -1;
+    const outLow = fromOut + (-1 - fromOut) * f;
+    const inLow = fromIn + (m.eqSnap.inLow - fromIn) * f;
+    const curOut = chRef.current[m.playingKey].eqLow;
+    const curIn = chRef.current[m.freeKey].eqLow;
+    if (Math.abs(outLow - curOut) > 0.01) {
+      (m.playingKey === 'A' ? setChA : setChB)({ ...chRef.current[m.playingKey], eqLow: outLow });
+    }
+    if (Math.abs(inLow - curIn) > 0.01) {
+      (m.freeKey === 'A' ? setChA : setChB)({ ...chRef.current[m.freeKey], eqLow: inLow });
+    }
+  };
+
   /** Restore pre-transition low EQ on both decks (takeover / cycle end). */
   const apRestoreEq = (m: ApMachine) => {
     if (!m.eqSnap) return;
@@ -982,12 +1032,25 @@ export default function App() {
   const apSetFallbackLoop = (m: ApMachine) => {
     const pSt = deckStateRef.current[m.playingKey];
     if (!pSt.track || m.fallbackLoop) return;
-    const start = m.outroStart;
-    const end = pSt.track.duration;
-    if (end <= start) return;
-    engine.setLoop(`deck${m.playingKey}`, start, end);
-    setDeckState(m.playingKey, { ...pSt, loop: { start, end }, loopBars: null });
-    m.fallbackLoop = { start, end };
+    // Round 7: the hold loop is a short musical phrase (8 bars, capped
+    // at 16), never a span from an outro point to track end. When the
+    // playhead is already past the loop end (last bar of the track),
+    // jump back into the groove — playing on into silence is not an
+    // option the hold is allowed to take.
+    const pos = engine.position(`deck${m.playingKey}`);
+    const loop = holdLoopFor(pSt.track, pSt.hotcues, pos);
+    if (!loop) {
+      debugLog('transport', 'autopilot hold loop unavailable', `deck${m.playingKey}`, { pos });
+      return;
+    }
+    engine.setLoop(`deck${m.playingKey}`, loop.start, loop.end);
+    setDeckState(m.playingKey, { ...pSt, loop: { start: loop.start, end: loop.end }, loopBars: null });
+    m.fallbackLoop = { start: loop.start, end: loop.end };
+    if (loop.jump) engine.seek(`deck${m.playingKey}`, loop.start);
+    debugLog('transport', 'autopilot hold loop', `deck${m.playingKey}`, {
+      start: loop.start, end: loop.end,
+      bars: Math.round((loop.end - loop.start) / barSeconds(pSt.track.beatGrid)), jumped: loop.jump,
+    });
   };
 
   const apLoadBridge = (key: 'A' | 'B', bridge: { buffer: AudioBuffer; grid: BeatGrid; key: string }): string => {
@@ -1108,6 +1171,7 @@ export default function App() {
   const apEnterFallback = (m: ApMachine, note: string | null) => {
     m.phase = 'fallback';
     apSetFallbackLoop(m);
+    debugLog('transport', 'autopilot fallback', `deck${m.playingKey}`, { note });
     pushApStatus({
       on: true, phase: 'fallback', playingKey: m.playingKey,
       nextTitle: null, barsToGo: null, blendProgress: null, bass: null,
@@ -1129,6 +1193,7 @@ export default function App() {
     if (backend.kind !== 'lyria' || !backend.isConfigured) {
       m.phase = 'fallback';
       m.genError = 'AI generation needs your Gemini key in the AI deck — holding the outro loop.';
+      debugLog('transport', 'autopilot generation unavailable', undefined, { reason: 'no Gemini key' });
       pushApStatus({
         on: true, phase: 'fallback', playingKey: m.playingKey,
         nextTitle: null, barsToGo: null, blendProgress: null, bass: null, note: m.genError,
@@ -1146,6 +1211,7 @@ export default function App() {
       bars: 4 as const,
       style: 'house',
     };
+    debugLog('transport', 'autopilot generating bridge', undefined, { bars: 4, bpm: spec.bpm });
     const timeout = new Promise<never>((_, rej) =>
       setTimeout(() => rej(new Error('generation timed out')), 120000),
     );
@@ -1217,6 +1283,9 @@ export default function App() {
     m.teaseArmed = false;
     m.teaseReleased = false;
     m.teasePrevIn = plan.teaseLoopStart;
+    debugLog('transport', 'autopilot tease launched', `deck${m.freeKey}`, {
+      loop: [plan.teaseLoopStart, plan.teaseLoopEnd], to: m.nextTitle,
+    });
     pushApStatus({
       on: true, phase: 'teasing', playingKey: m.playingKey,
       nextTitle: m.nextTitle, barsToGo: null, blendProgress: null, bass: 'cut',
@@ -1517,6 +1586,13 @@ export default function App() {
       engine.scheduleEqLowCurve(`deck${m.playingKey}`, outNow, -1, nowAudio, swapDur);
       engine.scheduleEqLowCurve(`deck${m.freeKey}`, inNow, m.eqSnap!.inLow, nowAudio, swapDur);
       m.bassSwapped = true;
+      // Round 7: the UI mirror replays this exact swap window, and the
+      // log makes the swap diagnosable (previously it was silent).
+      m.swapStartAt = nowAudio;
+      m.swapDur = swapDur;
+      m.swapFromOut = outNow;
+      m.swapFromIn = inNow;
+      debugLog('transport', 'autopilot bass swapped', undefined, { mode: m.plan?.mode ?? 'legacy' });
     };
     // Round 6 structural switch (PRIMARY for smart blends): the incoming
     // drop has arrived (playhead at/past its first kick) while the
@@ -1643,7 +1719,9 @@ export default function App() {
     const nextDeckState = { ...fSt, syncActive: false };
     if (m.nextIsBridge && fSt.buffer) {
       // A generated bridge loops on its deck until a real track is picked.
-      engine.setLoop(fId, 0, fSt.buffer.duration);
+      // Its loop IS the whole buffer by construction, so it opts out of
+      // the round-7 end-of-file clamp (which would shave its last beat).
+      engine.setLoop(fId, 0, fSt.buffer.duration, { allowEndAtDuration: true });
       nextDeckState.loop = { start: 0, end: fSt.buffer.duration };
       nextDeckState.loopBars = null;
     }
@@ -1687,6 +1765,15 @@ export default function App() {
       m.outroStart = outro;
       m.prepareAt = outro - 4 * barSec;
       apRef.current = m;
+      // Round 7: a machine that only pushes status is invisible in the
+      // log — one line per machine states what it is watching, so a
+      // future "autopilot on, nothing happened" is diagnosable.
+      const pos0 = engine.position(`deck${pk}`);
+      debugLog('transport', 'autopilot watching', `deck${pk}`, {
+        track: st.track!.title, outroStart: outro, prepareAt: m.prepareAt,
+        freeDeck: decks[fk].track ? decks[fk].track!.title : null,
+        late: pos0 >= m.prepareAt,
+      });
       // Lookahead arm: load the next pick now (well ahead of the outro)
       // when the free deck is empty — never clobber a manual load.
       if (!decks[fk].track) apArmNext(m, null);
@@ -1834,7 +1921,15 @@ export default function App() {
       }
       if (!armed && pos >= m.prepareAt) {
         // No arm (free deck was occupied at cycle start, or no pick
-        // then): legacy path — pick and load now.
+        // then): legacy path — pick and load now. Round 7: when the
+        // playhead is already PAST the blend start, say so loudly —
+        // silently falling through to a fallback loop is how a missed
+        // trigger turned into a 62-second loop in Tim's log.
+        if (pos >= m.outroStart) {
+          debugLog('transport', 'autopilot trigger missed, recovering', `deck${m.playingKey}`, {
+            pos, prepareAt: m.prepareAt, outroStart: m.outroStart,
+          });
+        }
         const pick = apPick(m);
         if (pick) apBeginPrepare(m, pick, false, now);
         else if (!m.genAttempted) apStartGeneration(m);
@@ -1930,6 +2025,7 @@ export default function App() {
         return;
       }
       if (inStarted) apLiveSwapCheck(m, nowAudio);
+      apMirrorUi(m, nowAudio);
       if (nowAudio >= m.blendEndAt - 0.05) {
         apFinishWithExtendRelease(m);
         return;
@@ -2065,6 +2161,7 @@ export default function App() {
     }
     const nowAudio = engine.ctx.currentTime;
     apLiveSwapCheck(m, nowAudio);
+    apMirrorUi(m, nowAudio);
     // A recovering blend (old deck already dead) finishes on time only
     // — never on old-deck death, which is already true.
     if (nowAudio >= m.blendEndAt - 0.05 || (!m.recovering && !engine.isPlaying(pId))) {
