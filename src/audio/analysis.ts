@@ -264,14 +264,40 @@ async function detectElectronic(
 ): Promise<Omit<BeatGrid, 'method' | 'beats' | 'bpmCurve'>> {
   const TARGET_RATE = 8000;
   const ANALYZE_SEC = 15;
+  const WINDOW_HOP_SEC = 5;
   const ch = buffer.getChannelData(0);
   const sr = buffer.sampleRate;
-  const analyzeLen = Math.min(ANALYZE_SEC * sr, ch.length);
   const ratio = Math.max(1, Math.floor(sr / TARGET_RATE));
   const dsRate = sr / ratio; // true downsampled rate (see buildBeatMap note)
-  const dsLen = Math.floor(analyzeLen / ratio);
+
+  // Window selection: the old code always analyzed the FIRST 15 s. For a
+  // track with a quiet build intro (Chlorine and Dashboard Light: 0:00–
+  // 0:45 quiet, first drop 1:30), that window contains no kick at all, so
+  // the kick gate (>= 4 onsets, consistency >= 0.5) fails and detection
+  // falls back to the full-band stream — which locks onto the dotted-
+  // eighth arp grid (122 x 4/3 ~= 163) instead of the kick grid. Fix:
+  // analyze the LOUDEST 15 s window instead (15 s windows hopped every
+  // 5 s over the full track, scored by mean square on the downsampled
+  // signal). The onset machinery below is unchanged; only the window
+  // moves to where the kick actually lives. Onset times are window-local,
+  // so firstBeat is shifted back by the window start below. Short tracks
+  // (< 15 s) still analyze from 0, exactly as before.
+  const totalDsLen = Math.floor(ch.length / ratio);
+  const winLen = Math.floor(ANALYZE_SEC * dsRate);
+  const hopLen = Math.max(1, Math.floor(WINDOW_HOP_SEC * dsRate));
+  let winStart = 0;
+  let bestEnergy = -1;
+  for (let s = 0; s < totalDsLen; s += hopLen) {
+    const end = Math.min(s + winLen, totalDsLen);
+    let e = 0;
+    for (let i = s; i < end; i++) { const v = ch[i * ratio]; e += v * v; }
+    const mean = e / Math.max(1, end - s);
+    if (mean > bestEnergy) { bestEnergy = mean; winStart = s; }
+  }
+  if (winStart + winLen > totalDsLen) winStart = Math.max(0, totalDsLen - winLen);
+  const dsLen = Math.min(winLen, totalDsLen - winStart);
   const ds = new Float32Array(dsLen);
-  for (let i = 0; i < dsLen; i++) ds[i] = ch[i * ratio];
+  for (let i = 0; i < dsLen; i++) ds[i] = ch[(winStart + i) * ratio];
 
   // Broadband transient extraction (high-pass-ish, as before)
   const transient = new Float32Array(dsLen);
@@ -328,13 +354,14 @@ async function detectElectronic(
   const anchorOnsets = useKick ? kickOnsets : onsets;
 
   if (chosen.bpm <= 0 || anchorOnsets.length < 4) {
-    return { bpm: 0, confidence: 0, downbeatOffset: -1, firstBeat: anchorOnsets[0] ?? onsets[0] ?? 0, tempoStability: 0 };
+    return { bpm: 0, confidence: 0, downbeatOffset: -1, firstBeat: winStart / dsRate + (anchorOnsets[0] ?? onsets[0] ?? 0), tempoStability: 0 };
   }
 
   const bpm = chosen.bpm;
   const confidence = Math.min(0.95, chosen.consistency * 0.9);
 
-  const firstBeat = anchorOnsets[0];
+  // Onset times are window-local; shift back into track time.
+  const firstBeat = winStart / dsRate + anchorOnsets[0];
   const beats = generateBeats(bpm, buffer.duration, firstBeat);
   const downbeatOffset = detectDownbeat(ch, sr, beats);
   onProgress?.(0.9);

@@ -38,8 +38,15 @@ function fmtScalar(v: unknown): string {
   return '[obj]';
 }
 
-/** Log one event. `data` values are reduced to short scalars — never pass buffers. */
+/** Log one event. `data` values are reduced to short scalars — never pass buffers.
+ *
+ * 'param' entries are dropped at ingest on purpose: EQ/filter/fader/trim
+ * setters log on EVERY call, so a single knob drag emits hundreds of lines
+ * per second and flushes the 500-entry ring within seconds, destroying
+ * the transport history this log exists to preserve. Transport, audio,
+ * analysis, and error lines are untouched. */
 export function debugLog(tag: LogTag, msg: string, deck?: string, data?: Record<string, unknown>): void {
+  if (tag === 'param') return;
   const line: LogEntry = {
     ms: Math.round(performance.now()),
     at: new Date().toISOString(),
