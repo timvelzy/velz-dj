@@ -1773,9 +1773,9 @@ export default function App() {
       masterKey,
       masterBpm,
       accent: deckKey === 'A' ? '#38bdf8' : '#fb923c',
-      onPlayPause: () => togglePlay(deckKey),
-      onCueDown: () => cueDown(deckKey),
-      onCueUp: () => cueUp(deckKey),
+      onPlayPause: () => { debugLog('transport', 'ui play/pause (deck panel)', deckId, { playing: engine.isPlaying(deckId) }); togglePlay(deckKey); },
+      onCueDown: () => { debugLog('transport', 'ui cueDown (deck panel)', deckId, { playing: engine.isPlaying(deckId) }); cueDown(deckKey); },
+      onCueUp: () => { debugLog('transport', 'ui cueUp (deck panel)', deckId, { playing: engine.isPlaying(deckId) }); cueUp(deckKey); },
       onTempo: (v: number) => {
         engine.setTempo(deckId, v);
         setDeckState(deckKey, { ...deckState(deckKey), tempo: v });
@@ -1793,6 +1793,7 @@ export default function App() {
         setDeckState(deckKey, { ...st, cuePoint: engine.position(deckId) });
       },
       onStop: () => {
+        debugLog('transport', 'ui stop (deck panel)', deckId, { playing: engine.isPlaying(deckId) });
         engine.pause(deckId);
         engine.seek(deckId, resolveCue(deckState(deckKey)));
       },
@@ -2066,10 +2067,10 @@ export default function App() {
             stability: deckA.track?.beatGrid.tempoStability,
             buffer: deckA.buffer, grid: deckA.track?.beatGrid ?? null, peaks: deckA.track?.peaks ?? null,
             bpm: deckA.track?.bpm ?? 0, isPlaying: engine.isPlaying('deckA'),
-            onPlayPause: () => togglePlay('A'),
-            onCueDown: () => cueDown('A'),
-            onCueUp: () => cueUp('A'),
-            onStop: () => { engine.pause('deckA'); engine.seek('deckA', deckA.cuePoint ?? 0); },
+            onPlayPause: () => { debugLog('transport', 'ui play/pause (top view)', 'deckA', { playing: engine.isPlaying('deckA') }); togglePlay('A'); },
+            onCueDown: () => { debugLog('transport', 'ui cueDown (top view)', 'deckA', { playing: engine.isPlaying('deckA') }); cueDown('A'); },
+            onCueUp: () => { debugLog('transport', 'ui cueUp (top view)', 'deckA', { playing: engine.isPlaying('deckA') }); cueUp('A'); },
+            onStop: () => { debugLog('transport', 'ui stop (top view)', 'deckA', { playing: engine.isPlaying('deckA') }); engine.pause('deckA'); engine.seek('deckA', deckA.cuePoint ?? 0); },
             onSetCue: () => setDeckState('A', { ...deckA, cuePoint: engine.position('deckA') }),
             onToggleSync: () => toggleSync('A'),
             onSeek: (t) => engine.seek('deckA', t),
@@ -2088,10 +2089,10 @@ export default function App() {
             stability: deckB.track?.beatGrid.tempoStability,
             buffer: deckB.buffer, grid: deckB.track?.beatGrid ?? null, peaks: deckB.track?.peaks ?? null,
             bpm: deckB.track?.bpm ?? 0, isPlaying: engine.isPlaying('deckB'),
-            onPlayPause: () => togglePlay('B'),
-            onCueDown: () => cueDown('B'),
-            onCueUp: () => cueUp('B'),
-            onStop: () => { engine.pause('deckB'); engine.seek('deckB', deckB.cuePoint ?? 0); },
+            onPlayPause: () => { debugLog('transport', 'ui play/pause (top view)', 'deckB', { playing: engine.isPlaying('deckB') }); togglePlay('B'); },
+            onCueDown: () => { debugLog('transport', 'ui cueDown (top view)', 'deckB', { playing: engine.isPlaying('deckB') }); cueDown('B'); },
+            onCueUp: () => { debugLog('transport', 'ui cueUp (top view)', 'deckB', { playing: engine.isPlaying('deckB') }); cueUp('B'); },
+            onStop: () => { debugLog('transport', 'ui stop (top view)', 'deckB', { playing: engine.isPlaying('deckB') }); engine.pause('deckB'); engine.seek('deckB', deckB.cuePoint ?? 0); },
             onSetCue: () => setDeckState('B', { ...deckB, cuePoint: engine.position('deckB') }),
             onToggleSync: () => toggleSync('B'),
             onSeek: (t) => engine.seek('deckB', t),
