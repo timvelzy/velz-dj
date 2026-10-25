@@ -33,6 +33,74 @@ export function barsToOutro(grid: BeatGrid, duration: number, posSec: number, ba
   return Math.max(0, Math.ceil((start - posSec) / barSeconds(grid)));
 }
 
+/**
+ * Audio time when a deck at (posBase, posBaseTime) advancing at posRate
+ * reaches targetPos. Pure math behind engine.audioTimeAtTrackPos — the
+ * driver schedules blends against audio time, never wall-clock time.
+ */
+export function audioTimeAtPos(
+  posBase: number,
+  posBaseTime: number,
+  posRate: number,
+  targetPos: number,
+): number {
+  return posBaseTime + (targetPos - posBase) / posRate;
+}
+
+/** Equal-power crossfader gain curves from fromV to toV (mirrors the engine's scheduled curve). */
+export function equalPowerCurve(
+  fromV: number,
+  toV: number,
+  points = 128,
+): { a: Float32Array; b: Float32Array } {
+  const gains = (v: number): [number, number] => {
+    const angle = ((clamp(v, -1, 1) + 1) / 2) * (Math.PI / 2);
+    return [Math.cos(angle), Math.sin(angle)];
+  };
+  const a = new Float32Array(points);
+  const b = new Float32Array(points);
+  for (let i = 0; i < points; i++) {
+    const v = fromV + (toV - fromV) * (i / (points - 1));
+    const [ga, gb] = gains(v);
+    a[i] = ga;
+    b[i] = gb;
+  }
+  return { a, b };
+}
+
+/** Linear dB ramp curve (mirrors the engine's scheduled EQ curve). */
+export function dbRampCurve(fromDb: number, toDb: number, points = 64): Float32Array {
+  const c = new Float32Array(points);
+  for (let i = 0; i < points; i++) c[i] = fromDb + (toDb - fromDb) * (i / (points - 1));
+  return c;
+}
+
+/** EQ knob value → dB, same mapping as the engine (knob −1 = −26 dB cut). */
+export const knobToDb = (knob: number): number => clamp(knob, -1, 1) * 26;
+
+/**
+ * Resolve a saved playlist's fileKeys against the current library.
+ * fileKeys are stable across reloads (session track ids are not), so this
+ * is what makes a playlist survive close/reopen. Tracks no longer in the
+ * library are skipped gracefully — the caller reports the missing count
+ * in the UI, never breaks the queue.
+ */
+export function resolvePlaylistTracks(
+  fileKeys: string[],
+  tracks: TrackInfo[],
+): { found: TrackInfo[]; missing: number } {
+  const byKey = new Map<string, TrackInfo>();
+  for (const t of tracks) if (t.fileKey) byKey.set(t.fileKey, t);
+  const found: TrackInfo[] = [];
+  let missing = 0;
+  for (const k of fileKeys) {
+    const t = byKey.get(k);
+    if (t && t.file) found.push(t);
+    else missing++;
+  }
+  return { found, missing };
+}
+
 // ─── Camelot key compatibility ────────────────────────────────────────────
 
 interface Camelot {

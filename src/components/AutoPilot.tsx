@@ -5,8 +5,9 @@
 
 import { useState } from 'react';
 import type { TrackInfo } from '../types';
+import type { PlaylistRecord } from '../audio/playlistStore';
 
-export type ApPhase = 'idle' | 'waiting' | 'preparing' | 'crossfading' | 'fallback' | 'generating';
+export type ApPhase = 'idle' | 'waiting' | 'preparing' | 'scheduled' | 'crossfading' | 'fallback' | 'generating';
 
 export interface ApStatus {
   on: boolean;
@@ -44,12 +45,25 @@ interface AutoPilotProps {
   onQueueRemove: (id: string) => void;
   onQueueMove: (id: string, dir: -1 | 1) => void;
   onQueueClear: () => void;
+  /** Saved playlists (IndexedDB — survive reload). */
+  playlists: PlaylistRecord[];
+  onPlaylistSave: (name: string) => void;
+  onPlaylistLoad: (id: string) => void;
+  onPlaylistDelete: (id: string) => void;
+  onPlaylistRename: (id: string, name: string) => void;
+  /** Name of the playlist currently feeding the queue, if any. */
+  loadedPlaylistName: string | null;
+  /** Note about the last playlist load (e.g. missing tracks skipped). */
+  playlistNote: string | null;
+  loopPlaylist: boolean;
+  onLoopPlaylist: (v: boolean) => void;
 }
 
 const PHASE_LABEL: Record<ApPhase, string> = {
   idle: 'Idle — start a track and autopilot takes it from there',
   waiting: 'Watching the playing deck',
   preparing: 'Loading next track',
+  scheduled: 'Blend scheduled on the audio clock',
   crossfading: 'Blending into the next track',
   fallback: 'No next track — looping the outro',
   generating: 'Generating next with AI…',
@@ -58,6 +72,9 @@ const PHASE_LABEL: Record<ApPhase, string> = {
 export default function AutoPilot(p: AutoPilotProps) {
   const [queueOpen, setQueueOpen] = useState(false);
   const [addId, setAddId] = useState('');
+  const [plName, setPlName] = useState('');
+  const [renamingId, setRenamingId] = useState<string | null>(null);
+  const [renameText, setRenameText] = useState('');
   const s = p.status;
   const addable = p.library.filter((t) => t.file && !p.queue.some((q) => q.id === t.id));
 
@@ -169,6 +186,98 @@ export default function AutoPilot(p: AutoPilotProps) {
               ))}
             </ol>
           )}
+          {/* Saved playlists — durable across reloads (IndexedDB). Loading
+              one REPLACES the queue; after it plays in order, autopilot
+              falls through to library auto-pick so the music never stops
+              (or loops the playlist when the loop box is ticked). */}
+          <div className="mt-3 border-t border-zinc-800 pt-2">
+            <p className="mb-2 text-xs font-bold text-zinc-300">
+              Playlists
+              {p.loadedPlaylistName && <span className="font-normal text-emerald-300"> · loaded: {p.loadedPlaylistName}</span>}
+            </p>
+            {p.playlistNote && <p className="mb-2 text-xs text-amber-300">{p.playlistNote}</p>}
+            <div className="mb-2 flex items-center gap-2">
+              <input
+                value={plName}
+                onChange={(e) => setPlName(e.target.value)}
+                placeholder="Playlist name…"
+                className="min-w-0 flex-1 rounded bg-zinc-800 px-2 py-1 text-xs text-zinc-100"
+              />
+              <button
+                disabled={p.queue.length === 0 || !plName.trim()}
+                onClick={() => { p.onPlaylistSave(plName.trim()); setPlName(''); }}
+                className="rounded bg-sky-700 px-2 py-1 text-xs font-bold text-white hover:bg-sky-600 disabled:opacity-40"
+                title="Save the current queue as a named playlist (same name replaces that playlist)"
+              >
+                Save queue
+              </button>
+            </div>
+            <label className="mb-2 flex items-center gap-2 text-xs text-zinc-400" title="When the loaded playlist runs out, restart it from the top instead of falling through to auto-pick">
+              <input
+                type="checkbox"
+                checked={p.loopPlaylist}
+                disabled={!p.loadedPlaylistName}
+                onChange={(e) => p.onLoopPlaylist(e.target.checked)}
+              />
+              Loop loaded playlist
+              {!p.loadedPlaylistName && <span className="text-zinc-600">(load a playlist first)</span>}
+            </label>
+            {p.playlists.length === 0 ? (
+              <p className="text-xs text-zinc-500">No saved playlists yet — build a queue above and save it.</p>
+            ) : (
+              <ul className="space-y-1">
+                {p.playlists.map((pl) => (
+                  <li key={pl.id} className="flex items-center gap-2 rounded bg-zinc-800/60 px-2 py-1 text-xs">
+                    {renamingId === pl.id ? (
+                      <>
+                        <input
+                          value={renameText}
+                          onChange={(e) => setRenameText(e.target.value)}
+                          className="min-w-0 flex-1 rounded bg-zinc-800 px-2 py-0.5 text-zinc-100"
+                        />
+                        <button
+                          disabled={!renameText.trim()}
+                          onClick={() => { p.onPlaylistRename(pl.id, renameText.trim()); setRenamingId(null); }}
+                          className="rounded bg-sky-700 px-1 py-0.5 font-bold text-white hover:bg-sky-600 disabled:opacity-40"
+                        >
+                          Save
+                        </button>
+                        <button onClick={() => setRenamingId(null)} className="rounded px-1 text-zinc-400 hover:bg-zinc-700">Cancel</button>
+                      </>
+                    ) : (
+                      <>
+                        <span className="min-w-0 flex-1 truncate text-zinc-200">
+                          {pl.name}
+                          <span className="text-zinc-500"> · {pl.fileKeys.length} track{pl.fileKeys.length === 1 ? '' : 's'}</span>
+                        </span>
+                        <button
+                          onClick={() => p.onPlaylistLoad(pl.id)}
+                          className="rounded bg-emerald-700 px-2 py-0.5 font-bold text-white hover:bg-emerald-600"
+                          title="Load into the autopilot queue (replaces the current queue)"
+                        >
+                          Load
+                        </button>
+                        <button
+                          onClick={() => { setRenamingId(pl.id); setRenameText(pl.name); }}
+                          className="rounded px-1 text-zinc-400 hover:bg-zinc-700"
+                          title="Rename playlist"
+                        >
+                          Rename
+                        </button>
+                        <button
+                          onClick={() => p.onPlaylistDelete(pl.id)}
+                          className="rounded px-1 text-zinc-400 hover:bg-zinc-700 hover:text-red-300"
+                          title="Delete playlist"
+                        >
+                          ✕
+                        </button>
+                      </>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
         </div>
       )}
     </div>
