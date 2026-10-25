@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, type ReactNode } from 'react';
 import { engine } from '../audio/engine';
 import { midi } from '../midi';
 
@@ -142,10 +142,24 @@ function Meter({ getLevel, color = '#22c55e' }: { getLevel: () => number; color?
 const killBtn = (active: boolean, onClick: () => void, label: string) => (
   <button
     onClick={onClick}
-    className={`h-6 w-10 rounded text-[10px] font-bold ${active ? 'bg-red-600 text-white' : 'bg-zinc-800 text-zinc-500 hover:bg-zinc-700'}`}
+    className={`h-6 w-6 rounded text-[10px] font-bold ${active ? 'bg-red-600 text-white' : 'bg-zinc-800 text-zinc-500 hover:bg-zinc-700'}`}
   >
     {label}
   </button>
+);
+
+// EQ row: the knob sits exactly on the strip's center axis. The kill
+// button is absolutely positioned to the knob's right (2px gap,
+// vertically centered on the 44px knob circle via a 10px top offset),
+// so it can never push the knob off-axis. The 88px row keeps the
+// strip footprint unchanged; the 24px button extends 4px into the
+// strip's padding, well inside the card. Shared by ChannelStrip and
+// SamplerStrip so all four strips match exactly.
+const eqRow = (knob: ReactNode, kill: ReactNode) => (
+  <div className="relative flex w-[88px] justify-center">
+    {knob}
+    <div className="absolute left-[calc(50%+24px)] top-2.5">{kill}</div>
+  </div>
 );
 
 function ChannelStrip({ id, label, accent, ch, set, deckId, midiPrefix, fxMidiId }: {
@@ -189,18 +203,18 @@ function ChannelStrip({ id, label, accent, ch, set, deckId, midiPrefix, fxMidiId
         <span className="text-xs font-bold text-zinc-200">{label}</span>
       </div>
       <Knob label="trim" value={ch.trim} min={0} max={2} onChange={(v) => upd({ trim: v })} size={40} />
-      <div className="flex items-center gap-1">
-        <Knob label="hi" value={ch.eqHigh} onChange={(v) => upd({ eqHigh: v })} size={44} />
-        {killBtn(ch.highKill, () => upd({ highKill: !ch.highKill }), 'K')}
-      </div>
-      <div className="flex items-center gap-1">
-        <Knob label="mid" value={ch.eqMid} onChange={(v) => upd({ eqMid: v })} size={44} />
-        {killBtn(ch.midKill, () => upd({ midKill: !ch.midKill }), 'K')}
-      </div>
-      <div className="flex items-center gap-1">
-        <Knob label="low" value={ch.eqLow} onChange={(v) => upd({ eqLow: v })} size={44} />
-        {killBtn(ch.lowKill, () => upd({ lowKill: !ch.lowKill }), 'K')}
-      </div>
+      {eqRow(
+        <Knob label="hi" value={ch.eqHigh} onChange={(v) => upd({ eqHigh: v })} size={44} />,
+        killBtn(ch.highKill, () => upd({ highKill: !ch.highKill }), 'K'),
+      )}
+      {eqRow(
+        <Knob label="mid" value={ch.eqMid} onChange={(v) => upd({ eqMid: v })} size={44} />,
+        killBtn(ch.midKill, () => upd({ midKill: !ch.midKill }), 'K'),
+      )}
+      {eqRow(
+        <Knob label="low" value={ch.eqLow} onChange={(v) => upd({ eqLow: v })} size={44} />,
+        killBtn(ch.lowKill, () => upd({ lowKill: !ch.lowKill }), 'K'),
+      )}
       <Knob label="filter" value={ch.filter} onChange={(v) => upd({ filter: v })} size={44} />
       <Knob label="fx send" value={ch.fxSend} min={0} max={1} onChange={(v) => upd({ fxSend: v })} size={36} />
       <Meter getLevel={() => engine.deckLevel(deckId)} />
@@ -264,18 +278,18 @@ function SamplerStrip({ ch, set, vol, setVol, muted, setMuted }: {
         <span className="text-xs font-bold text-zinc-200">SMP</span>
       </div>
       <Knob label="trim" value={ch.trim} min={0} max={2} onChange={(v) => upd({ trim: v })} size={40} />
-      <div className="flex items-center gap-1">
-        <Knob label="hi" value={ch.eqHigh} onChange={(v) => upd({ eqHigh: v })} size={44} />
-        {killBtn(ch.highKill, () => upd({ highKill: !ch.highKill }), 'K')}
-      </div>
-      <div className="flex items-center gap-1">
-        <Knob label="mid" value={ch.eqMid} onChange={(v) => upd({ eqMid: v })} size={44} />
-        {killBtn(ch.midKill, () => upd({ midKill: !ch.midKill }), 'K')}
-      </div>
-      <div className="flex items-center gap-1">
-        <Knob label="low" value={ch.eqLow} onChange={(v) => upd({ eqLow: v })} size={44} />
-        {killBtn(ch.lowKill, () => upd({ lowKill: !ch.lowKill }), 'K')}
-      </div>
+      {eqRow(
+        <Knob label="hi" value={ch.eqHigh} onChange={(v) => upd({ eqHigh: v })} size={44} />,
+        killBtn(ch.highKill, () => upd({ highKill: !ch.highKill }), 'K'),
+      )}
+      {eqRow(
+        <Knob label="mid" value={ch.eqMid} onChange={(v) => upd({ eqMid: v })} size={44} />,
+        killBtn(ch.midKill, () => upd({ midKill: !ch.midKill }), 'K'),
+      )}
+      {eqRow(
+        <Knob label="low" value={ch.eqLow} onChange={(v) => upd({ eqLow: v })} size={44} />,
+        killBtn(ch.lowKill, () => upd({ lowKill: !ch.lowKill }), 'K'),
+      )}
       <Knob label="filter" value={ch.filter} onChange={(v) => upd({ filter: v })} size={44} />
       <Knob label="fx send" value={ch.fxSend} min={0} max={1} onChange={(v) => upd({ fxSend: v })} size={36} />
       <Meter getLevel={() => engine.samplerOutputLevel()} color="#4ade80" />
