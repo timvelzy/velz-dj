@@ -173,6 +173,10 @@ export default function Deck(props: DeckProps) {
       midi.registerControl(`${deckId}.loopExit`, { kind: 'button', onButton: (p) => { if (p) props.onLoopExit(); } }),
       midi.registerControl(`${deckId}.loopHalve`, { kind: 'button', onButton: (p) => { if (p) props.onLoopHalve(); } }),
       midi.registerControl(`${deckId}.loopDouble`, { kind: 'button', onButton: (p) => { if (p) props.onLoopDouble(); } }),
+      midi.registerControl(`${deckId}.hotcue1`, { kind: 'button', onButton: (p) => { if (p) props.onHotcue(0, false); } }),
+      midi.registerControl(`${deckId}.hotcue2`, { kind: 'button', onButton: (p) => { if (p) props.onHotcue(1, false); } }),
+      midi.registerControl(`${deckId}.hotcue3`, { kind: 'button', onButton: (p) => { if (p) props.onHotcue(2, false); } }),
+      midi.registerControl(`${deckId}.hotcue4`, { kind: 'button', onButton: (p) => { if (p) props.onHotcue(3, false); } }),
     ];
     return () => regs.forEach((u) => u());
     // eslint-disable-next-line react-hooks/exhaustive-deps

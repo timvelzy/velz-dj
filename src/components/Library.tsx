@@ -9,13 +9,16 @@ interface LibraryProps {
   masterKey?: string;
   onAddFiles: (files: FileList) => void;
   onLoadToDeck: (trackId: string, deck: 'A' | 'B') => void;
+  /** Row highlighted as the hardware browse selection (null = none). */
+  selectedTrackId?: string | null;
+  onSelectTrack?: (trackId: string) => void;
   onRemoveTrack: (trackId: string) => void;
   onClearLibrary: () => void;
   libraryError: string | null;
   onDismissLibraryError: () => void;
 }
 
-export default function Library({ tracks, masterKey, onAddFiles, onLoadToDeck, onRemoveTrack, onClearLibrary, libraryError, onDismissLibraryError }: LibraryProps) {
+export default function Library({ tracks, masterKey, onAddFiles, onLoadToDeck, onRemoveTrack, onClearLibrary, libraryError, onDismissLibraryError, selectedTrackId, onSelectTrack }: LibraryProps) {
   const inputRef = useRef<HTMLInputElement>(null);
   const [pasteText, setPasteText] = useState('');
   const [matches, setMatches] = useState<MatchResult[] | null>(null);
@@ -98,8 +101,9 @@ export default function Library({ tracks, masterKey, onAddFiles, onLoadToDeck, o
                   key={t.id}
                   draggable
                   onDragStart={(e) => e.dataTransfer.setData('text/track-id', t.id)}
-                  className="cursor-grab border-t border-zinc-900 hover:bg-zinc-900"
-                  title="Drag onto a deck"
+                  onClick={() => onSelectTrack?.(t.id)}
+                  className={`cursor-grab border-t border-zinc-900 ${selectedTrackId === t.id ? 'bg-cyan-950/60' : 'hover:bg-zinc-900'}`}
+                  title="Drag onto a deck — click to select for hardware load"
                 >
                   <td className="px-2 py-1.5 font-medium text-zinc-200">{t.title}</td>
                   <td className="px-2 py-1.5 text-zinc-500">{t.artist || '—'}</td>

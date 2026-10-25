@@ -115,6 +115,13 @@ export default function App() {
   const [tracks, setTracks] = useState<TrackInfo[]>([]);
   const tracksRef = useRef<TrackInfo[]>([]);
   tracksRef.current = tracks;
+  // Library selection for hardware browse: the highlighted row the S8
+  // browse encoder moves and the load buttons act on. Kept as an id
+  // (not an index) so it survives list appends; cleared if the track
+  // leaves the library.
+  const [selectedTrackId, setSelectedTrackId] = useState<string | null>(null);
+  const selectedTrackIdRef = useRef<string | null>(null);
+  selectedTrackIdRef.current = selectedTrackId;
   // Shown in the library when a save fails (quota etc.) — the track stays
   // usable in-session, but it will not survive a reload until storage frees up.
   const [libraryError, setLibraryError] = useState<string | null>(null);
@@ -1625,6 +1632,33 @@ export default function App() {
     return unreg;
   }, [toggleAp]);
 
+  // MIDI — library browse + load reuse loadLibraryTrack exactly (the
+  // mouse-load path, including restored-track lazy decode and the
+  // pause-first behavior on a playing deck). Empty library or no
+  // selection: browse/load are no-ops.
+  useEffect(() => {
+    const regs = [
+      midi.registerControl('library.browse', {
+        kind: 'jog',
+        onRelative: (d) => {
+          const list = tracksRef.current;
+          if (!list.length) return;
+          const curIdx = list.findIndex((t) => t.id === selectedTrackIdRef.current);
+          const next = curIdx < 0 ? 0 : Math.min(list.length - 1, Math.max(0, curIdx + Math.sign(d)));
+          setSelectedTrackId(list[next].id);
+        },
+      }),
+      midi.registerControl('deckA.load', { kind: 'button', onButton: (p) => { if (p) { const id = selectedTrackIdRef.current; if (id) loadLibraryTrack(id, 'A'); } } }),
+      midi.registerControl('deckB.load', { kind: 'button', onButton: (p) => { if (p) { const id = selectedTrackIdRef.current; if (id) loadLibraryTrack(id, 'B'); } } }),
+    ];
+    return () => regs.forEach((u) => u());
+  }, [loadLibraryTrack]);
+
+  // Clear the hardware selection if its track leaves the library.
+  useEffect(() => {
+    if (selectedTrackId && !tracks.some((t) => t.id === selectedTrackId)) setSelectedTrackId(null);
+  }, [tracks, selectedTrackId]);
+
   const apQueueAdd = (id: string) => setApQueueIds((ids) => (ids.includes(id) ? ids : [...ids, id]));
   const apQueueRemove = (id: string) => setApQueueIds((ids) => ids.filter((x) => x !== id));
   const apQueueMove = (id: string, dir: -1 | 1) =>
@@ -2214,6 +2248,8 @@ export default function App() {
           masterKey={masterKey}
           onAddFiles={addFiles}
           onLoadToDeck={loadLibraryTrack}
+          selectedTrackId={selectedTrackId}
+          onSelectTrack={setSelectedTrackId}
           onRemoveTrack={removeLibraryTrack}
           onClearLibrary={clearLibrary}
           libraryError={libraryError}

@@ -54,6 +54,11 @@ export const BINDABLE_CONTROLS: BindableControl[] = [
   { id: 'deckA.loopExit', label: 'Loop exit (keep playing)', group: 'Deck A' },
   { id: 'deckA.loopHalve', label: 'Loop halve', group: 'Deck A' },
   { id: 'deckA.loopDouble', label: 'Loop double', group: 'Deck A' },
+  { id: 'deckA.load', label: 'Load selected to deck A', group: 'Deck A' },
+  { id: 'deckA.hotcue1', label: 'Hotcue 1', group: 'Deck A' },
+  { id: 'deckA.hotcue2', label: 'Hotcue 2', group: 'Deck A' },
+  { id: 'deckA.hotcue3', label: 'Hotcue 3', group: 'Deck A' },
+  { id: 'deckA.hotcue4', label: 'Hotcue 4', group: 'Deck A' },
   // Deck B
   { id: 'deckB.play', label: 'Play / Pause', group: 'Deck B' },
   { id: 'deckB.cue', label: 'Cue', group: 'Deck B' },
@@ -68,6 +73,11 @@ export const BINDABLE_CONTROLS: BindableControl[] = [
   { id: 'deckB.loopExit', label: 'Loop exit (keep playing)', group: 'Deck B' },
   { id: 'deckB.loopHalve', label: 'Loop halve', group: 'Deck B' },
   { id: 'deckB.loopDouble', label: 'Loop double', group: 'Deck B' },
+  { id: 'deckB.load', label: 'Load selected to deck B', group: 'Deck B' },
+  { id: 'deckB.hotcue1', label: 'Hotcue 1', group: 'Deck B' },
+  { id: 'deckB.hotcue2', label: 'Hotcue 2', group: 'Deck B' },
+  { id: 'deckB.hotcue3', label: 'Hotcue 3', group: 'Deck B' },
+  { id: 'deckB.hotcue4', label: 'Hotcue 4', group: 'Deck B' },
   // Mixer
   { id: 'mixer.crossfader', label: 'Crossfader', group: 'Mixer' },
   { id: 'mixer.chA.fader', label: 'Ch A fader', group: 'Mixer' },
@@ -135,6 +145,7 @@ export const BINDABLE_CONTROLS: BindableControl[] = [
   { id: 'sampler.pad7.volume', label: 'Pad 7 volume', group: 'Sampler' },
   { id: 'sampler.pad8.volume', label: 'Pad 8 volume', group: 'Sampler' },
   { id: 'sampler.quantize', label: 'Quantize toggle', group: 'Sampler' },
+  { id: 'library.browse', label: 'Browse library', group: 'Library' },
   { id: 'sampler.rec', label: 'Record from deck (toggle)', group: 'Sampler' },
 ];
 
@@ -172,6 +183,17 @@ export const S8_TEMPLATE: { physical: string; controlId: string }[] = [
   { physical: 'Right remix fader 3', controlId: 'sampler.pad7.volume' },
   { physical: 'Right remix fader 4', controlId: 'sampler.pad8.volume' },
   { physical: 'Master knob', controlId: 'mixer.master' },
+  { physical: 'Browse encoder', controlId: 'library.browse' },
+  { physical: 'Left LOAD button', controlId: 'deckA.load' },
+  { physical: 'Right LOAD button', controlId: 'deckB.load' },
+  { physical: 'Left performance pad 1', controlId: 'deckA.hotcue1' },
+  { physical: 'Left performance pad 2', controlId: 'deckA.hotcue2' },
+  { physical: 'Left performance pad 3', controlId: 'deckA.hotcue3' },
+  { physical: 'Left performance pad 4', controlId: 'deckA.hotcue4' },
+  { physical: 'Right performance pad 1', controlId: 'deckB.hotcue1' },
+  { physical: 'Right performance pad 2', controlId: 'deckB.hotcue2' },
+  { physical: 'Right performance pad 3', controlId: 'deckB.hotcue3' },
+  { physical: 'Right performance pad 4', controlId: 'deckB.hotcue4' },
 ];
 
 const STORAGE_KEY = 'velz-dj-midi-bindings-v1';
