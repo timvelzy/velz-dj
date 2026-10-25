@@ -399,6 +399,15 @@ export default function App() {
     const d = engine.decks.get(deckId);
     if (!d) return;
     engine.pause(deckId);
+    // Fresh transport state for the NEW track: pause() captures the OLD
+    // track's position into posBase, and play() defaults its offset to
+    // posBase — without this reset a new track would start at the old
+    // track's last position and run out (onended) seconds later. A stale
+    // loop region would likewise carry over, so it is cleared too.
+    d.posBase = 0;
+    d.posBaseTime = engine.ctx.currentTime;
+    d.loopStart = null;
+    d.loopEnd = null;
     setDeckState(deckKey, { ...deckInit(), analyzing: true, analysisProgress: 0 });
 
     try {
@@ -483,6 +492,13 @@ export default function App() {
     const d = engine.decks.get(deckId);
     if (!d || !track.file) return;
     engine.pause(deckId);
+    // Same fresh-transport reset as loadTrack: a restored track must
+    // start at 0, not at the previous track's last position, and must
+    // not inherit a stale loop region.
+    d.posBase = 0;
+    d.posBaseTime = engine.ctx.currentTime;
+    d.loopStart = null;
+    d.loopEnd = null;
     setDeckState(deckKey, { ...deckInit(), analyzing: true, analysisProgress: 0 });
     try {
       const raw = await track.file.arrayBuffer();
