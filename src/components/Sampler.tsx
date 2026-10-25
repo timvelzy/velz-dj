@@ -113,8 +113,6 @@ export default function Sampler() {
   // Quantize defaults ON (EDM sync feature): pads drop on the next master
   // beat. The checkbox defeats it for manual triggering.
   const [quantize, setQuantize] = useState(true);
-  const [master, setMaster] = useState(0.9);
-  const [muted, setMuted] = useState(false);
   const [open, setOpen] = useState(true);
   const flashTimers = useRef<number[]>([]);
 
@@ -173,13 +171,6 @@ export default function Sampler() {
     engine.setPadVolume(i, v);
     refreshPad(i);
   }, [refreshPad]);
-
-  const toggleMute = useCallback(() => {
-    setMuted((m) => {
-      engine.setSamplerMuted(!m);
-      return !m;
-    });
-  }, []);
 
   const startRec = useCallback(() => {
     setRecError(null);
@@ -305,27 +296,9 @@ export default function Sampler() {
             />
             QUANTIZE
           </label>
-          <label className="flex items-center gap-1.5 text-[10px] font-mono text-zinc-400">
-            VOL
-            <input
-              type="range" min={0} max={1} step={0.01} value={master}
-              className="w-16 h-1"
-              onChange={(e) => {
-                const v = parseFloat(e.target.value);
-                setMaster(v);
-                engine.setSamplerMaster(v);
-              }}
-            />
-          </label>
-          <button
-            onClick={toggleMute}
-            title="Mute the sampler channel"
-            className={`rounded px-2 py-0.5 text-[10px] font-mono font-bold ${
-              muted ? 'bg-red-900/60 text-red-300' : 'bg-zinc-800 text-zinc-400 hover:text-zinc-200'
-            }`}
-          >
-            {muted ? 'MUTED' : 'MUTE'}
-          </button>
+          {/* Channel volume + mute live on the sampler strip in the
+              mixer now (single control, no competing VOL here). */}
+          <span className="text-[10px] font-mono text-zinc-600">VOL + MUTE on mixer strip</span>
         </div>
       </div>
       {/* Record from a playing deck into a pad. Tap is parallel to the

@@ -28,6 +28,10 @@ interface MixerProps {
   setChA: (c: ChannelState) => void;
   setChB: (c: ChannelState) => void;
   setChC: (c: ChannelState) => void;
+  samplerVol: number;
+  setSamplerVol: (v: number) => void;
+  samplerMuted: boolean;
+  setSamplerMuted: (m: boolean) => void;
   crossfader: number;
   setCrossfader: (v: number) => void;
   masterVol: number;
@@ -204,10 +208,11 @@ export default function Mixer(props: MixerProps) {
       midi.registerControl('mixer.chA.fader', { kind: 'fader', onAbsolute: (v) => props.setChA({ ...props.chA, fader: v }) }),
       midi.registerControl('mixer.chB.fader', { kind: 'fader', onAbsolute: (v) => props.setChB({ ...props.chB, fader: v }) }),
       midi.registerControl('mixer.chC.fader', { kind: 'fader', onAbsolute: (v) => props.setChC({ ...props.chC, fader: v }) }),
+      midi.registerControl('mixer.chS.fader', { kind: 'fader', onAbsolute: (v) => props.setSamplerVol(v) }),
     ];
     return () => regs.forEach((u) => u());
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [props.chA.fader, props.chB.fader, props.chC.fader]);
+  }, [props.chA.fader, props.chB.fader, props.chC.fader, props.samplerVol]);
 
   const applyX = (v: number) => {
     setCrossfader(v);
@@ -221,6 +226,33 @@ export default function Mixer(props: MixerProps) {
         <ChannelStrip id="chA" label="A" accent="#38bdf8" ch={props.chA} set={props.setChA} deckId="deckA" midiPrefix="mixer.chA" fxMidiId="fx.sendA" />
         <ChannelStrip id="chC" label="AI" accent="#c084fc" ch={props.chC} set={props.setChC} deckId="deckC" midiPrefix="mixer.chC" fxMidiId="fx.sendC" />
         <ChannelStrip id="chB" label="B" accent="#fb923c" ch={props.chB} set={props.setChB} deckId="deckB" midiPrefix="mixer.chB" fxMidiId="fx.sendB" />
+        {/* Sampler channel strip: the sampler's ONLY channel-level volume
+            + mute. It drives the same engine state the sampler panel's
+            old VOL/MUTE row drove (samplerMaster gain; mute keeps the
+            level so unmute restores it exactly). No EQ/trim/filter here:
+            the sampler bus has none in the engine, and per-pad volumes
+            still live on the sampler panel under Deck B. */}
+        <div className="flex flex-col items-center gap-1.5 rounded-lg border border-zinc-800 bg-zinc-950 p-2">
+          <div className="flex items-center gap-1.5">
+            <span className="h-2.5 w-2.5 rounded-full" style={{ background: '#4ade80' }} />
+            <span className="text-xs font-bold text-zinc-200">SMP</span>
+          </div>
+          <Meter getLevel={() => engine.samplerOutputLevel()} color="#4ade80" />
+          <input
+            type="range" min={0} max={1} step={0.01} value={props.samplerVol}
+            onChange={(e) => props.setSamplerVol(Number(e.target.value))}
+            className="h-24 w-2 accent-emerald-500"
+            style={{ writingMode: 'vertical-lr', direction: 'rtl' } as React.CSSProperties}
+            title="Sampler channel fader"
+          />
+          <button
+            onClick={() => props.setSamplerMuted(!props.samplerMuted)}
+            className={`h-7 w-full rounded px-1 text-[10px] font-bold ${props.samplerMuted ? 'bg-red-600 text-white' : 'bg-zinc-800 text-zinc-400'}`}
+            title="Mute the sampler channel (level is kept, not lost)"
+          >
+            {props.samplerMuted ? 'MUTED' : 'MUTE'}
+          </button>
+        </div>
       </div>
 
       {/* Crossfader */}
