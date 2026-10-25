@@ -1056,10 +1056,17 @@ export default function App() {
         } : null}
       />
 
+      {/* FX strip — full width along the top of the mixer area:
+          below the horizontal full-width waveforms above, above
+          Deck A, the mixer EQ section, and Deck B. */}
+      <div className="px-3 pt-3">
+        <FxUnit />
+      </div>
+
       {/* Decks + mixer in stacked columns (Traktor-style): AI under
-          Deck A, FX above the mixer in the center, sampler back under
-          Deck B. The center column is wider now so the 4-channel
-          mixer (A, AI, B, sampler) fits in one row. */}
+          Deck A, sampler back under Deck B. The center column is
+          wider now so the 4-channel mixer (A, AI, B, sampler) fits
+          in one row. */}
       <main className="grid items-start gap-3 p-3 lg:grid-cols-[1fr_460px_1fr]">
         {/* Left column: Deck A, then the AI deck underneath it. */}
         <div className="flex flex-col gap-3">
@@ -1093,10 +1100,9 @@ export default function App() {
             onLyriaKeyChange={applyLyriaKey}
           />
         </div>
-        {/* Center column: FX unit on top (Traktor-style), mixer below. */}
+        {/* Center column: mixer only (FX lives in the full-width
+            strip above the mixer area). */}
         <div className="flex flex-col gap-3">
-          {/* FX unit — beat-synced send/return */}
-          <FxUnit />
           <Mixer
             chA={chA} chB={chB} chC={chC}
             setChA={setChA} setChB={setChB} setChC={setChC}
