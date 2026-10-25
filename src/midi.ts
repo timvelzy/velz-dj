@@ -103,6 +103,14 @@ export const BINDABLE_CONTROLS: BindableControl[] = [
   { id: 'sampler.pad6', label: 'Pad 6', group: 'Sampler' },
   { id: 'sampler.pad7', label: 'Pad 7', group: 'Sampler' },
   { id: 'sampler.pad8', label: 'Pad 8', group: 'Sampler' },
+  { id: 'sampler.pad1.volume', label: 'Pad 1 volume', group: 'Sampler' },
+  { id: 'sampler.pad2.volume', label: 'Pad 2 volume', group: 'Sampler' },
+  { id: 'sampler.pad3.volume', label: 'Pad 3 volume', group: 'Sampler' },
+  { id: 'sampler.pad4.volume', label: 'Pad 4 volume', group: 'Sampler' },
+  { id: 'sampler.pad5.volume', label: 'Pad 5 volume', group: 'Sampler' },
+  { id: 'sampler.pad6.volume', label: 'Pad 6 volume', group: 'Sampler' },
+  { id: 'sampler.pad7.volume', label: 'Pad 7 volume', group: 'Sampler' },
+  { id: 'sampler.pad8.volume', label: 'Pad 8 volume', group: 'Sampler' },
   { id: 'sampler.quantize', label: 'Quantize toggle', group: 'Sampler' },
 ];
 
@@ -129,6 +137,14 @@ export const S8_TEMPLATE: { physical: string; controlId: string }[] = [
   { physical: 'Ch 2 HI / MID / LOW', controlId: 'mixer.chB.eqHigh' },
   { physical: 'Ch 1 FILTER knob', controlId: 'mixer.chA.filter' },
   { physical: 'Ch 2 FILTER knob', controlId: 'mixer.chB.filter' },
+  { physical: 'Left remix fader 1', controlId: 'sampler.pad1.volume' },
+  { physical: 'Left remix fader 2', controlId: 'sampler.pad2.volume' },
+  { physical: 'Left remix fader 3', controlId: 'sampler.pad3.volume' },
+  { physical: 'Left remix fader 4', controlId: 'sampler.pad4.volume' },
+  { physical: 'Right remix fader 1', controlId: 'sampler.pad5.volume' },
+  { physical: 'Right remix fader 2', controlId: 'sampler.pad6.volume' },
+  { physical: 'Right remix fader 3', controlId: 'sampler.pad7.volume' },
+  { physical: 'Right remix fader 4', controlId: 'sampler.pad8.volume' },
   { physical: 'Master knob', controlId: 'mixer.master' },
 ];
 
