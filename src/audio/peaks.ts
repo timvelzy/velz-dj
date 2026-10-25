@@ -132,7 +132,17 @@ export function bandColor(peaks: BandPeaks, i: number): string {
   const lo = peaks.low[i] ?? 0;
   const md = peaks.mid[i] ?? 0;
   const hi = peaks.high[i] ?? 0;
-  if (lo >= md && lo >= hi) return '#fb923c'; // low — warm orange
-  if (hi >= md) return '#e0f2fe'; // high — pale sky/white
-  return '#4ade80'; // mid — green
+  // Vivid band palette adopted exactly from groove-web-mixer's
+  // DetailedScrollingWaveform (dominant-band coloring, same approach as
+  // here): bass #ff2d55, mid #32d74b, high #007aff. The previous velz-dj
+  // palette (low #fb923c, mid #4ade80, high #e0f2fe) read muted next to
+  // groove's render, notably the near-white pale high band. Beatgrid
+  // contrast: grid lines stay deck-colored (A #38bdf8, B #fb923c, AI
+  // #c084fc — all distinct hues from the three band colors), downbeats
+  // are 2px solid with a white first-beat marker, and the unplayed dim
+  // is drawn under the grid so lines stay full-strength over dimmed
+  // upcoming audio.
+  if (lo >= md && lo >= hi) return '#ff2d55'; // low — vivid pink-red
+  if (hi >= md) return '#007aff'; // high — vivid blue
+  return '#32d74b'; // mid — vivid green
 }

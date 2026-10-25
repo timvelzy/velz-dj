@@ -189,10 +189,21 @@ function TopWaveformRow({ deck, pxPerSec, height }: RowProps) {
       const pos = engine.position(deck.deckId);
       const dur = deck.buffer.duration;
       const centerX = w / 2;
-      // Fixed center playhead: the window is anchored on the playhead.
-      // At the track edges the window clamps and the playhead sits
-      // off-center — unavoidable, and only for the first/last seconds.
-      const viewStart = Math.max(0, Math.min(Math.max(0, dur - w / pxPerSec), pos - centerX / pxPerSec));
+      // Fixed center playhead, groove ScrollingWaveformRenderer math:
+      // the window is anchored on the playhead and NEVER clamped, so
+      // t2x(pos) is identically centerX at every position. Negative
+      // viewStart is allowed (lead-in display): at t=0 the track start
+      // sits exactly on the center line with empty space to its left,
+      // and at the end the track end sits on the line with empty space
+      // to its right. The previous code clamped viewStart into
+      // [0, dur - w/pxPerSec], which dragged the audio position off the
+      // center line at both edges (at t=0 the position read at the left
+      // edge) — that clamp was the playback bug. Note groove itself has
+      // both patterns: DetailedScrollingWaveform clamps like the old
+      // code did, but ScrollingWaveformRenderer — the one that scrolls
+      // correctly — explicitly allows negative startTime, and that is
+      // the math ported here.
+      const viewStart = pos - centerX / pxPerSec;
       const viewEnd = viewStart + w / pxPerSec;
       const t2x = (t: number) => (t - viewStart) * pxPerSec;
 
@@ -231,6 +242,15 @@ function TopWaveformRow({ deck, pxPerSec, height }: RowProps) {
         }
         ctx.globalAlpha = 1;
       }
+
+      // Unplayed region dimmed — drawn BEFORE the beatgrid so grid lines
+      // stay full-strength over the dimmed upcoming audio (beatgrid
+      // contrast against the vivid band colors). With the unclamped
+      // window, px is identically centerX: played audio left of the
+      // line, upcoming audio right of it.
+      const px = t2x(pos);
+      ctx.fillStyle = 'rgba(0,0,0,0.30)';
+      ctx.fillRect(Math.max(0, px), 0, w - Math.max(0, px), h);
 
       // Beatgrid overlay, groove style: deck-colored lines drawn OVER the
       // colors — downbeats solid + thick, off-beats dashed + thin, with a
@@ -281,11 +301,6 @@ function TopWaveformRow({ deck, pxPerSec, height }: RowProps) {
         }
       }
 
-      // Unplayed region dimmed (right of the playhead reads as "ahead").
-      const px = t2x(pos);
-      ctx.fillStyle = 'rgba(0,0,0,0.30)';
-      ctx.fillRect(Math.max(0, px), 0, w - Math.max(0, px), h);
-
       // Fixed center playhead — white, always on top.
       ctx.fillStyle = '#ffffff';
       ctx.fillRect(centerX - 1, 0, 2, h);
@@ -305,7 +320,11 @@ function TopWaveformRow({ deck, pxPerSec, height }: RowProps) {
     const rect = wrapRef.current.getBoundingClientRect();
     const x = e.clientX - rect.left;
     const pos = engine.position(deck.deckId);
-    const viewStart = Math.max(0, Math.min(Math.max(0, deck.buffer.duration - rect.width / pxPerSec), pos - rect.width / 2 / pxPerSec));
+    // Same unclamped window as the draw loop: clicking the center line
+    // seeks to the current position at every point in the track,
+    // including the first/last seconds. The result is clamped to the
+    // track bounds below, never the window.
+    const viewStart = pos - rect.width / 2 / pxPerSec;
     deck.onSeek(Math.max(0, Math.min(deck.buffer.duration, viewStart + x / pxPerSec)));
   };
 
@@ -454,13 +473,13 @@ export default function CenterPlayheadView({ decks, ai }: { decks: [TopDeckView,
         </div>
         {!collapsed && (
           <div className="space-y-1 p-1">
-            <TopWaveformRow deck={decks[0]} pxPerSec={zoom} height={110} />
+            <TopWaveformRow deck={decks[0]} pxPerSec={zoom} height={140} />
             <div className="border-t border-zinc-800" />
-            <TopWaveformRow deck={decks[1]} pxPerSec={zoom} height={110} />
+            <TopWaveformRow deck={decks[1]} pxPerSec={zoom} height={140} />
             {ai && (
               <>
                 <div className="border-t border-zinc-800" />
-                <TopWaveformRow deck={ai} pxPerSec={zoom} height={88} />
+                <TopWaveformRow deck={ai} pxPerSec={zoom} height={112} />
               </>
             )}
           </div>
