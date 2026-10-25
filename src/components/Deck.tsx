@@ -18,6 +18,9 @@ export interface DeckState {
    * launches to the master bar (Phase 5 + quantized launch). */
   quantize: boolean;
   hotcues: (number | null)[];
+  /** Per-slot: true when that hotcue is an auto (analysis) value. A manual
+      set on the slot clears its flag (and persists as manualHotcues). */
+  hotcueAuto: boolean[];
   loop: { start: number; end: number } | null;
   /** Active Traktor-style loop size in bars (null for manual IN/OUT loops). */
   loopBars: number | null;
@@ -38,6 +41,8 @@ interface DeckProps {
   onCueDown: () => void;
   onCueUp: () => void;
   onSetCue: () => void;
+  /** Re-anchor the beat grid at the playhead: the nearest beat becomes bar 1 beat 1 (phase only, no re-analysis). */
+  onSetOneOne: () => void;
   onStop: () => void;
   onTempo: (v: number) => void;
   onSync: () => void;
@@ -299,6 +304,7 @@ export default function Deck(props: DeckProps) {
         color={accent}
         loop={state.loop}
         hotcues={state.hotcues}
+        hotcueAuto={state.hotcueAuto}
         onSeek={props.onSeek}
       />
       <Waveform
@@ -308,6 +314,7 @@ export default function Deck(props: DeckProps) {
         color={accent}
         loop={state.loop}
         hotcues={state.hotcues}
+        hotcueAuto={state.hotcueAuto}
         onSeek={props.onSeek}
         peaks={state.track?.peaks ?? null}
       />
@@ -402,6 +409,14 @@ export default function Deck(props: DeckProps) {
               SET CUE
             </button>
             <button
+              onClick={props.onSetOneOne}
+              disabled={!state.buffer}
+              title="Set 1.1: re-anchor the beat grid here — the beat nearest the playhead becomes bar 1 beat 1 (grid phase only, no re-analysis, saved with the track)"
+              className="h-8 flex-1 rounded bg-zinc-800 text-xs font-bold text-sky-300 hover:bg-zinc-700 disabled:opacity-40"
+            >
+              SET 1.1
+            </button>
+            <button
               onClick={props.onStop}
               disabled={!state.buffer}
               title="Stop and return to cue point (track start if none set)"
@@ -444,11 +459,12 @@ export default function Deck(props: DeckProps) {
             key={i}
             onClick={(e) => props.onHotcue(i, e.shiftKey)}
             onContextMenu={(e) => { e.preventDefault(); props.onHotcue(i, true); }}
-            title="Click: jump • Shift+click / right-click: set"
+            title={state.hotcueAuto?.[i] ? 'Auto hotcue (click: jump • Shift+click / right-click: set your own)' : 'Click: jump • Shift+click / right-click: set'}
             className={`h-8 flex-1 rounded text-xs font-bold ${hc !== null ? 'text-black' : 'bg-zinc-800 text-zinc-500'}`}
             style={hc !== null ? { background: ['#f472b6', '#fbbf24', '#a3e635', '#22d3ee'][i % 4] } : undefined}
           >
             {i + 1}
+            {state.hotcueAuto?.[i] && <span className="block text-[8px] leading-none">AUTO</span>}
           </button>
         ))}
         <div className="mx-1 h-8 w-px bg-zinc-800" />

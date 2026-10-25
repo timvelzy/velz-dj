@@ -64,8 +64,14 @@ export default function GridEditorModal({ deckId, deckLabel, grid, onSave, onClo
     const beats: number[] = [];
     for (let t = newFirst; t < duration; t += newSpb) beats.push(t);
     const bpmCurve = beats.map(() => newBpm).slice(0, Math.max(0, beats.length - 1));
+    // A hand edit rebuilds beats[], so the old barPhase residue is
+    // meaningless against the new map: drop it and let barPhaseOf()
+    // derive the phase from the NEW downbeatOffset (nearest mapped beat
+    // to it). Auto hotcues stay — they are structural times in seconds,
+    // not grid-relative, so a BPM correction does not move them.
+    const { barPhase: _oldPhase, ...rest } = grid;
     const next: BeatGrid = {
-      ...grid,
+      ...rest,
       bpm: newBpm,
       firstBeat: newFirst,
       downbeatOffset:

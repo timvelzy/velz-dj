@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { engine } from '../audio/engine';
 import type { BandPeaks, BeatGrid } from '../types';
 import { amplitudeRGB, resamplePeaks } from '../audio/peaks';
+import { barPhaseOf } from '../audio/loop';
 
 interface WaveformProps {
   deckId: 'deckA' | 'deckB' | 'deckC';
@@ -11,6 +12,8 @@ interface WaveformProps {
   height?: number;
   loop: { start: number; end: number } | null;
   hotcues: (number | null)[];
+  /** Per-slot: true when that hotcue is an auto (analysis) value, shown with an AUTO tag. */
+  hotcueAuto?: boolean[];
   onSeek: (t: number) => void;
   /** Precomputed band peaks (Phase 4) — band-colored rendering when present. */
   peaks?: BandPeaks | null;
@@ -35,7 +38,7 @@ function computePeaks(buffer: AudioBuffer, buckets: number): Float32Array {
 }
 
 export default function Waveform({
-  deckId, buffer, grid, color, height = 96, loop, hotcues, onSeek, peaks: bandPeaks,
+  deckId, buffer, grid, color, height = 96, loop, hotcues, hotcueAuto, onSeek, peaks: bandPeaks,
 }: WaveformProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
@@ -154,7 +157,8 @@ export default function Waveform({
           }
           for (let i = first; i < beats.length && beats[i] <= viewEnd; i++) {
             const x = t2x(beats[i]);
-            const isDown = ((i % 4) + 4) % 4 === 0;
+            const phase = barPhaseOf(grid);
+            const isDown = (((i - phase) % 4) + 4) % 4 === 0;
             ctx.strokeStyle = isDown ? 'rgba(255,255,255,0.55)' : 'rgba(255,255,255,0.18)';
             ctx.lineWidth = isDown ? 1.5 : 1;
             ctx.beginPath();
@@ -163,7 +167,7 @@ export default function Waveform({
             ctx.stroke();
             if (isDown && zoom > 40) {
               ctx.fillStyle = 'rgba(255,255,255,0.5)';
-              ctx.fillText(`${Math.floor(i / 4) + 1}`, x + 3, 10);
+              ctx.fillText(`${Math.max(1, Math.floor((i - phase) / 4) + 1)}`, x + 3, 10);
             }
           }
         } else {
@@ -198,6 +202,7 @@ export default function Waveform({
         ctx.fillStyle = ['#f472b6', '#fbbf24', '#a3e635', '#22d3ee'][i % 4];
         ctx.fillRect(x - 1, 0, 2, h);
         ctx.fillText(`${i + 1}`, x + 3, h - 4);
+        if (hotcueAuto?.[i]) ctx.fillText('A', x + 3, h - 15);
       });
 
       // Playhead — driven by the engine's tempo-integrated position
@@ -214,7 +219,7 @@ export default function Waveform({
     };
     raf = requestAnimationFrame(draw);
     return () => cancelAnimationFrame(raf);
-  }, [buffer, peaks, bandPeaks, grid, zoom, follow, deckId, color, height, loop, hotcues]);
+  }, [buffer, peaks, bandPeaks, grid, zoom, follow, deckId, color, height, loop, hotcues, hotcueAuto]);
 
   const seekFromEvent = (e: React.MouseEvent) => {
     if (!buffer || !wrapRef.current) return;
@@ -289,10 +294,12 @@ interface OverviewProps {
   color: string;
   loop: { start: number; end: number } | null;
   hotcues: (number | null)[];
+  /** Per-slot: true when that hotcue is an auto (analysis) value. */
+  hotcueAuto?: boolean[];
   onSeek: (t: number) => void;
 }
 
-export function OverviewWaveform({ deckId, buffer, peaks, grid, color, loop, hotcues, onSeek }: OverviewProps) {
+export function OverviewWaveform({ deckId, buffer, peaks, grid, color, loop, hotcues, hotcueAuto, onSeek }: OverviewProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
   const height = 30;
@@ -361,10 +368,11 @@ export function OverviewWaveform({ deckId, buffer, peaks, grid, color, loop, hot
         ctx.globalAlpha = 1;
       }
 
-      // Downbeat ticks (every 4th mapped beat)
+      // Downbeat ticks (every 4th mapped beat, from the grid's phase anchor)
       if (grid && grid.beats.length > 0) {
         ctx.fillStyle = 'rgba(255,255,255,0.35)';
-        for (let i = 0; i < grid.beats.length; i += 4) {
+        const phase = barPhaseOf(grid);
+        for (let i = phase; i < grid.beats.length; i += 4) {
           ctx.fillRect(t2x(grid.beats[i]), 0, 1, 4);
         }
       }
@@ -378,6 +386,7 @@ export function OverviewWaveform({ deckId, buffer, peaks, grid, color, loop, hot
         if (hc === null) return;
         ctx.fillStyle = ['#f472b6', '#fbbf24', '#a3e635', '#22d3ee'][i % 4];
         ctx.fillRect(t2x(hc) - 1, 0, 2, height);
+        if (hotcueAuto?.[i]) ctx.fillText('A', t2x(hc) + 2, 10);
       });
 
       // Playhead
@@ -386,7 +395,7 @@ export function OverviewWaveform({ deckId, buffer, peaks, grid, color, loop, hot
     };
     raf = requestAnimationFrame(draw);
     return () => cancelAnimationFrame(raf);
-  }, [buffer, small, mono, grid, deckId, color, loop, hotcues]);
+  }, [buffer, small, mono, grid, deckId, color, loop, hotcues, hotcueAuto]);
 
   if (!buffer) return null;
   return (

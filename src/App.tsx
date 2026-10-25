@@ -33,6 +33,7 @@ import {
   clearLibraryRecords,
   deleteLibraryRecord,
   fileKeyFor,
+  getLibraryRecord,
   loadLibraryRecords,
   requestLibraryPersistence,
   saveLibraryRecord,
@@ -67,6 +68,7 @@ const deckInit = (): DeckState => ({
   syncActive: false,
   quantize: true,
   hotcues: [null, null, null, null],
+  hotcueAuto: [false, false, false, false],
   loop: null,
   loopBars: null,
   pendingLoopIn: null,
@@ -500,7 +502,33 @@ export default function App() {
       d.syncCorr = 1;
       d.nudge = 0;
       setTracks((ts) => [...ts.filter((t) => t.fileKey !== track.fileKey), track]);
-      setDeckState(deckKey, { ...deckInit(), track, buffer, hotcues });
+      // Hotcue precedence: an in-app manual edit (library record) wins
+      // over everything; else Traktor's hotcues for matched tracks, else
+      // the analysis auto hotcues (tagged AUTO). Manual edits are the
+      // newest user intent, so they survive even a fresh-file reload.
+      const hotcueAuto = [false, false, false, false];
+      if (!traktorTrack && track.beatGrid.autoHotcues) {
+        for (let i = 0; i < 4; i++) {
+          if (track.beatGrid.autoHotcues[i] != null) {
+            hotcues[i] = track.beatGrid.autoHotcues[i]!;
+            hotcueAuto[i] = true;
+          }
+        }
+      }
+      let manual: (number | null)[] | null = null;
+      try {
+        manual = (await getLibraryRecord(key))?.manualHotcues ?? null;
+      } catch { /* no record yet — first load */ }
+      if (manual) {
+        for (let i = 0; i < 4; i++) {
+          if (manual[i] != null) {
+            hotcues[i] = manual[i];
+            hotcueAuto[i] = false;
+          }
+        }
+        track.manualHotcues = manual;
+      }
+      setDeckState(deckKey, { ...deckInit(), track, buffer, hotcues, hotcueAuto });
       recorderRef.current?.noteTrack({
         deck: deckKey, title: track.title, artist: track.artist, bpm: track.bpm, key: track.key ?? '',
       });
@@ -523,9 +551,11 @@ export default function App() {
   // Restored library tracks load WITHOUT re-analysis: the stored beat grid,
   // key, and peaks are already the track's analysis (a Traktor-matched
   // track's stored grid IS its Traktor grid). Only the audio is decoded.
-  // Hotcues are not part of the saved record, so a restored track starts
-  // with no hotcues — a deck load from a fresh file still picks up
-  // Traktor hotcues through loadTrack.
+  // Hotcues DO come back now: auto hotcues ride in the stored grid and
+  // manual edits ride in the record's manualHotcues (manual wins per
+  // slot). This deliberately changes the old "restored tracks have no
+  // hotcues" behavior for auto/manual values; a fresh-file load still
+  // re-applies Traktor/auto defaults when no manual edit exists.
   const loadRestoredTrack = useCallback(async (deckKey: 'A' | 'B', track: TrackInfo) => {
     const deckId = `deck${deckKey}` as 'deckA' | 'deckB';
     const d = engine.decks.get(deckId);
@@ -548,7 +578,18 @@ export default function App() {
       d.syncBaseTempo = 1;
       d.syncCorr = 1;
       d.nudge = 0;
-      setDeckState(deckKey, { ...deckInit(), track, buffer, hotcues: [null, null, null, null] });
+      // Restored hotcues: manual overrides win per slot, else the stored
+      // grid's auto values (tagged AUTO).
+      const rHotcues: (number | null)[] = [null, null, null, null];
+      const rAuto = [false, false, false, false];
+      for (let i = 0; i < 4; i++) {
+        if (track.manualHotcues?.[i] != null) rHotcues[i] = track.manualHotcues[i]!;
+        else if (track.beatGrid.autoHotcues?.[i] != null) {
+          rHotcues[i] = track.beatGrid.autoHotcues[i]!;
+          rAuto[i] = true;
+        }
+      }
+      setDeckState(deckKey, { ...deckInit(), track, buffer, hotcues: rHotcues, hotcueAuto: rAuto });
       recorderRef.current?.noteTrack({
         deck: deckKey, title: track.title, artist: track.artist, bpm: track.bpm, key: track.key ?? '',
       });
@@ -685,6 +726,54 @@ export default function App() {
       engine.seek(deckId, resolveCue(st));
     }
   }, [deckState]);
+
+  // Traktor-style Set 1.1: re-anchor the beat grid at the playhead. The
+  // beat nearest the playhead becomes the new bar-phase origin (that
+  // beat's index mod 4 becomes the grid's barPhase, and its time becomes
+  // downbeatOffset). beats[] is never rewritten — only the phase label
+  // moves — so it is instant, and it persists with the grid in the
+  // library record like a hand-fixed grid edit.
+  const setOneOne = useCallback((deckKey: 'A' | 'B') => {
+    const deckId = `deck${deckKey}` as 'deckA' | 'deckB';
+    const st = deckState(deckKey);
+    const track = st.track;
+    if (!track || !st.buffer) return;
+    const grid = track.beatGrid;
+    if (grid.bpm <= 0) return;
+    const pos = engine.position(deckId);
+    const spb = 60 / grid.bpm;
+    let j: number;
+    let anchorTime: number;
+    if (grid.beats.length >= 2) {
+      const beats = grid.beats;
+      let lo = 0;
+      let hi = beats.length - 1;
+      while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        if (beats[mid] < pos) lo = mid + 1;
+        else hi = mid;
+      }
+      const cand = lo < beats.length ? lo : beats.length - 1;
+      const prev = cand > 0 ? cand - 1 : cand;
+      j = pos - beats[prev] <= beats[cand] - pos ? prev : cand;
+      anchorTime = beats[j];
+    } else {
+      const off = grid.downbeatOffset >= 0 ? grid.downbeatOffset : grid.firstBeat >= 0 ? grid.firstBeat : 0;
+      j = Math.round((pos - off) / spb);
+      anchorTime = off + j * spb;
+    }
+    const barPhase = ((j % 4) + 4) % 4;
+    const newGrid: BeatGrid = { ...grid, barPhase, downbeatOffset: Math.max(0, anchorTime) };
+    const d = engine.decks.get(deckId);
+    if (d) d.grid = newGrid;
+    const next = { ...track, beatGrid: newGrid };
+    setDeckState(deckKey, { ...st, track: next });
+    setTracks((ts) => ts.map((t) => (t.id === track.id ? next : t)));
+    debugLog('transport', 'grid 1.1 set', deckId, { at: newGrid.downbeatOffset, barPhase });
+    if (next.fileKey) {
+      void saveLibraryRecord(next).catch((e) => console.warn('Could not persist grid anchor', e));
+    }
+  }, [deckState, setDeckState, setTracks]);
 
   const toggleSync = useCallback((deckKey: 'A' | 'B') => {
     const deckId = `deck${deckKey}` as 'deckA' | 'deckB';
@@ -1836,6 +1925,7 @@ export default function App() {
         const st = deckState(deckKey);
         setDeckState(deckKey, { ...st, cuePoint: engine.position(deckId) });
       },
+      onSetOneOne: () => setOneOne(deckKey),
       onStop: () => {
         debugLog('transport', 'ui stop (deck panel)', deckId, { playing: engine.isPlaying(deckId) });
         engine.pause(deckId);
@@ -1845,7 +1935,22 @@ export default function App() {
         const hcs = [...st.hotcues];
         if (set || hcs[i] === null) {
           hcs[i] = engine.position(deckId);
-          setDeckState(deckKey, { ...st, hotcues: hcs });
+          // A manual set clears the AUTO tag for that slot and persists
+          // as a manual override, so it survives reloads (manual wins
+          // over auto and Traktor on every later load).
+          const auto = [...(st.hotcueAuto ?? [false, false, false, false])];
+          auto[i] = false;
+          let nextSt = { ...st, hotcues: hcs, hotcueAuto: auto };
+          const track = st.track;
+          if (track && track.fileKey) {
+            const manuals: (number | null)[] = [...(track.manualHotcues ?? [null, null, null, null])];
+            manuals[i] = hcs[i];
+            const next = { ...track, manualHotcues: manuals };
+            nextSt = { ...nextSt, track: next };
+            setTracks((ts) => ts.map((t) => (t.id === track.id ? next : t)));
+            void saveLibraryRecord(next).catch((e) => console.warn('Could not persist manual hotcue', e));
+          }
+          setDeckState(deckKey, nextSt);
         } else if (hcs[i] !== null) {
           const target = st.quantize ? engine.quantizeToBeat(deckId, hcs[i]!) : hcs[i]!;
           engine.seek(deckId, target);

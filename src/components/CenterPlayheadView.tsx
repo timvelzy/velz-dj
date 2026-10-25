@@ -83,6 +83,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { engine } from '../audio/engine';
 import type { BandPeaks, BeatGrid } from '../types';
 import { amplitudeRGB, bucketAmplitude } from '../audio/peaks';
+import { barPhaseOf } from '../audio/loop';
 
 export interface TopDeckView {
   label: string;
@@ -351,10 +352,9 @@ function TopWaveformRow({ deck, pxPerSec, height }: RowProps) {
       const grid = deck.grid;
       if (grid && grid.bpm > 0) {
         ctx.font = '9px monospace';
-        const drawBeat = (t: number, idx: number) => {
+        const drawBeat = (t: number, idx: number, isDown: boolean, barNo: number) => {
           const x = t2x(t);
           if (x < 0 || x > w) return;
-          const isDown = ((idx % 4) + 4) % 4 === 0;
           const isFirst = idx === 0;
           ctx.strokeStyle = deck.color;
           ctx.globalAlpha = isDown ? 0.9 : 0.45;
@@ -369,7 +369,7 @@ function TopWaveformRow({ deck, pxPerSec, height }: RowProps) {
           if (isDown) {
             ctx.fillStyle = deck.color;
             ctx.globalAlpha = 0.85;
-            ctx.fillText(`${Math.floor(idx / 4) + 1}`, x + 3, 11);
+            ctx.fillText(`${barNo}`, x + 3, 11);
             ctx.globalAlpha = 1;
           }
           if (isFirst) {
@@ -384,13 +384,19 @@ function TopWaveformRow({ deck, pxPerSec, height }: RowProps) {
             if (grid.beats[mid] >= viewStart) { first = mid; hi = mid - 1; }
             else lo = mid + 1;
           }
-          for (let i = first; i < grid.beats.length && grid.beats[i] <= viewEnd; i++) drawBeat(grid.beats[i], i);
+          // Map branch: downbeats are indices ≡ barPhase (mod 4).
+          const phase = barPhaseOf(grid);
+          for (let i = first; i < grid.beats.length && grid.beats[i] <= viewEnd; i++) {
+            const isDown = (((i - phase) % 4) + 4) % 4 === 0;
+            drawBeat(grid.beats[i], i, isDown, Math.max(1, Math.floor((i - phase) / 4) + 1));
+          }
         } else {
+          // Flat branch: beat 0 IS the downbeat (times step from downbeatOffset).
           const spb = 60 / grid.bpm;
           const off = grid.downbeatOffset >= 0 ? grid.downbeatOffset : grid.firstBeat;
           const firstIdx = Math.max(0, Math.ceil((viewStart - off) / spb));
           const lastIdx = Math.floor((viewEnd - off) / spb);
-          for (let i = firstIdx; i <= lastIdx; i++) drawBeat(off + i * spb, i);
+          for (let i = firstIdx; i <= lastIdx; i++) drawBeat(off + i * spb, i, i % 4 === 0, Math.floor(i / 4) + 1);
         }
       }
 

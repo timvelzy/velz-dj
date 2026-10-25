@@ -30,6 +30,22 @@ export interface BeatGrid {
    * Captures tempo drift within the track. Empty = constant bpm.
    */
   bpmCurve: number[];
+  /**
+   * Bar-phase anchor: beat-map index residue (0..3) that counts as a
+   * downbeat (bar 1 beat 1). Undefined = legacy: derive it from
+   * downbeatOffset (nearest mapped beat) or 0 — see barPhaseOf() in
+   * audio/loop.ts, which every bar-phase consumer reads through so all
+   * surfaces agree on the same 1.1. Set explicitly by auto-1.1 analysis
+   * and by the manual Set 1.1 control; never rewrite beats[] to move it.
+   */
+  barPhase?: number;
+  /**
+   * Auto hotcues computed at analysis time: 4 structural points in
+   * seconds (null where undetectable). Displayed with an AUTO tag; a
+   * manual set on a slot overrides that slot (manualHotcues on
+   * TrackInfo). Only analyzed tracks carry these; Traktor grids don't.
+   */
+  autoHotcues?: (number | null)[];
 }
 
 /**
@@ -69,6 +85,10 @@ export interface TrackInfo {
   /** Stable library identity (name + size + last modified) — the
       IndexedDB key for this track's saved record, when it has one. */
   fileKey?: string;
+  /** Per-slot manual hotcue overrides (null = no manual override; the
+      slot falls back to the grid's auto hotcue). Persisted in the library
+      record so a manual edit survives a reload. */
+  manualHotcues?: (number | null)[];
   /** True for tracks restored from the saved library (stored beat grid +
       peaks, so loading one to a deck skips re-analysis). */
   restored?: boolean;
