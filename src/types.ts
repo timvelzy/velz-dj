@@ -17,6 +17,14 @@ export interface BeatGrid {
   firstBeat: number;
   /** Tempo stability 0..1 */
   tempoStability: number;
+  /**
+   * Round-4 consensus audit fields (only when the multi-window consensus
+   * voted): fraction of voting weight behind the winning tempo, and the
+   * track-wide kick-comb alignment of the winning tempo. Undefined on
+   * legacy fallback grids.
+   */
+  agreement?: number;
+  gridScore?: number;
   /** How the grid was derived */
   method: 'electronic' | 'general' | 'manual' | 'traktor';
   /**

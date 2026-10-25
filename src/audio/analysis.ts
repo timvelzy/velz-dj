@@ -699,37 +699,429 @@ function yieldControl(): Promise<void> {
  * low confidence (< 0.4) means the grid is a guess and the UI should say so
  * (and the user should fix it in the grid editor). Never silently stamps 120.
  */
+// ─── Multi-window consensus BPM (round 4) ────────────────────────────────
+// Why: one window anywhere can be fooled. The round-2 loudest-window fix
+// only helps QUIET intros. A MELODIC intro (dotted-eighth arp, weak or no
+// kick) still yields a full-band stream that locks onto the dotted
+// subdivision (120 -> 160), and any single window can also be fooled by a
+// breakdown, a fill, or a half-time section. So: sample MANY windows
+// across the whole track, let each window vote from its BEST stream
+// (kick vs broadband transient — the lowpass kick stream is
+// bass-polluted in real mastered drops, the transient stream stays
+// clean there), weight votes by window energy (drops ARE the track),
+// and decide by energy-weighted consensus with explicit 4/3 rival
+// elimination. The global comb score is reported as drop-restricted
+// diagnostic evidence only: on dense real mixes the all-onset comb
+// ranks the dotted tempo ABOVE the true one, so it must not decide.
+
+export interface ConsensusVote {
+  start: number;
+  bpm: number;
+  weight: number;
+  kind: 'kick' | 'fallback' | 'both';
+  consistency: number;
+  energyFactor: number;
+}
+
+export interface ConsensusResult {
+  bpm: number;
+  confidence: number;
+  agreement: number;
+  /**
+   * Drop-restricted transient comb score (high-energy windows only).
+   * Diagnostic evidence, NOT a decision input: on dense real mixes the
+   * all-onset comb ranks the dotted tempo above the true one.
+   */
+  gridScore: number;
+  /** Mean consistency of the winning cluster's votes. */
+  meanConsistency: number;
+  /** Weight share of surviving non-rival losing clusters (unexplained disagreement). */
+  loserShare: number;
+  windowsSelected: number;
+  windowsVoted: number;
+  steady: boolean;
+  firstBeat: number;
+  downbeatOffset: number;
+  tempoStability: number;
+  votes: ConsensusVote[];
+  kickOnsets: number[];
+}
+
+const CONSENSUS_WIN_SEC = 12;
+const CONSENSUS_HOP_SEC = 6;
+const CONSENSUS_TARGET_WINDOWS = 12;
+const CONSENSUS_RIVAL_RATIOS = [4 / 3, 3 / 4, 3 / 2, 2 / 3, 1 / 2, 2];
+
+interface ConsensusStreams {
+  ds: Float32Array;
+  dsRate: number;
+  flux: Float32Array;
+  transient: Float32Array;
+  kickOnsets: number[];
+}
+
+export function buildConsensusStreams(channelData: Float32Array, sampleRate: number): ConsensusStreams {
+  const TARGET_RATE = 8000;
+  const ratio = Math.max(1, Math.floor(sampleRate / TARGET_RATE));
+  const dsRate = sampleRate / ratio;
+  const totalDs = Math.floor(channelData.length / ratio);
+  const ds = new Float32Array(totalDs);
+  for (let i = 0; i < totalDs; i++) ds[i] = channelData[i * ratio];
+  const transient = new Float32Array(totalDs);
+  let prev = 0;
+  const alpha = 0.8;
+  for (let i = 0; i < totalDs; i++) {
+    const hp = ds[i] - prev;
+    prev = ds[i] * (1 - alpha) + prev * alpha;
+    transient[i] = Math.abs(hp) * 2;
+  }
+  const flux = new Float32Array(totalDs);
+  const la = 1 - Math.exp(-2 * Math.PI * 160 / dsRate);
+  const ea = 1 - Math.exp(-2 * Math.PI * 50 / dsRate);
+  let lpPrev = 0;
+  let ePrev = 0;
+  for (let i = 0; i < totalDs; i++) {
+    lpPrev += la * (ds[i] - lpPrev);
+    const sq = lpPrev * lpPrev;
+    const eNew = ePrev + ea * (sq - ePrev);
+    flux[i] = Math.max(0, eNew - ePrev);
+    ePrev = eNew;
+  }
+  const kickOnsets = pickOnsets(flux, dsRate, 4);
+  return { ds, dsRate, flux, transient, kickOnsets };
+}
+
+export function selectConsensusWindows(
+  duration: number,
+  ds: Float32Array,
+  dsRate: number,
+): { start: number; end: number }[] {
+  const cands: { start: number; energy: number }[] = [];
+  for (let s = 0; s < duration; s += CONSENSUS_HOP_SEC) {
+    const e = Math.min(duration, s + CONSENSUS_WIN_SEC);
+    if (e - s < 3 && cands.length > 0) break;
+    const i0 = Math.floor(s * dsRate);
+    const i1 = Math.min(ds.length, Math.floor(e * dsRate));
+    let sum = 0;
+    for (let i = 0; i < i1; i++) sum += ds[i] * ds[i];
+    cands.push({ start: s, energy: i1 > i0 ? sum / (i1 - i0) : 0 });
+  }
+  if (cands.length === 0) return [{ start: 0, end: duration }];
+  if (cands.length === 1) return [{ start: 0, end: duration }];
+  const byEnergy = [...cands].sort((a, b) => b.energy - a.energy);
+  const picked: { start: number }[] = [];
+  const add = (c: { start: number }): void => {
+    if (!picked.some((p) => Math.abs(p.start - c.start) < 3)) picked.push(c);
+  };
+  for (let i = 0; i < Math.min(6, byEnergy.length); i++) add(byEnergy[i]);
+  for (let i = 0; i < 6; i++) add(cands[Math.floor((i / 5) * (cands.length - 1))]);
+  for (const c of byEnergy) {
+    if (picked.length >= CONSENSUS_TARGET_WINDOWS) break;
+    add(c);
+  }
+  picked.sort((a, b) => a.start - b.start);
+  return picked
+    .slice(0, CONSENSUS_TARGET_WINDOWS)
+    .map((p) => ({ start: p.start, end: Math.min(duration, p.start + CONSENSUS_WIN_SEC) }));
+}
+
+// One window's vote: the BEST stream wins, not "kick first".
+// Round-4 finding on real masters: the 160 Hz lowpass "kick" stream is
+// bass-polluted in drops (extra bass-note flux breaks interval
+// consistency), while the broadband transient stream stays clean there
+// (sharp attacks on the grid). Conversely the intro arp pollutes BOTH
+// streams at the dotted rate. So: compute both, merge when they agree
+// within 1.5%, else take the higher-consistency one. Weight follows
+// window energy (drops ARE the track; quiet intros/outros count less):
+// w = base * (0.25 + 0.75 * E/Emax), base 1.0 merged, 0.75 single-stream.
+function analyzeConsensusWindow(
+  flux: Float32Array,
+  transient: Float32Array,
+  dsRate: number,
+  start: number,
+  end: number,
+  energyFactor: number,
+): ConsensusVote | null {
+  const i0 = Math.floor(start * dsRate);
+  const i1 = Math.min(flux.length, Math.floor(end * dsRate));
+  if (i1 - i0 < dsRate * 3) return null;
+  let kick: { bpm: number; consistency: number } | null = null;
+  const kOn = pickOnsets(flux.subarray(i0, i1), dsRate, 4);
+  if (kOn.length >= 4) {
+    const r = medianBpmFromOnsets(kOn);
+    if (r.bpm > 0 && r.consistency >= 0.5) kick = { bpm: r.bpm, consistency: r.consistency };
+  }
+  let fb: { bpm: number; consistency: number } | null = null;
+  const fOn = pickOnsets(transient.subarray(i0, i1), dsRate, 4);
+  if (fOn.length >= 8) {
+    const r = medianBpmFromOnsets(fOn);
+    if (r.bpm > 0 && r.consistency >= 0.6) fb = { bpm: r.bpm, consistency: r.consistency };
+  }
+  if (!kick && !fb) return null;
+  if (kick && fb && Math.abs(kick.bpm - fb.bpm) / kick.bpm <= 0.015) {
+    const bpm = (kick.bpm * kick.consistency + fb.bpm * fb.consistency) / (kick.consistency + fb.consistency);
+    return { start, bpm, weight: 1 * energyFactor, kind: 'both', consistency: (kick.consistency + fb.consistency) / 2, energyFactor };
+  }
+  const kind = !kick ? 'fallback' : !fb ? 'kick' : kick.consistency >= fb.consistency ? 'kick' : 'fallback';
+  const pick = kind === 'kick' ? kick! : fb!;
+  return { start, bpm: pick.bpm, weight: 0.75 * energyFactor, kind, consistency: pick.consistency, energyFactor };
+}
+
+/** Fraction of onsets explained by a beat comb at `bpm` (best phase). */
+export function kickGridScore(bpm: number, kickOnsets: number[]): number {
+  if (kickOnsets.length === 0 || !(bpm > 0)) return 0;
+  const p = 60 / bpm;
+  const sigma = 0.035;
+  const phases = 32;
+  let best = 0;
+  for (let k = 0; k < phases; k++) {
+    const phi = (k / phases) * p;
+    let s = 0;
+    for (const t of kickOnsets) {
+      let rel = (t - phi) % p;
+      if (rel < 0) rel += p;
+      const d = Math.min(rel, p - rel);
+      s += Math.exp(-(d * d) / (2 * sigma * sigma));
+    }
+    if (s > best) best = s;
+  }
+  return best / kickOnsets.length;
+}
+
+export async function detectConsensusBpm(
+  buffer: AudioBuffer,
+  onProgress?: (p: number) => void,
+): Promise<ConsensusResult | null> {
+  const ch = buffer.getChannelData(0);
+  const sr = buffer.sampleRate;
+  const duration = buffer.duration;
+  if (!(duration > 0) || ch.length === 0) return null;
+  const { ds, dsRate, flux, transient, kickOnsets } = buildConsensusStreams(ch, sr);
+  const windows = selectConsensusWindows(duration, ds, dsRate);
+  // Window energies (mean square) + peak, for energy-weighted votes.
+  const winEnergy = windows.map((w) => {
+    const i0 = Math.floor(w.start * dsRate);
+    const i1 = Math.min(ds.length, Math.floor(w.end * dsRate));
+    let sum = 0;
+    for (let i = i0; i < i1; i++) sum += ds[i] * ds[i];
+    return i1 > i0 ? sum / (i1 - i0) : 0;
+  });
+  const maxEnergy = winEnergy.reduce((m, e) => Math.max(m, e), 0);
+  const votes: ConsensusVote[] = [];
+  for (let w = 0; w < windows.length; w++) {
+    const ef = maxEnergy > 0 ? 0.25 + 0.75 * (winEnergy[w] / maxEnergy) : 1;
+    const v = analyzeConsensusWindow(flux, transient, dsRate, windows[w].start, windows[w].end, ef);
+    if (v) votes.push(v);
+    if ((w & 3) === 3) {
+      onProgress?.(0.1 + 0.3 * ((w + 1) / windows.length));
+      await yieldControl();
+    }
+  }
+  if (votes.length === 0) return null;
+  // Cluster votes within 1.5% (energy-weighted mean center).
+  const clusters: { center: number; weight: number; votes: ConsensusVote[] }[] = [];
+  for (const v of votes) {
+    const c = clusters.find((cc) => Math.abs(v.bpm - cc.center) / cc.center <= 0.015);
+    if (c) {
+      c.center = (c.center * c.weight + v.bpm * v.weight) / (c.weight + v.weight);
+      c.weight += v.weight;
+      c.votes.push(v);
+    } else {
+      clusters.push({ center: v.bpm, weight: v.weight, votes: [v] });
+    }
+  }
+  // Explicit rival elimination: clusters related by a simple ratio
+  // (dotted 4/3, triplet 3/2, half-time 1/2, ...) cannot both be right.
+  // The survivor is the HEAVIER cluster (energy-weighted votes): drops
+  // outweigh intros, so the track's real tempo beats its intro arp.
+  // (An earlier version picked the rival by global comb score; on real
+  // dense mixes the comb ranks the dotted tempo ABOVE the true one —
+  // the onset sets are too polluted — so the comb must not decide.)
+  // Ties fall back to the slower tempo (in house/techno the kick IS
+  // the beat; dotted subdivisions are ornament).
+  const eliminated = new Set<number>();
+  for (let i = 0; i < clusters.length; i++) {
+    if (eliminated.has(i)) continue;
+    for (let j = i + 1; j < clusters.length; j++) {
+      if (eliminated.has(j)) continue;
+      const ratio = clusters[j].center / clusters[i].center;
+      const isRival = CONSENSUS_RIVAL_RATIOS.some((r) => Math.abs(ratio - r) / r < 0.03);
+      if (!isRival) continue;
+      const a = clusters[i];
+      const b = clusters[j];
+      let loser: number;
+      if (a.weight !== b.weight) loser = a.weight > b.weight ? j : i;
+      else loser = a.center <= b.center ? j : i;
+      eliminated.add(loser);
+    }
+  }
+  const alive = clusters.filter((_, i) => !eliminated.has(i));
+  let winner = alive[0];
+  for (const c of alive) {
+    if (c.weight > winner.weight) winner = c;
+    else if (c.weight === winner.weight && c.center < winner.center) winner = c;
+  }
+  const totalWeight = votes.reduce((s, v) => s + v.weight, 0);
+  const agreement = totalWeight > 0 ? winner.weight / totalWeight : 0;
+  // Unexplained disagreement: weight of surviving clusters that are NOT
+  // the winner and NOT explained away as rivals. A rival (dotted 4/3,
+  // half-time, ...) is an artifact of the winner, not a competing
+  // tempo, so it does not count here. A large unexplained loser means
+  // the track may not have one steady tempo at all (tempo change).
+  const loserWeight = alive.reduce((s, c) => (c === winner ? s : s + c.weight), 0);
+  const loserShare = totalWeight > 0 ? loserWeight / totalWeight : 0;
+  const winVotes = winner.votes;
+  const meanConsistency = winVotes.reduce((s, v) => s + v.consistency, 0) / Math.max(1, winVotes.length);
+  // Coverage: a tempo claim backed by 1-2 windows is weak evidence no
+  // matter how well those windows agree (fl-track1: a single intro
+  // vote must not yield a confident steady grid). Scale confidence by
+  // coverage (full weight at 4+ voting windows) and require 3+ votes
+  // for the steady grid.
+  const coverageFactor = Math.min(1, votes.length / 4);
+  const confidence = Math.min(0.95, agreement * meanConsistency * (1 - loserShare) * coverageFactor);
+  // Drop-restricted transient comb: global grid evidence, reported for
+  // diagnosis (NOT used to decide — the all-onset comb ranks dotted
+  // above true on dense mixes). High-energy windows only, so intro
+  // arp onsets cannot dominate it.
+  const tOn = pickOnsets(transient, dsRate, 4);
+  const dropOn: number[] = [];
+  for (let w = 0; w < windows.length; w++) {
+    if (maxEnergy > 0 && winEnergy[w] / maxEnergy >= 0.6) {
+      for (const t of tOn) if (t >= windows[w].start && t < windows[w].end) dropOn.push(t);
+    }
+  }
+  const bpm = Math.round(winner.center * 10) / 10;
+  const gridScore = kickGridScore(bpm, dropOn);
+  const firstBeat = kickOnsets.length > 0 ? kickOnsets[0] : 0;
+  const provBeats = generateBeats(bpm, duration, firstBeat);
+  const downbeatOffset = provBeats.length > 0 ? detectDownbeat(ch, sr, provBeats) : -1;
+  onProgress?.(0.45);
+  return {
+    bpm,
+    confidence,
+    agreement,
+    gridScore,
+    meanConsistency,
+    loserShare,
+    windowsSelected: windows.length,
+    windowsVoted: votes.length,
+    steady: agreement >= 0.6 && loserShare < 0.3 && meanConsistency >= 0.5 && votes.length >= 3,
+    firstBeat,
+    downbeatOffset,
+    tempoStability: agreement,
+    votes,
+    kickOnsets,
+  };
+}
+
+function steadyBeatsFrom(origin: number, spb: number, duration: number): number[] {
+  if (!(spb > 0) || !(origin >= 0)) return [];
+  const nBack = Math.floor(origin / spb + 1e-9);
+  const beats: number[] = [];
+  for (let i = -nBack; ; i++) {
+    const t = origin + i * spb;
+    if (t >= duration) break;
+    if (t >= 0) beats.push(t);
+    if (i > 100000) break;
+  }
+  return beats;
+}
+
 export async function analyzeTrack(
   buffer: AudioBuffer,
   onProgress?: (p: number) => void,
 ): Promise<AnalysisResult> {
-  const electronic = await detectElectronic(buffer, onProgress);
-  const general = electronic.confidence < 0.4 ? await detectGeneral(buffer) : null;
-  const best = !general || general.confidence <= electronic.confidence ? electronic : general;
-  const method = best === electronic ? 'electronic' as const : 'general' as const;
-  const partial: Omit<BeatGrid, 'beats' | 'bpmCurve'> = { ...best, method };
+  // Round 4: multi-window consensus first. It votes only where kicks
+  // exist, so melodic/dotted intros cannot hijack the base tempo the
+  // way a single window could. Only when NO window votes do we fall
+  // back to the legacy single-window detectors.
+  const consensus = await detectConsensusBpm(buffer, onProgress);
+  let partial: Omit<BeatGrid, 'beats' | 'bpmCurve'>;
+  if (consensus && consensus.bpm > 0) {
+    partial = {
+      bpm: consensus.bpm,
+      confidence: consensus.confidence,
+      downbeatOffset: consensus.downbeatOffset,
+      firstBeat: consensus.firstBeat,
+      tempoStability: consensus.agreement,
+      method: 'electronic',
+    };
+  } else {
+    const electronic = await detectElectronic(buffer, onProgress);
+    const general = electronic.confidence < 0.4 ? await detectGeneral(buffer) : null;
+    const best = !general || general.confidence <= electronic.confidence ? electronic : general;
+    const method = best === electronic ? 'electronic' as const : 'general' as const;
+    partial = { ...best, method };
+  }
 
-  // Build the full beat map (tempo curve + snapped beat timestamps).
-  // This is what the sync engine phase-locks against.
+  const ch = buffer.getChannelData(0);
+  const sr = buffer.sampleRate;
+  const duration = buffer.duration;
+
   let beats: number[] = [];
   let bpmCurve: number[] = [];
   let mapStability = partial.tempoStability;
+  let structure: StructureAnalysis | null = null;
+  let steadyOrigin: number | null = null;
+
   if (partial.bpm > 0) {
-    try {
-      const map = await buildBeatMap(
-        buffer.getChannelData(0),
-        buffer.sampleRate,
-        buffer.duration,
-        partial.bpm,
-        partial.firstBeat,
-        onProgress,
-      );
-      beats = map.beats;
-      bpmCurve = map.bpmCurve;
-      // Blend section-agreement into the reported stability
-      mapStability = Math.min(partial.tempoStability, map.stability);
-    } catch {
-      // Beat map failed — engine falls back to bpm + firstBeat extrapolation
+    if (consensus && consensus.steady) {
+      // Steady-tempo house/techno: ONE steady grid for the whole track.
+      // Mapped/transient-snapped beats would reintroduce drift and
+      // jitter into quantize, loops, and sync phase, so the steady grid
+      // replaces them here. The mapped beat map is still built below
+      // for non-steady tracks (tempo drift / tempo change), where the
+      // steady assumption does not hold.
+      const spb = 60 / partial.bpm;
+      try {
+        const provBeats = generateBeats(partial.bpm, duration, partial.firstBeat);
+        structure = analyzeStructure(ch, sr, partial.bpm, provBeats, partial.downbeatOffset, partial.firstBeat, duration);
+      } catch {
+        structure = null;
+      }
+      const origin = structure?.anchorTime ?? (partial.downbeatOffset >= 0 ? partial.downbeatOffset : partial.firstBeat);
+      beats = steadyBeatsFrom(origin >= 0 ? origin : 0, spb, duration);
+      bpmCurve = new Array(Math.max(0, beats.length - 1)).fill(partial.bpm);
+      steadyOrigin = beats.length > 0 ? origin : null;
+      // Snap the anchor to the nearest real kick onset (±60 ms) so grid
+      // phase is sample-tight, not just beat-quantized. Auto hotcues
+      // shift by the same delta so they stay on the snapped grid.
+      if (structure && structure.anchorTime !== null && consensus) {
+        const a = structure.anchorTime;
+        let best: number | null = null;
+        let bestD = 0.06;
+        for (const k of consensus.kickOnsets) {
+          const d = Math.abs(k - a);
+          if (d < bestD) {
+            bestD = d;
+            best = k;
+          }
+        }
+        if (best !== null) {
+          const delta = best - a;
+          beats = steadyBeatsFrom(best, spb, duration);
+          bpmCurve = new Array(Math.max(0, beats.length - 1)).fill(partial.bpm);
+          steadyOrigin = best;
+          structure = {
+            ...structure,
+            anchorTime: best,
+            autoHotcues: structure.autoHotcues.map((t) => (t === null ? null : t + delta)),
+          };
+        }
+      }
+    } else {
+      // Non-steady (or legacy fallback): the walked, transient-snapped
+      // beat map, as before. This is what the sync engine phase-locks
+      // against when the tempo is not steady.
+      try {
+        const map = await buildBeatMap(ch, sr, duration, partial.bpm, partial.firstBeat, onProgress);
+        beats = map.beats;
+        bpmCurve = map.bpmCurve;
+        // Blend section-agreement into the reported stability
+        mapStability = Math.min(partial.tempoStability, map.stability);
+      } catch {
+        // Beat map failed — engine falls back to bpm + firstBeat extrapolation
+      }
     }
   }
 
@@ -739,27 +1131,33 @@ export async function analyzeTrack(
     beats,
     bpmCurve,
   };
+  if (consensus) {
+    grid.agreement = consensus.agreement;
+    grid.gridScore = consensus.gridScore;
+  }
   // Smart grid: auto 1.1 anchor + auto hotcues from the track's energy.
   // Best-effort — a structure failure must never break the grid itself.
-  // Reuses the decoded buffer (no new decode); the anchor, when found,
-  // becomes the grid's downbeat origin and bar-phase residue.
-  let structure: StructureAnalysis | null = null;
-  try {
-    structure = analyzeStructure(
-      buffer.getChannelData(0),
-      buffer.sampleRate,
-      partial.bpm,
-      beats,
-      partial.downbeatOffset,
-      partial.firstBeat,
-      buffer.duration,
-    );
-  } catch {
-    structure = null;
+  // Reuses the decoded buffer (no new decode). For the steady path the
+  // structure was already computed above against provisional beats; for
+  // the mapped path it runs here against the walked map, as before.
+  if (!structure) {
+    try {
+      structure = analyzeStructure(ch, sr, partial.bpm, beats, partial.downbeatOffset, partial.firstBeat, duration);
+    } catch {
+      structure = null;
+    }
   }
   if (structure) {
     grid.autoHotcues = structure.autoHotcues;
-    if (structure.anchorTime !== null && structure.barPhase !== null) {
+    if (consensus && consensus.steady && steadyOrigin !== null) {
+      // Steady grid: the origin IS a beat by construction; its index
+      // residue is the bar phase, and it is the downbeat origin.
+      const spb = 60 / partial.bpm;
+      const idx = beats.length > 0 ? Math.round((steadyOrigin - beats[0]) / spb) : 0;
+      grid.barPhase = ((idx % 4) + 4) % 4;
+      grid.downbeatOffset = steadyOrigin;
+      grid.firstBeat = beats.length > 0 ? beats[0] : partial.firstBeat;
+    } else if (structure.anchorTime !== null && structure.barPhase !== null) {
       grid.barPhase = structure.barPhase;
       grid.downbeatOffset = structure.anchorTime;
     }
@@ -773,6 +1171,12 @@ export async function analyzeTrack(
     stability: grid.tempoStability,
     anchor: structure?.anchorTime ?? null,
     autoHotcues: structure?.autoHotcues ?? null,
+    agreement: consensus?.agreement ?? null,
+    gridScore: consensus?.gridScore ?? null,
+    loserShare: consensus?.loserShare ?? null,
+    meanConsistency: consensus?.meanConsistency ?? null,
+    windows: consensus ? `${consensus.windowsVoted}/${consensus.windowsSelected}` : null,
+    steady: consensus?.steady ?? null,
   });
   const spectralData = await analyzeSpectrum(buffer);
   onProgress?.(1);
