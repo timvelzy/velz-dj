@@ -23,10 +23,9 @@ export const defaultChannel = (): ChannelState => ({
   filter: 0, cue: false, fxSend: 0,
 });
 
-/** Sampler channel state — the trim/EQ section of a deck strip, without
- *  filter/fx-send/cue (the sampler chain has no filter node, no FX send,
- *  and no cue bus). Fader + mute travel on the existing samplerVol /
- *  samplerMuted props. */
+/** Sampler channel state — full parity with a deck strip: trim, 3-band
+ *  EQ with kills, filter, fx send, cue. Fader + mute travel on the
+ *  existing samplerVol / samplerMuted props. */
 export interface SamplerChannelState {
   trim: number;
   eqLow: number;
@@ -35,12 +34,16 @@ export interface SamplerChannelState {
   lowKill: boolean;
   midKill: boolean;
   highKill: boolean;
+  filter: number;
+  fxSend: number;
+  cue: boolean;
 }
 
 export const defaultSamplerChannel = (): SamplerChannelState => ({
   trim: 1,
   eqLow: 0, eqMid: 0, eqHigh: 0,
   lowKill: false, midKill: false, highKill: false,
+  filter: 0, fxSend: 0, cue: false,
 });
 
 interface MixerProps {
@@ -231,7 +234,28 @@ function SamplerStrip({ ch, set, vol, setVol, muted, setMuted }: {
     engine.setSamplerEq('low', next.eqLow, next.lowKill);
     engine.setSamplerEq('mid', next.eqMid, next.midKill);
     engine.setSamplerEq('high', next.eqHigh, next.highKill);
+    engine.setSamplerFilter(next.filter);
+    engine.setSamplerFxSend(next.fxSend);
+    engine.setSamplerCue(next.cue);
   };
+
+  // MIDI — same pattern as the deck strips (prefix mixer.chS, matching
+  // the existing mixer.chS.fader registration at Mixer level, which is
+  // intentionally NOT duplicated here). Trim maps 0–1 → 0–2 like a
+  // fader; bipolar knobs map 0–1 → -1–1 like the deck EQ/filter knobs.
+  useEffect(() => {
+    const regs = [
+      midi.registerControl('mixer.chS.trim', { kind: 'knob', onAbsolute: (v) => upd({ trim: v * 2 }) }),
+      midi.registerControl('mixer.chS.eqLow', { kind: 'knob', onAbsolute: (v) => upd({ eqLow: v * 2 - 1 }) }),
+      midi.registerControl('mixer.chS.eqMid', { kind: 'knob', onAbsolute: (v) => upd({ eqMid: v * 2 - 1 }) }),
+      midi.registerControl('mixer.chS.eqHigh', { kind: 'knob', onAbsolute: (v) => upd({ eqHigh: v * 2 - 1 }) }),
+      midi.registerControl('mixer.chS.filter', { kind: 'knob', onAbsolute: (v) => upd({ filter: v * 2 - 1 }) }),
+      midi.registerControl('mixer.chS.cue', { kind: 'button', onButton: (p) => { if (p) upd({ cue: !ch.cue }); } }),
+      midi.registerControl('fx.sendS', { kind: 'knob', onAbsolute: (v) => upd({ fxSend: v }) }),
+    ];
+    return () => regs.forEach((u) => u());
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ch.cue, ch.trim, ch.eqLow, ch.eqMid, ch.eqHigh, ch.filter, ch.fxSend]);
 
   return (
     <div className="flex flex-col items-center gap-1.5 rounded-lg border border-zinc-800 bg-zinc-950 p-2">
@@ -252,6 +276,8 @@ function SamplerStrip({ ch, set, vol, setVol, muted, setMuted }: {
         <Knob label="low" value={ch.eqLow} onChange={(v) => upd({ eqLow: v })} size={44} />
         {killBtn(ch.lowKill, () => upd({ lowKill: !ch.lowKill }), 'K')}
       </div>
+      <Knob label="filter" value={ch.filter} onChange={(v) => upd({ filter: v })} size={44} />
+      <Knob label="fx send" value={ch.fxSend} min={0} max={1} onChange={(v) => upd({ fxSend: v })} size={36} />
       <Meter getLevel={() => engine.samplerOutputLevel()} color="#4ade80" />
       <input
         type="range" min={0} max={1} step={0.01} value={vol}
@@ -260,6 +286,12 @@ function SamplerStrip({ ch, set, vol, setVol, muted, setMuted }: {
         style={{ writingMode: 'vertical-lr', direction: 'rtl' } as React.CSSProperties}
         title="Sampler channel fader"
       />
+      <button
+        onClick={() => upd({ cue: !ch.cue })}
+        className={`h-7 w-full rounded text-xs font-bold ${ch.cue ? 'bg-amber-500 text-black' : 'bg-zinc-800 text-zinc-400'}`}
+      >
+        CUE
+      </button>
       <button
         onClick={() => setMuted(!muted)}
         className={`h-7 w-full rounded px-1 text-[10px] font-bold ${muted ? 'bg-red-600 text-white' : 'bg-zinc-800 text-zinc-400'}`}
@@ -301,13 +333,12 @@ export default function Mixer(props: MixerProps) {
         <ChannelStrip id="chC" label="AI" accent="#c084fc" ch={props.chC} set={props.setChC} deckId="deckC" midiPrefix="mixer.chC" fxMidiId="fx.sendC" />
         <ChannelStrip id="chB" label="B" accent="#fb923c" ch={props.chB} set={props.setChB} deckId="deckB" midiPrefix="mixer.chB" fxMidiId="fx.sendB" />
         {/* Sampler channel strip — full parity with the deck strips:
-            trim, 3-band EQ with kill buttons, meter, fader, MUTE.
-            Drives the sampler's own trim/EQ nodes in the engine; the
-            fader + mute drive the same samplerMaster gain as before
-            (mute keeps the level so unmute restores it exactly).
-            No filter / fx-send / cue here: the sampler chain has no
-            filter node, no FX send, and no cue bus. Per-pad volumes
-            still live on the sampler panel under Deck B. */}
+            trim, 3-band EQ with kill buttons, filter, fx send, meter,
+            fader, CUE, MUTE. Drives the sampler's own trim/EQ/filter/
+            send/cue nodes in the engine; the fader + mute drive the
+            same samplerMaster gain as before (mute keeps the level so
+            unmute restores it exactly). Per-pad volumes still live on
+            the sampler panel under Deck B. */}
         <SamplerStrip
           ch={props.samplerCh} set={props.setSamplerCh}
           vol={props.samplerVol} setVol={props.setSamplerVol}

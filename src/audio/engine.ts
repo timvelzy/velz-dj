@@ -201,6 +201,9 @@ export class DJEngine {
   private samplerEqLow!: BiquadFilterNode;
   private samplerEqMid!: BiquadFilterNode;
   private samplerEqHigh!: BiquadFilterNode;
+  private samplerFilter!: BiquadFilterNode;
+  private samplerFxSend!: GainNode;
+  private samplerCueGain!: GainNode;
   private samplerAnalyser!: AnalyserNode;
   pads: SamplerPad[] = Array.from({ length: 8 }, () => ({
     buffer: null, name: '', volume: 0.8, source: null,
@@ -252,11 +255,15 @@ export class DJEngine {
     this.buildFxUnit();
 
     // Sampler bus → master (post-compressor, pre-master-gain for independent level)
-    // Full deck-style channel chain: trim → 3-band EQ → fader/mute, using
-    // the SAME filter types/frequencies/Q as the deck channel EQ (lowshelf
-    // 200 Hz, peaking 1000 Hz Q 1, highshelf 3000 Hz). Defaults are neutral
-    // (trim unity, EQ flat) so the sampler sounds exactly as before until
-    // a knob moves.
+    // Full deck-style channel chain: trim → 3-band EQ → filter → fader/mute,
+    // plus a post-fader FX send into fxBus and a pre-fader cue tap into
+    // cueBus — the same positions as the deck channel chain (source →
+    // stretch → trim → EQ → filter → analyser → fader → xfade → master,
+    // cue tapped post-filter/pre-fader, FX sent post-fader). Filter uses
+    // the SAME allpass/lowpass/highpass behavior as the deck setFilter.
+    // Defaults are neutral (trim unity, EQ flat, filter allpass at
+    // 20 kHz, FX send closed, cue off) so the sampler sounds exactly
+    // as before until a knob moves.
     this.samplerBus = this.ctx.createGain();
     this.samplerTrim = this.ctx.createGain();
     this.samplerTrim.gain.value = 1;
@@ -266,14 +273,25 @@ export class DJEngine {
     this.samplerEqMid.type = 'peaking'; this.samplerEqMid.frequency.value = 1000; this.samplerEqMid.Q.value = 1;
     this.samplerEqHigh = this.ctx.createBiquadFilter();
     this.samplerEqHigh.type = 'highshelf'; this.samplerEqHigh.frequency.value = 3000;
+    this.samplerFilter = this.ctx.createBiquadFilter();
+    this.samplerFilter.type = 'allpass'; this.samplerFilter.frequency.value = 20000;
+    this.samplerFxSend = this.ctx.createGain();
+    this.samplerFxSend.gain.value = 0; // FX sends start closed (Phase 6)
+    this.samplerCueGain = this.ctx.createGain();
+    this.samplerCueGain.gain.value = 0; // cue OFF by default — real isolation
     this.samplerMaster = this.ctx.createGain();
     this.samplerMaster.gain.value = 0.9;
     this.samplerBus.connect(this.samplerTrim);
     this.samplerTrim.connect(this.samplerEqLow);
     this.samplerEqLow.connect(this.samplerEqMid);
     this.samplerEqMid.connect(this.samplerEqHigh);
-    this.samplerEqHigh.connect(this.samplerMaster);
+    this.samplerEqHigh.connect(this.samplerFilter);
+    this.samplerFilter.connect(this.samplerMaster);
     this.samplerMaster.connect(this.masterBus);
+    this.samplerMaster.connect(this.samplerFxSend);
+    this.samplerFxSend.connect(this.fxBus);
+    this.samplerFilter.connect(this.samplerCueGain);
+    this.samplerCueGain.connect(this.cueBus);
     // Passive meter tap for the sampler channel strip (analyser does not
     // alter the audio passing through samplerMaster).
     this.samplerAnalyser = this.ctx.createAnalyser();
@@ -1502,6 +1520,48 @@ export class DJEngine {
     node.gain.setTargetAtTime(db, t, 0.05);
     if (band === 'mid') node.Q.setTargetAtTime(kill ? 2 : 1, t, 0.05);
     debugLog('param', `eq ${band}`, 'sampler', { knob: v, db, kill });
+  }
+
+  /**
+   * Sampler filter — mirrors the deck setFilter exactly: |v| < 0.05 →
+   * allpass at 20 kHz (neutral); v < 0 → lowpass 100 * 200^(1-|v|);
+   * v > 0 → highpass 20 * 250^v; Q = 1 + |v| * 2. Same 0.05 tau.
+   */
+  setSamplerFilter(v: number): void {
+    if (!this.ctx) return;
+    const t = this.ctx.currentTime;
+    if (Math.abs(v) < 0.05) {
+      this.samplerFilter.type = 'allpass';
+      this.samplerFilter.frequency.setTargetAtTime(20000, t, 0.05);
+    } else if (v < 0) {
+      this.samplerFilter.type = 'lowpass';
+      const f = 100 * Math.pow(200, 1 - Math.abs(v));
+      this.samplerFilter.frequency.setTargetAtTime(f, t, 0.05);
+      this.samplerFilter.Q.value = 1 + Math.abs(v) * 2;
+    } else {
+      this.samplerFilter.type = 'highpass';
+      const f = 20 * Math.pow(250, v);
+      this.samplerFilter.frequency.setTargetAtTime(f, t, 0.05);
+      this.samplerFilter.Q.value = 1 + v * 2;
+    }
+    debugLog('param', 'filter', 'sampler', { v });
+  }
+
+  /** Sampler FX send — post-fader send into fxBus, mirroring setFxSend
+   * (gain 0–1, 0.03 tau, closed by default). The sampler is then
+   * processable by the existing FX unit exactly like a deck channel. */
+  setSamplerFxSend(v: number): void {
+    if (!this.ctx) return;
+    this.samplerFxSend.gain.setTargetAtTime(clamp(v, 0, 1), this.ctx.currentTime, 0.03);
+  }
+
+  /** Sampler cue — mirrors the deck setCue: pre-fader tap (post-filter)
+   * into the cue bus, 1/0 with 0.02 tau. Reaches only the phones mix,
+   * never masterBus directly. */
+  setSamplerCue(on: boolean): void {
+    if (!this.ctx) return;
+    this.samplerCueGain.gain.setTargetAtTime(on ? 1 : 0, this.ctx.currentTime, 0.02);
+    debugLog('param', 'cue', 'sampler', { on });
   }
 
   isSamplerMuted(): boolean {
