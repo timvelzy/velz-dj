@@ -127,7 +127,14 @@ export function resamplePeaks(peaks: BandPeaks, target: number): BandPeaks {
   return out;
 }
 
-/** Dominant-band color for a bucket (Rekordbox-style full-color waveform). */
+/** Dominant-band color for a bucket (Rekordbox-style full-color waveform).
+ * NOTE: superseded for rendering by amplitudeRGB below. Dominant-band
+ * coloring reads green-dominated on real tracks with the current
+ * analysis: the "mid" render in analyzeSpectrum is a peaking filter at
+ * 1kHz with default gain 0dB, i.e. a flat response — the mid array is
+ * effectively the FULL unfiltered signal, so it wins the max-band pick
+ * on nearly every bucket and the waveform renders almost entirely
+ * mid-green. Kept for reference; renderers use amplitudeRGB. */
 export function bandColor(peaks: BandPeaks, i: number): string {
   const lo = peaks.low[i] ?? 0;
   const md = peaks.mid[i] ?? 0;
@@ -145,4 +152,47 @@ export function bandColor(peaks: BandPeaks, i: number): string {
   if (lo >= md && lo >= hi) return '#ff2d55'; // low — vivid pink-red
   if (hi >= md) return '#007aff'; // high — vivid blue
   return '#32d74b'; // mid — vivid green
+}
+
+/**
+ * Per-bucket playback amplitude, groove ScrollingWaveformRenderer style:
+ * max of the envelope peak and the RMS × 1.8 boost. This is the input to
+ * the amplitude-banded coloring below (and to the sqrt bar heights in
+ * the top view), matching the renderer behind groove's DualOverviewWaveform
+ * top view — the example Tim showed. That renderer does NOT color by
+ * frequency band at all.
+ */
+export function bucketAmplitude(peaks: BandPeaks, i: number): number {
+  const peak = Math.max(Math.abs(peaks.min[i] ?? 0), Math.abs(peaks.max[i] ?? 0));
+  return Math.max(peak, (peaks.rms[i] ?? 0) * 1.8);
+}
+
+/**
+ * Amplitude-banded color, ported exactly from groove-web-mixer's
+ * ScrollingWaveformRenderer.getAmplitudeBasedColor (the renderer behind
+ * DualOverviewWaveform's top view). Color varies with loudness along the
+ * track, which is why groove's example reads multicolored instead of
+ * one flat band color: quiet passages render deep blue, then cyan, then
+ * green/yellow at mid level, then orange/red at high level. Returns
+ * [r, g, b] so callers can build groove's vertical per-bar gradient
+ * (lighter top, base middle, darker bottom) and played/unplayed alpha.
+ */
+export function amplitudeRGB(peaks: BandPeaks, i: number): [number, number, number] {
+  const normalizedAmp = Math.min(1, bucketAmplitude(peaks, i) * 2.5);
+  if (normalizedAmp < 0.2) {
+    // Very low amplitude — deep blue
+    const intensity = Math.floor(normalizedAmp * 255 * 5);
+    return [Math.floor(intensity * 0.3), Math.floor(intensity * 0.6), intensity];
+  } else if (normalizedAmp < 0.4) {
+    // Low amplitude — cyan
+    const intensity = Math.floor((normalizedAmp - 0.2) * 255 * 5);
+    return [Math.floor(intensity * 0.4), Math.floor(intensity * 0.9), intensity];
+  } else if (normalizedAmp < 0.7) {
+    // Mid amplitude — green/yellow
+    const intensity = Math.floor((normalizedAmp - 0.4) * 255 * 3.33);
+    return [intensity, Math.min(255, Math.floor(intensity * 1.3)), Math.floor(intensity * 0.3)];
+  }
+  // High amplitude — orange/red
+  const intensity = Math.floor((normalizedAmp - 0.7) * 255 * 3.33);
+  return [Math.min(255, intensity + 80), Math.floor(intensity * 0.6), Math.floor(intensity * 0.2)];
 }
