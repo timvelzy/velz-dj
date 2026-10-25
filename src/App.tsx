@@ -18,6 +18,14 @@ import { SetRecorder, downloadBlob, formatElapsed, type TracklistEntry } from '.
 import { computeBandPeaks, peaksKey } from './audio/peaks';
 import { computeBarLoop, doubleLoop, halveLoop } from './audio/loop';
 import { loadPeaks, savePeaks } from './audio/peaksStore';
+import {
+  clearLibraryRecords,
+  deleteLibraryRecord,
+  fileKeyFor,
+  loadLibraryRecords,
+  requestLibraryPersistence,
+  saveLibraryRecord,
+} from './audio/libraryStore';
 import type { BandPeaks, TrackInfo } from './types';
 import Deck, { type DeckState } from './components/Deck';
 import CenterPlayheadView, { type TopDeckView } from './components/CenterPlayheadView';
@@ -73,6 +81,11 @@ export default function App() {
   const [masterDeck, setMasterDeck] = useState<'deckA' | 'deckB' | null>(null);
   const [masterBpm, setMasterBpm] = useState(0);
   const [tracks, setTracks] = useState<TrackInfo[]>([]);
+  const tracksRef = useRef<TrackInfo[]>([]);
+  tracksRef.current = tracks;
+  // Shown in the library when a save fails (quota etc.) — the track stays
+  // usable in-session, but it will not survive a reload until storage frees up.
+  const [libraryError, setLibraryError] = useState<string | null>(null);
   const [editingGrid, setEditingGrid] = useState<'A' | 'B' | null>(null);
   const [midiOpen, setMidiOpen] = useState(false);
   const [devices, setDevices] = useState<MediaDeviceInfo[]>([]);
@@ -113,6 +126,27 @@ export default function App() {
     };
   }, []);
 
+  // Restore the saved track library on startup: titles/metadata land
+  // immediately, audio stays in IndexedDB and is decoded lazily when a
+  // track loads to a deck — startup stays snappy no matter how big the
+  // library gets. Also ask the browser to persist this origin's storage
+  // so the library is less likely to be evicted under pressure.
+  const libraryRestoredRef = useRef(false);
+  useEffect(() => {
+    if (libraryRestoredRef.current) return;
+    libraryRestoredRef.current = true;
+    void requestLibraryPersistence();
+    let cancelled = false;
+    loadLibraryRecords()
+      .then((restored) => {
+        if (!cancelled && restored.length) setTracks(restored);
+      })
+      .catch((e) => console.warn('Saved library restore failed', e));
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   // AI backend: real Gemini Lyria when a key is configured (localStorage
   // key field in the AI deck, or VITE_GEMINI_API_KEY at build time),
   // otherwise the clearly-labeled demo synth. The key is never committed.
@@ -147,6 +181,16 @@ export default function App() {
       const st = deckStateRef.current[k];
       if (st.track?.id === trackId) setDeckState(k, { ...st, track: { ...st.track, peaks } });
     });
+    // Keep the saved library record in step: a restored track's peaks come
+    // from its record, so a record saved before peaks were computed gets
+    // them here. Best-effort only — a failed update just means the peaks
+    // cache (not the track) is stale.
+    const track = tracksRef.current.find((t) => t.id === trackId);
+    if (track?.fileKey) {
+      void saveLibraryRecord({ ...track, peaks }).catch((e) =>
+        console.warn('Could not update saved library peaks', e),
+      );
+    }
   }, [setDeckState]);
 
   const ensurePeaks = useCallback((track: TrackInfo, buffer: AudioBuffer) => {
@@ -305,10 +349,51 @@ export default function App() {
     setTraktorSavedAt('');
   }, []);
 
+  // ─── Saved library management ───────────────────────────────────────────
+  // Removing a track drops it from the list and its stored record; a track
+  // already on a deck keeps playing (decks hold their own buffers).
+  const removeLibraryTrack = useCallback(async (trackId: string) => {
+    const track = tracksRef.current.find((t) => t.id === trackId);
+    if (track?.fileKey) {
+      try {
+        await deleteLibraryRecord(track.fileKey);
+      } catch (e) {
+        console.warn('Could not delete saved library record', e);
+      }
+    }
+    setTracks((ts) => ts.filter((t) => t.id !== trackId));
+  }, []);
+
+  const clearLibrary = useCallback(async () => {
+    if (!window.confirm('Clear the saved library? Every saved track is removed from this browser. Tracks on the decks keep playing.')) return;
+    try {
+      await clearLibraryRecords();
+    } catch (e) {
+      console.warn('Could not clear saved library', e);
+      alert('Could not clear the saved library — try again.');
+      return;
+    }
+    setTracks([]);
+    setLibraryError(null);
+  }, []);
+
   // ─── Track loading + analysis (ALWAYS runs — never hardcoded BPM) ─────────
   // Traktor is the source of truth: a matching collection entry loads its
   // hand-fixed grid + hotcues with zero re-analysis. Our analyzer is the
   // fallback for tracks Traktor doesn't know.
+  //
+  // Library saves are surfaced, not silent: a failed save (usually quota)
+  // leaves the track playable this session but warns in the library UI,
+  // and never breaks the deck load or the rest of the library.
+  const noteLibrarySaveError = useCallback((fileName: string, e: unknown) => {
+    const quota = e instanceof Error && e.name === 'QuotaExceededError';
+    setLibraryError(
+      quota
+        ? `Could not save "${fileName}" — browser storage is full. The track still plays this session, but it will not be in the library after a reload. Free up storage or remove saved tracks, then re-add it.`
+        : `Could not save "${fileName}" to the library (${e instanceof Error ? e.message : 'storage error'}). It still plays this session.`,
+    );
+  }, []);
+
   const loadTrack = useCallback(async (deckKey: 'A' | 'B', file: File) => {
     const deckId = `deck${deckKey}` as 'deckA' | 'deckB';
     const d = engine.decks.get(deckId);
@@ -320,6 +405,7 @@ export default function App() {
       const raw = await file.arrayBuffer();
       const buffer = await engine.ctx.decodeAudioData(raw);
       const traktorTrack = traktor ? findTraktorTrack(traktor, file) : undefined;
+      const key = fileKeyFor(file);
 
       let track: TrackInfo;
       let hotcues: (number | null)[] = [null, null, null, null];
@@ -336,6 +422,7 @@ export default function App() {
           key: keyRes.key,
           beatGrid: grid,
           file,
+          fileKey: key,
         };
         for (const hc of traktorTrack.hotcues) {
           if (hc.slot < 4) hotcues[hc.slot] = hc.position;
@@ -355,6 +442,7 @@ export default function App() {
           beatGrid: grid,
           spectralData,
           file,
+          fileKey: key,
         };
       }
       d.buffer = buffer;
@@ -363,23 +451,68 @@ export default function App() {
       d.syncBaseTempo = 1;
       d.syncCorr = 1;
       d.nudge = 0;
-      setTracks((ts) => [...ts.filter((t) => t.id !== track.id), track]);
+      setTracks((ts) => [...ts.filter((t) => t.fileKey !== track.fileKey), track]);
       setDeckState(deckKey, { ...deckInit(), track, buffer, hotcues });
       recorderRef.current?.noteTrack({
         deck: deckKey, title: track.title, artist: track.artist, bpm: track.bpm, key: track.key ?? '',
       });
       ensurePeaks(track, buffer);
+      // A newly loaded track joins the saved library. A failed save never
+      // breaks the deck load — the track plays this session regardless.
+      try {
+        await saveLibraryRecord(track);
+      } catch (e) {
+        console.warn('Library save failed', e);
+        noteLibrarySaveError(file.name, e);
+      }
     } catch (e) {
       console.error('Load failed', e);
       setDeckState(deckKey, deckInit());
       alert(`Could not load ${file.name}: ${e instanceof Error ? e.message : e}`);
     }
-  }, [setDeckState, traktor, ensurePeaks]);
+  }, [setDeckState, traktor, ensurePeaks, noteLibrarySaveError]);
+
+  // Restored library tracks load WITHOUT re-analysis: the stored beat grid,
+  // key, and peaks are already the track's analysis (a Traktor-matched
+  // track's stored grid IS its Traktor grid). Only the audio is decoded.
+  // Hotcues are not part of the saved record, so a restored track starts
+  // with no hotcues — a deck load from a fresh file still picks up
+  // Traktor hotcues through loadTrack.
+  const loadRestoredTrack = useCallback(async (deckKey: 'A' | 'B', track: TrackInfo) => {
+    const deckId = `deck${deckKey}` as 'deckA' | 'deckB';
+    const d = engine.decks.get(deckId);
+    if (!d || !track.file) return;
+    engine.pause(deckId);
+    setDeckState(deckKey, { ...deckInit(), analyzing: true, analysisProgress: 0 });
+    try {
+      const raw = await track.file.arrayBuffer();
+      const buffer = await engine.ctx.decodeAudioData(raw);
+      d.buffer = buffer;
+      d.grid = track.beatGrid;
+      d.userTempo = 1;
+      d.syncBaseTempo = 1;
+      d.syncCorr = 1;
+      d.nudge = 0;
+      setDeckState(deckKey, { ...deckInit(), track, buffer, hotcues: [null, null, null, null] });
+      recorderRef.current?.noteTrack({
+        deck: deckKey, title: track.title, artist: track.artist, bpm: track.bpm, key: track.key ?? '',
+      });
+      // Peaks usually ride along in the record; if an old record lacks
+      // them, this falls back to the peaks cache / computation.
+      ensurePeaks(track, buffer);
+    } catch (e) {
+      console.error('Restored load failed', e);
+      setDeckState(deckKey, deckInit());
+      alert(`Could not load ${track.title}: ${e instanceof Error ? e.message : e}`);
+    }
+  }, [setDeckState, ensurePeaks]);
 
   const loadLibraryTrack = useCallback((trackId: string, deckKey: 'A' | 'B') => {
     const t = tracks.find((x) => x.id === trackId);
-    if (t?.file) void loadTrack(deckKey, t.file);
-  }, [tracks, loadTrack]);
+    if (!t?.file) return;
+    if (t.restored) void loadRestoredTrack(deckKey, t);
+    else void loadTrack(deckKey, t.file);
+  }, [tracks, loadTrack, loadRestoredTrack]);
 
   const addFiles = useCallback((files: FileList) => {
     const audio = [...files].filter((f) => f.type.startsWith('audio/') || /\.(mp3|wav|flac|ogg|m4a|aac)$/i.test(f.name));
@@ -389,42 +522,64 @@ export default function App() {
     }
     // Add to library without loading to a deck.
     // Traktor matches skip analysis entirely — the collection grid is the grid.
+    // One bad file (or one failed save) never aborts the rest of the batch.
     void (async () => {
+      const failed: string[] = [];
       for (const file of audio) {
-        const raw = await file.arrayBuffer();
-        const buffer = await engine.ctx.decodeAudioData(raw.slice(0));
-        const traktorTrack = traktor ? findTraktorTrack(traktor, file) : undefined;
-        const keyRes = detectKey(buffer);
-        const track: TrackInfo = traktorTrack
-          ? {
-              id: `t${++trackSeq}`,
-              title: traktorTrack.title || file.name.replace(/\.[^.]+$/, ''),
-              artist: traktorTrack.artist,
-              duration: buffer.duration,
-              bpm: traktorTrack.grid.bpm,
-              key: keyRes.key,
-              beatGrid: refineTraktorGrid(traktorTrack, buffer.duration),
-              file,
-            }
-          : await (async () => {
-              const { grid, spectralData } = await analyzeTrack(buffer);
-              return {
+        try {
+          const raw = await file.arrayBuffer();
+          const buffer = await engine.ctx.decodeAudioData(raw.slice(0));
+          const traktorTrack = traktor ? findTraktorTrack(traktor, file) : undefined;
+          const keyRes = detectKey(buffer);
+          const key = fileKeyFor(file);
+          const track: TrackInfo = traktorTrack
+            ? {
                 id: `t${++trackSeq}`,
-                title: file.name.replace(/\.[^.]+$/, ''),
-                artist: '',
+                title: traktorTrack.title || file.name.replace(/\.[^.]+$/, ''),
+                artist: traktorTrack.artist,
                 duration: buffer.duration,
-                bpm: grid.bpm,
+                bpm: traktorTrack.grid.bpm,
                 key: keyRes.key,
-                beatGrid: grid,
-                spectralData,
+                beatGrid: refineTraktorGrid(traktorTrack, buffer.duration),
                 file,
-              } satisfies TrackInfo;
-            })();
-        setTracks((ts) => [...ts, track]);
-        ensurePeaks(track, buffer);
+                fileKey: key,
+              }
+            : await (async () => {
+                const { grid, spectralData } = await analyzeTrack(buffer);
+                return {
+                  id: `t${++trackSeq}`,
+                  title: file.name.replace(/\.[^.]+$/, ''),
+                  artist: '',
+                  duration: buffer.duration,
+                  bpm: grid.bpm,
+                  key: keyRes.key,
+                  beatGrid: grid,
+                  spectralData,
+                  file,
+                  fileKey: key,
+                } satisfies TrackInfo;
+              })();
+          setTracks((ts) => [...ts.filter((t) => t.fileKey !== track.fileKey), track]);
+          ensurePeaks(track, buffer);
+          // Join the saved library. A failed save leaves the track usable
+          // this session and warns in the library UI — it never drops the
+          // track or stops the batch.
+          try {
+            await saveLibraryRecord(track);
+          } catch (e) {
+            console.warn('Library save failed', e);
+            noteLibrarySaveError(file.name, e);
+          }
+        } catch (e) {
+          console.error('Add failed', file.name, e);
+          failed.push(file.name);
+        }
+      }
+      if (failed.length) {
+        alert(`Could not add ${failed.length} file(s): ${failed.join(', ')}`);
       }
     })();
-  }, [traktor, ensurePeaks]);
+  }, [traktor, ensurePeaks, noteLibrarySaveError]);
 
   // ─── Transport ────────────────────────────────────────────────────────────
   const togglePlay = useCallback((deckKey: 'A' | 'B') => {
@@ -931,7 +1086,15 @@ export default function App() {
 
       {/* Library */}
       <div className="px-3 pb-3">
-        <Library tracks={tracks} onAddFiles={addFiles} onLoadToDeck={loadLibraryTrack} />
+        <Library
+          tracks={tracks}
+          onAddFiles={addFiles}
+          onLoadToDeck={loadLibraryTrack}
+          onRemoveTrack={removeLibraryTrack}
+          onClearLibrary={clearLibrary}
+          libraryError={libraryError}
+          onDismissLibraryError={() => setLibraryError(null)}
+        />
       </div>
 
       {/* Modals */}
@@ -949,6 +1112,13 @@ export default function App() {
               const next = { ...track, beatGrid: grid, bpm: grid.bpm };
               setDeckState(editingGrid, { ...st, track: next });
               setTracks((ts) => ts.map((t) => (t.id === track.id ? next : t)));
+              // A hand-fixed grid is part of the track now — persist it so
+              // a reload does not bring back the pre-edit grid.
+              if (next.fileKey) {
+                void saveLibraryRecord(next).catch((e) =>
+                  console.warn('Could not persist edited grid', e),
+                );
+              }
             }}
           />
         ) : null;

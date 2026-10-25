@@ -6,9 +6,13 @@ interface LibraryProps {
   tracks: TrackInfo[];
   onAddFiles: (files: FileList) => void;
   onLoadToDeck: (trackId: string, deck: 'A' | 'B') => void;
+  onRemoveTrack: (trackId: string) => void;
+  onClearLibrary: () => void;
+  libraryError: string | null;
+  onDismissLibraryError: () => void;
 }
 
-export default function Library({ tracks, onAddFiles, onLoadToDeck }: LibraryProps) {
+export default function Library({ tracks, onAddFiles, onLoadToDeck, onRemoveTrack, onClearLibrary, libraryError, onDismissLibraryError }: LibraryProps) {
   const inputRef = useRef<HTMLInputElement>(null);
   const [pasteText, setPasteText] = useState('');
   const [matches, setMatches] = useState<MatchResult[] | null>(null);
@@ -23,12 +27,23 @@ export default function Library({ tracks, onAddFiles, onLoadToDeck }: LibraryPro
     <div className="rounded-xl border border-zinc-800 bg-zinc-950 p-3">
       <div className="mb-2 flex items-center justify-between">
         <span className="text-xs font-bold uppercase tracking-widest text-zinc-500">Track Library</span>
-        <button
-          onClick={() => inputRef.current?.click()}
-          className="rounded bg-sky-700 px-3 py-1 text-xs font-bold text-white hover:bg-sky-600"
-        >
-          + Add audio
-        </button>
+        <span className="flex items-center gap-2">
+          {tracks.length > 0 && (
+            <button
+              onClick={onClearLibrary}
+              className="rounded bg-zinc-800 px-2 py-1 text-xs text-zinc-400 hover:bg-zinc-700"
+              title="Remove every saved track from this browser"
+            >
+              Clear saved
+            </button>
+          )}
+          <button
+            onClick={() => inputRef.current?.click()}
+            className="rounded bg-sky-700 px-3 py-1 text-xs font-bold text-white hover:bg-sky-600"
+          >
+            + Add audio
+          </button>
+        </span>
         <input
           ref={inputRef}
           type="file"
@@ -39,6 +54,15 @@ export default function Library({ tracks, onAddFiles, onLoadToDeck }: LibraryPro
         />
       </div>
 
+      {libraryError && (
+        <div className="mb-2 flex items-start gap-2 rounded-lg border border-amber-800 bg-amber-950/60 px-3 py-2 text-xs text-amber-200">
+          <span className="min-w-0 flex-1">{libraryError}</span>
+          <button onClick={onDismissLibraryError} className="shrink-0 text-amber-400 hover:text-amber-200" title="Dismiss">
+            ✕
+          </button>
+        </div>
+      )}
+
       {tracks.length === 0 ? (
         <div
           className="rounded-lg border-2 border-dashed border-zinc-800 p-8 text-center text-sm text-zinc-500"
@@ -46,7 +70,7 @@ export default function Library({ tracks, onAddFiles, onLoadToDeck }: LibraryPro
           onDrop={(e) => { e.preventDefault(); if (e.dataTransfer.files.length) onAddFiles(e.dataTransfer.files); }}
         >
           Drop audio files here, or click “+ Add audio”.<br />
-          <span className="text-xs text-zinc-600">Every track is analyzed on load — BPM, beat grid, downbeat and key. Nothing is ever hardcoded.</span>
+          <span className="text-xs text-zinc-600">Every track is analyzed on load — BPM, beat grid, downbeat and key. Nothing is ever hardcoded. Saved tracks come back when you reopen the site.</span>
         </div>
       ) : (
         <div
@@ -101,9 +125,16 @@ export default function Library({ tracks, onAddFiles, onLoadToDeck }: LibraryPro
                     </button>
                     <button
                       onClick={() => onLoadToDeck(t.id, 'B')}
-                      className="rounded bg-orange-800 px-2 py-0.5 text-xs font-bold text-white hover:bg-orange-700"
+                      className="mr-1 rounded bg-orange-800 px-2 py-0.5 text-xs font-bold text-white hover:bg-orange-700"
                     >
                       B
+                    </button>
+                    <button
+                      onClick={() => onRemoveTrack(t.id)}
+                      className="rounded bg-zinc-800 px-1.5 py-0.5 text-xs text-zinc-500 hover:bg-zinc-700 hover:text-zinc-300"
+                      title="Remove from the saved library"
+                    >
+                      ✕
                     </button>
                   </td>
                 </tr>
@@ -114,6 +145,7 @@ export default function Library({ tracks, onAddFiles, onLoadToDeck }: LibraryPro
       )}
       <div className="mt-1 text-[11px] text-zinc-600">
         Tip: drag a row onto Deck A or B. Amber BPM = low analysis confidence — open “Edit beat grid” on the deck.
+        Tracks are saved in this browser — close and reopen, and they are still here, ready to load.
       </div>
 
       {/* Spotify playlist matching — metadata only. Spotify audio can't
