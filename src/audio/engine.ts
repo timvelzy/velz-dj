@@ -47,7 +47,14 @@ export interface DeckNodes {
   userTempo: number; // from the tempo fader
   syncBaseTempo: number; // tempo-follow value while synced
   syncCorr: number; // continuous phase correction multiplier (~1.0)
-  syncInt: number; // PLL integral term (Phase 5), clamped ±0.003
+  syncInt: number; // PLL integral term (Phase 5), clamped ±0.01 (round 5)
+  /** Round-5 smoothed tempo-follow ratio: 2s one-pole glide toward the
+   *  master/slave BPM ratio, so per-section BPM steps on walked grids
+   *  don't yank the playback rate (see syncTick). */
+  syncFollowSm: number;
+  /** Round-5 consecutive 50ms sync ticks with |phase| ≤ 30ms; LOCKED
+   *  requires a sustained streak, not one lucky poll (see syncStatus). */
+  syncLockStreak: number;
   nudge: number; // momentary pitch bend, e.g. ±0.05
   nudgeDeadline: number; // ctx time after which a nudge auto-expires (anti-latch)
   keyLock: boolean;
@@ -74,14 +81,19 @@ export function phaseErrorBeats(masterBeats: number, slaveBeats: number, range =
 
 /**
  * PLL correction multiplier from a phase error + integral term.
- * Proportional gain 0.12/beat gives a true proportional band (a 0.3-beat
- * error → 3.6% pull, not a bang-bang clamp); hard clamp ±3%. Pure.
- * Retuned for EDM sync: the old 0.05 gain converged too slowly to feel
- * locked on steady 4/4 grids; launch quantization handles the big jumps
- * (see playQuantized) and this PLL holds the lock after.
+ * Proportional gain 0.25/beat with hard clamp ±3% (round 5: was 0.12).
+ * What this does and doesn't do, measured on the loop equations (see
+ * the round-5 report): large offsets are slew-limited by the ±3%
+ * clamp in both versions (~13s from 0.8 beats either way), so the
+ * retune is NOT a faster big-offset fix. What it improves is the
+ * small-signal endgame: from a 49ms offset the loop settles inside
+ * ±30ms in ~0.9s instead of ~1.4s, with comparable ~10ms overshoot.
+ * The ±3% clamp is unchanged (audio-safe: no rate jumps), and
+ * per-tick correction slew stays ≤ ~0.001, so setTargetAtTime/WSOLA
+ * smoothing never sees a step. Pure.
  */
 export function pllCorrection(errBeats: number, integral: number): number {
-  return clamp(1 - errBeats * 0.12 - integral, 0.97, 1.03);
+  return clamp(1 - errBeats * 0.25 - integral, 0.97, 1.03);
 }
 
 /**
@@ -664,7 +676,7 @@ export class DJEngine {
       buffer: null,
       grid: null,
       posBase: 0, posBaseTime: ctx.currentTime, posRate: 1, pendingStartAt: null,
-      userTempo: 1, syncBaseTempo: 1, syncCorr: 1, syncInt: 0, nudge: 0, nudgeDeadline: 0,
+      userTempo: 1, syncBaseTempo: 1, syncCorr: 1, syncInt: 0, syncFollowSm: 1, syncLockStreak: 0, nudge: 0, nudgeDeadline: 0,
       keyLock: true,
       syncOn: false,
       loopStart: null, loopEnd: null,
@@ -881,6 +893,11 @@ export class DJEngine {
         const slaveBpm = this.bpmAtPosition(d, this.position(d.id));
         d.syncBaseTempo = clamp(mBpm / slaveBpm, 0.5, 2);
       }
+      // Round 5: snap the smoothed follow to the same starting ratio so
+      // the first ticks don't glide from a stale value, and reset the
+      // lock streak — a fresh sync-on has not earned LOCKED yet.
+      d.syncFollowSm = d.syncBaseTempo;
+      d.syncLockStreak = 0;
       d.syncCorr = 1;
       d.syncInt = 0;
       this.applyTempo(d);
@@ -889,6 +906,7 @@ export class DJEngine {
       d.userTempo = clamp(this.effectiveTempo(d), 0.5, 2);
       d.syncCorr = 1;
       d.syncInt = 0;
+      d.syncLockStreak = 0;
       this.applyTempo(d);
     }
   }
@@ -1025,6 +1043,11 @@ export class DJEngine {
    * churns the tempo, and a faster integral so steady-state offset dies
    * instead of lingering. Launch quantization (playQuantized) does the
    * big phase jumps at start time; this PLL only has to HOLD the lock.
+   * Round 5: the tempo-follow ratio is smoothed with a 2s glide (raw
+   * per-section BPM steps on walked grids used to yank the rate by
+   * tens of percent and the PLL could never hold phase against that),
+   * the integral clamp is 1% with a 2%/s slew limit, and the LOCKED
+   * claim moved to syncStatus as a sustained + grid-trusted criterion.
    */
   private syncTick(): void {
     // Nudge anti-latch enforcement (runs even without a master)
@@ -1046,25 +1069,58 @@ export class DJEngine {
       // Tempo follow — against the slave's LOCAL bpm from its beat map,
       // so drifting tracks stay matched instead of fighting a flat average.
       const slaveBpm = this.bpmAtPosition(d, this.position(d.id));
-      const want = clamp(mBpm / slaveBpm, 0.5, 2);
       let changed = false;
-      if (Math.abs(want - d.syncBaseTempo) > 0.0005) {
-        d.syncBaseTempo = want;
+      // Tempo follow — SMOOTHED (round 5). bpmAtPosition on a walked
+      // (non-steady) grid returns the current SECTION's BPM, which steps
+      // between section estimates as the track plays: the Oct 25 live
+      // retest follower showed a 0.661 launch rate, consistent with a
+      // ~186-BPM section estimate (123/186). Feeding such steps straight
+      // into the rate lurches the follower's TRUE tempo by tens of
+      // percent per section — the ear hears pumping even while the
+      // counter (which is built from the same grid) reads locked. A 2s
+      // one-pole glide turns steps into ramps: short blips wash out
+      // and real drift (slow) is still tracked. Stated limits: the
+      // glide does NOT cure a persistently misestimated section — the
+      // true tempo still ends up wrong there, just gradually instead
+      // of instantly — and during a glide the counter transiently
+      // deviates (PLL authority < glide lag on big steps), so LOCKED
+      // will correctly drop at section boundaries on bad grids. That
+      // is the label telling the truth, not a regression: a lasting
+      // audible lock on a bad grid needs grid repair, not loop tuning.
+      const target = clamp(mBpm / slaveBpm, 0.5, 2);
+      const alpha = 1 - Math.exp(-0.05 / 2); // 50ms tick, 2s time constant
+      d.syncFollowSm += (target - d.syncFollowSm) * alpha;
+      if (Math.abs(d.syncFollowSm - d.syncBaseTempo) > 0.0002) {
+        d.syncBaseTempo = d.syncFollowSm;
         changed = true;
       }
       // Phase correction from the beat counters (map-aware on both sides).
       // Bar-range wrap: being a whole bar ahead is alignment, not error.
       const sBeats = this.beatsAtPosition(d, this.position(d.id));
       const err = phaseErrorBeats(mBeats, sBeats, 4); // + = slave ahead
+      const errMs = (err * 60) / mBpm * 1000;
       // Deadband: sub-2.5ms error counts as locked, never churns tempo.
       const errCtl = Math.abs(err) < 0.005 ? 0 : err;
-      // Integral term: faster accumulation kills steady-state offset.
-      d.syncInt = clamp(d.syncInt + errCtl * 0.004, -0.005, 0.005);
+      // Integral term: absorbs steady-state rate mismatch so it dies
+      // instead of lingering. Round 5: clamp widened 0.5% → 1% (with the
+      // old 0.5% clamp and P = 0.25, a 1% residual mismatch still left
+      // ~10ms standing error — (1% − 0.5%) / 0.25 = 0.02 beats ≈ 10ms
+      // at 123 BPM — and 1.5% left ~20ms; mismatches up to 1% are now
+      // fully absorbed), with the per-tick step clamped so the
+      // integral can only slew 2%/s — no audible rate jumps from the
+      // integrator itself.
+      const dInt = clamp(errCtl * 0.004, -0.001, 0.001);
+      d.syncInt = clamp(d.syncInt + dInt, -0.01, 0.01);
       const corr = pllCorrection(errCtl, d.syncInt);
       if (Math.abs(corr - d.syncCorr) > 0.0002) {
         d.syncCorr = corr;
         changed = true;
       }
+      // Lock streak (round 5): LOCKED is a sustained claim, not one
+      // lucky poll. 10 consecutive ticks (500ms) inside ±30ms — the
+      // flam-fusion window: inside it two beats sound like ONE beat,
+      // outside it the ear hears a flam/double-hit.
+      if (Math.abs(errMs) <= 30) d.syncLockStreak += 1; else d.syncLockStreak = 0;
       if (changed) this.applyTempo(d);
     }
   }
@@ -1177,16 +1233,38 @@ export class DJEngine {
     return startAt;
   }
 
-  /** Sync lock readout for the UI: null when not a playing synced slave. */
+  /**
+   * Sync lock readout for the UI: null when not a playing synced slave.
+   * Round 5 — LOCKED is honest. It requires ALL of: (a) a sustained
+   * tight lock — 10 consecutive 50ms ticks inside ±30ms AND currently
+   * inside ±30ms, so one lucky poll can't claim it; (b) trustworthy
+   * grids on BOTH sides (confidence ≥ 0.4, the codebase's own "flag
+   * for manual fixing" line). On a low-confidence follower grid the
+   * counter phase itself is unreliable — mapped beats deviate from
+   * true beats — so no confident lock is ever claimed there; the ±ms
+   * readout still shows the measured error. Threshold basis: ±30ms
+   * is the flam-fusion window — inside it two beats sound like ONE,
+   * outside it the ear hears a flam/double-hit.
+   */
   syncStatus(id: string): { errBeats: number; errMs: number; locked: boolean } | null {
     const d = this.decks.get(id);
     if (!d || !d.syncOn || d.id === this.masterDeckId || !d.source || !d.grid || d.grid.bpm <= 0) return null;
+    // Round 5: during a queued quantized launch the position integrator
+    // is frozen at the queued offset while the master advances, so the
+    // phase error would climb toward a full bar and then snap at the
+    // drop. That number is meaningless — the QUEUED badge already
+    // covers this state — so report no lock readout until the drop.
+    if (d.pendingStartAt !== null && this.ctx.currentTime < d.pendingStartAt) return null;
     const mBeats = this.masterBeats();
     const mBpm = this.masterEffectiveBpm();
     if (mBeats === null || !mBpm) return null;
+    const mGrid = this.masterDeckId ? this.decks.get(this.masterDeckId)?.grid : undefined;
+    const gridsTrusted = d.grid.confidence >= 0.4 && (mGrid?.confidence ?? 0) >= 0.4;
     const sBeats = this.beatsAtPosition(d, this.position(d.id));
     const err = phaseErrorBeats(mBeats, sBeats, 4);
-    return { errBeats: err, errMs: (err * 60) / mBpm * 1000, locked: Math.abs(err) < 0.02 };
+    const errMs = (err * 60) / mBpm * 1000;
+    const locked = gridsTrusted && d.syncLockStreak >= 10 && Math.abs(errMs) <= 30;
+    return { errBeats: err, errMs, locked };
   }
 
   /** Audio time of a queued quantized launch, or null when none is queued. */
