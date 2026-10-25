@@ -831,10 +831,12 @@ export default function App() {
         >
           <Deck {...deckProps('A')} />
         </div>
-        {/* Center column: mixer on top, AI controls below — the
-            traditional three-channel arrangement (deck A | center | deck B),
-            with the top center-playhead view above. */}
-        <div className="flex min-w-0 flex-col gap-3">
+        {/* Center column: mixer — the traditional three-channel
+            arrangement (deck A | center | deck B), with the top
+            center-playhead view above. The AI deck is NOT here: it
+            lives as a full-width row below the decks/mixer section,
+            as it was before cfad71c (the center-column move cramped
+            it — reverted on Tim's call). */}
         <Mixer
           chA={chA} chB={chB} chC={chC}
           setChA={setChA} setChB={setChB} setChC={setChC}
@@ -847,6 +849,26 @@ export default function App() {
           phonesLevel={phonesLevel}
           setPhonesLevel={(v) => { setPhonesLevel(v); engine.setPhonesLevel(v); }}
         />
+        <div
+          onDragOver={(e) => e.preventDefault()}
+          onDrop={(e) => {
+            e.preventDefault();
+            const id = e.dataTransfer.getData('text/track-id');
+            if (id) loadLibraryTrack(id, 'B');
+          }}
+        >
+          <Deck {...deckProps('B')} />
+        </div>
+      </main>
+
+      {/* FX unit — beat-synced send/return */}
+      <div className="px-3 pb-3">
+        <FxUnit />
+      </div>
+
+      {/* AI deck — full width, below the decks/mixer section (restored
+          pre-cfad71c placement; panel contents unchanged). */}
+      <div className="px-3 pb-3">
         <AIDeck
           queue={queue}
           masterBpm={masterBpm}
@@ -866,22 +888,6 @@ export default function App() {
           lyriaKey={lyriaKey}
           onLyriaKeyChange={applyLyriaKey}
         />
-        </div>
-        <div
-          onDragOver={(e) => e.preventDefault()}
-          onDrop={(e) => {
-            e.preventDefault();
-            const id = e.dataTransfer.getData('text/track-id');
-            if (id) loadLibraryTrack(id, 'B');
-          }}
-        >
-          <Deck {...deckProps('B')} />
-        </div>
-      </main>
-
-      {/* FX unit — beat-synced send/return */}
-      <div className="px-3 pb-3">
-        <FxUnit />
       </div>
 
       {/* Library */}
