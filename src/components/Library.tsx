@@ -1,9 +1,12 @@
 import { useRef, useState } from 'react';
 import type { TrackInfo } from '../types';
+import { keyCompatibility } from '../audio/keycompat';
 import { matchTracklist, type MatchResult } from '../audio/spotifyMatch';
 
 interface LibraryProps {
   tracks: TrackInfo[];
+  /** The sync master's Camelot key (for compatibility markers; '' = none). */
+  masterKey?: string;
   onAddFiles: (files: FileList) => void;
   onLoadToDeck: (trackId: string, deck: 'A' | 'B') => void;
   onRemoveTrack: (trackId: string) => void;
@@ -12,7 +15,7 @@ interface LibraryProps {
   onDismissLibraryError: () => void;
 }
 
-export default function Library({ tracks, onAddFiles, onLoadToDeck, onRemoveTrack, onClearLibrary, libraryError, onDismissLibraryError }: LibraryProps) {
+export default function Library({ tracks, masterKey, onAddFiles, onLoadToDeck, onRemoveTrack, onClearLibrary, libraryError, onDismissLibraryError }: LibraryProps) {
   const inputRef = useRef<HTMLInputElement>(null);
   const [pasteText, setPasteText] = useState('');
   const [matches, setMatches] = useState<MatchResult[] | null>(null);
@@ -114,7 +117,27 @@ export default function Library({ tracks, onAddFiles, onLoadToDeck, onRemoveTrac
                       </span>
                     ) : '—'}
                   </td>
-                  <td className="px-2 py-1.5 font-mono text-amber-300">{t.key || '—'}</td>
+                  <td className="px-2 py-1.5 font-mono text-amber-300">
+                    {t.key || '—'}
+                    {masterKey && t.key && (() => {
+                      const tier = keyCompatibility(masterKey, t.key!);
+                      if (tier === 'perfect' || tier === 'compatible') {
+                        return (
+                          <span className="ml-1 text-[10px] font-bold text-emerald-400" title={`Camelot vs master ${masterKey}: ${tier === 'perfect' ? 'same key' : 'compatible'}`}>
+                            ✓
+                          </span>
+                        );
+                      }
+                      if (tier === 'energy') {
+                        return (
+                          <span className="ml-1 text-[10px] font-bold text-sky-400" title={`Camelot vs master ${masterKey}: energy boost (+2)`}>
+                            ⚡
+                          </span>
+                        );
+                      }
+                      return null;
+                    })()}
+                  </td>
                   <td className="px-2 py-1.5 font-mono text-zinc-500">{fmtDur(t.duration)}</td>
                   <td className="px-2 py-1.5 text-right">
                     <button

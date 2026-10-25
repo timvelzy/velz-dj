@@ -110,7 +110,9 @@ export default function Sampler() {
   const [pads, setPads] = useState<PadUIState[]>(
     Array.from({ length: 8 }, () => ({ name: '', loaded: false, volume: 0.8, flashing: false }))
   );
-  const [quantize, setQuantize] = useState(false);
+  // Quantize defaults ON (EDM sync feature): pads drop on the next master
+  // beat. The checkbox defeats it for manual triggering.
+  const [quantize, setQuantize] = useState(true);
   const [master, setMaster] = useState(0.9);
   const [open, setOpen] = useState(true);
   const flashTimers = useRef<number[]>([]);

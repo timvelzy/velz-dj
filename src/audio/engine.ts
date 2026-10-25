@@ -40,6 +40,8 @@ export interface DeckNodes {
   posBase: number;
   posBaseTime: number;
   posRate: number;
+  /** Audio time of a queued quantized launch (null = not queued). */
+  pendingStartAt: number | null;
   // Tempo model
   userTempo: number; // from the tempo fader
   syncBaseTempo: number; // tempo-follow value while synced
@@ -71,11 +73,53 @@ export function phaseErrorBeats(masterBeats: number, slaveBeats: number, range =
 
 /**
  * PLL correction multiplier from a phase error + integral term.
- * Proportional gain 0.05/beat gives a true proportional band (a 0.3-beat
- * error → 1.5% pull, not a bang-bang clamp); hard clamp ±2%. Pure.
+ * Proportional gain 0.12/beat gives a true proportional band (a 0.3-beat
+ * error → 3.6% pull, not a bang-bang clamp); hard clamp ±3%. Pure.
+ * Retuned for EDM sync: the old 0.05 gain converged too slowly to feel
+ * locked on steady 4/4 grids; launch quantization handles the big jumps
+ * (see playQuantized) and this PLL holds the lock after.
  */
 export function pllCorrection(errBeats: number, integral: number): number {
-  return clamp(1 - errBeats * 0.05 - integral, 0.98, 1.02);
+  return clamp(1 - errBeats * 0.12 - integral, 0.97, 1.03);
+}
+
+/**
+ * Beats until the next `cycleBeats` boundary at/after `mBeats`, never less
+ * than `minAheadBeats` out (a boundary right now waits a full cycle, so a
+ * scheduled start is never in the past). Pure — extracted for tests.
+ */
+export function nextBoundaryWaitBeats(mBeats: number, cycleBeats: number, minAheadBeats: number): number {
+  const frac = ((mBeats % cycleBeats) + cycleBeats) % cycleBeats;
+  let wait = (cycleBeats - frac) % cycleBeats;
+  while (wait < minAheadBeats) wait += cycleBeats;
+  return wait;
+}
+
+/**
+ * First downbeat-phase beat at/after `cuePoint` on this grid (the engine's
+ * phase convention: beat index % 4 === 0 is a downbeat). Falls back to
+ * flat downbeatOffset/firstBeat math when the map is thin. Pure.
+ */
+export function downbeatOffsetFor(grid: BeatGrid, cuePoint: number, duration: number): number {
+  if (grid.beats.length > 0) {
+    let lo = 0, hi = grid.beats.length - 1, first = grid.beats.length;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (grid.beats[mid] >= cuePoint) { first = mid; hi = mid - 1; }
+      else lo = mid + 1;
+    }
+    if (first < grid.beats.length) {
+      const j = first + ((4 - (first % 4)) % 4);
+      if (j < grid.beats.length) return grid.beats[j];
+    }
+  }
+  const off = grid.downbeatOffset >= 0 ? grid.downbeatOffset : grid.firstBeat >= 0 ? grid.firstBeat : 0;
+  const spb = 60 / grid.bpm;
+  const barDur = 4 * spb;
+  const k = Math.ceil(Math.max(0, cuePoint - off) / barDur);
+  const target = off + k * barDur;
+  if (duration > 0 && target >= duration) return Math.max(0, target % duration);
+  return Math.max(0, target);
 }
 
 export type FxType = 'delay' | 'reverb' | 'bitcrush' | 'flanger';
@@ -145,7 +189,12 @@ export class DJEngine {
   pads: SamplerPad[] = Array.from({ length: 8 }, () => ({
     buffer: null, name: '', volume: 0.8, source: null,
   }));
-  samplerQuantize = false;
+  samplerQuantize = true; // default ON: pads launch quantized (checkbox defeats it)
+
+  // Quantized launch (EDM sync feature): decks wait for the master grid.
+  // 'bar' = drop on the next master bar with the slave on a downbeat (the
+  // EDM default); 'beat' = next master beat; 'off' = immediate play.
+  launchQuantize: 'bar' | 'beat' | 'off' = 'bar';
 
   // Device routing (master + headphones on separate devices via setSinkId)
   private masterDest!: MediaStreamAudioDestinationNode;
@@ -237,8 +286,9 @@ export class DJEngine {
     this.initDeck('deckB');
     this.initDeck('deckC');
 
-    // Continuous sync PLL
-    this.syncTimer = window.setInterval(() => this.syncTick(), 100);
+    // Continuous sync PLL (50ms tick — tight enough to hold phase on
+    // steady 4/4 grids without churning the tempo every frame)
+    this.syncTimer = window.setInterval(() => this.syncTick(), 50);
   }
 
   async resume(): Promise<void> {
@@ -543,7 +593,7 @@ export class DJEngine {
       trim, eqLow, eqMid, eqHigh, filter, analyser, fader, fxSend, xfade, cueGain,
       buffer: null,
       grid: null,
-      posBase: 0, posBaseTime: ctx.currentTime, posRate: 1,
+      posBase: 0, posBaseTime: ctx.currentTime, posRate: 1, pendingStartAt: null,
       userTempo: 1, syncBaseTempo: 1, syncCorr: 1, syncInt: 0, nudge: 0, nudgeDeadline: 0,
       keyLock: true,
       syncOn: false,
@@ -599,6 +649,12 @@ export class DJEngine {
   position(id: string): number {
     const d = this.decks.get(id);
     if (!d || !d.buffer) return 0;
+    // A queued quantized launch reports its queued offset until the
+    // scheduled start time passes (never a negative/integrated value).
+    if (d.pendingStartAt !== null) {
+      if (this.ctx.currentTime < d.pendingStartAt) return d.posBase;
+      d.pendingStartAt = null;
+    }
     if (!d.source) return d.posBase;
     let pos = d.posBase + d.posRate * (this.ctx.currentTime - d.posBaseTime);
     // Loop wrap (source loops the buffer region; our integrator must follow)
@@ -613,7 +669,7 @@ export class DJEngine {
     return Math.max(0, pos);
   }
 
-  play(id: string, opts?: { offset?: number; alignToMaster?: boolean }): void {
+  play(id: string, opts?: { offset?: number; alignToMaster?: boolean; startAt?: number }): void {
     const d = this.decks.get(id);
     if (!d || !d.buffer) return;
     this.rebase(d);
@@ -635,10 +691,15 @@ export class DJEngine {
     let offset = opts?.offset ?? d.posBase;
     if (opts?.alignToMaster) offset = this.barAlignedOffset(id, offset);
 
-    const t = this.ctx.currentTime + 0.02;
+    // A future startAt is a queued quantized launch (see playQuantized):
+    // the source is created now but starts on the grid, and the deck
+    // reports the queued offset until then.
+    const now = this.ctx.currentTime;
+    const t = opts?.startAt !== undefined ? Math.max(opts.startAt, now + 0.02) : now + 0.02;
     d.source = src;
     d.posBase = offset;
     d.posBaseTime = t;
+    d.pendingStartAt = opts?.startAt !== undefined && t > now + 0.03 ? t : null;
     d.posRate = this.effectiveTempo(d);
     this.applyTempo(d);
     // Natural-end reporting (dropout hardening): a BufferSource that runs
@@ -667,6 +728,7 @@ export class DJEngine {
     try { d.source.stop(); } catch { /* noop */ }
     d.source.disconnect();
     d.source = null;
+    d.pendingStartAt = null; // also cancels a queued quantized launch
     d.posBaseTime = this.ctx.currentTime;
     d.nudge = 0; // momentary bend never survives a pause
     d.nudgeDeadline = 0;
@@ -875,12 +937,16 @@ export class DJEngine {
   }
 
   /**
-   * Continuous sync: phase-locked loop. Every 100ms, for each synced slave,
+   * Continuous sync: phase-locked loop. Every 50ms, for each synced slave,
    * tempo-follow the master and apply a proportional + integral correction
    * toward zero bar-phase error. This is what keeps decks from drifting
    * apart. Phase 5: applyTempo is now called whenever EITHER the follow
    * tempo or the correction changed (previously a follow-only change never
    * reached the audio rate), and the P-gain is a true proportional band.
+   * EDM retune: 50ms tick (was 100ms), deadband so sub-2.5ms error never
+   * churns the tempo, and a faster integral so steady-state offset dies
+   * instead of lingering. Launch quantization (playQuantized) does the
+   * big phase jumps at start time; this PLL only has to HOLD the lock.
    */
   private syncTick(): void {
     // Nudge anti-latch enforcement (runs even without a master)
@@ -912,9 +978,11 @@ export class DJEngine {
       // Bar-range wrap: being a whole bar ahead is alignment, not error.
       const sBeats = this.beatsAtPosition(d, this.position(d.id));
       const err = phaseErrorBeats(mBeats, sBeats, 4); // + = slave ahead
-      // Integral term: slow accumulation kills steady-state offset.
-      d.syncInt = clamp(d.syncInt + err * 0.0015, -0.003, 0.003);
-      const corr = pllCorrection(err, d.syncInt);
+      // Deadband: sub-2.5ms error counts as locked, never churns tempo.
+      const errCtl = Math.abs(err) < 0.005 ? 0 : err;
+      // Integral term: faster accumulation kills steady-state offset.
+      d.syncInt = clamp(d.syncInt + errCtl * 0.004, -0.005, 0.005);
+      const corr = pllCorrection(errCtl, d.syncInt);
       if (Math.abs(corr - d.syncCorr) > 0.0002) {
         d.syncCorr = corr;
         changed = true;
@@ -955,15 +1023,115 @@ export class DJEngine {
     return clamp(snapped, 0, dur);
   }
 
-  /** Audio time (ctx.currentTime) of the next master bar boundary ≥ `minAheadSec` out. */
-  nextBarTime(minAheadSec = 0.25): number | null {
+  /** Audio time of the next master boundary of `cycleBeats` beats, ≥ minAheadSec out. */
+  private nextMasterBoundaryTime(cycleBeats: number, minAheadSec: number): number | null {
     const mBeats = this.masterBeats();
     const mBpm = this.masterEffectiveBpm();
     if (mBeats === null || !mBpm) return null;
-    const beatsUntil = (4 - (((mBeats % 4) + 4) % 4)) % 4;
     const spb = 60 / mBpm;
-    const waitBeats = beatsUntil * spb < minAheadSec ? beatsUntil + 4 : beatsUntil;
-    return this.ctx.currentTime + waitBeats * spb;
+    const wait = nextBoundaryWaitBeats(mBeats, cycleBeats, minAheadSec / spb);
+    return this.ctx.currentTime + wait * spb;
+  }
+
+  /** Audio time (ctx.currentTime) of the next master bar boundary ≥ `minAheadSec` out. */
+  nextBarTime(minAheadSec = 0.25): number | null {
+    return this.nextMasterBoundaryTime(4, minAheadSec);
+  }
+
+  /** Audio time of the next master beat boundary ≥ `minAheadSec` out. */
+  nextBeatTime(minAheadSec = 0.1): number | null {
+    return this.nextMasterBoundaryTime(1, minAheadSec);
+  }
+
+  /** First downbeat-phase offset at/after `cuePoint` on this deck's grid. */
+  downbeatOffset(id: string, cuePoint: number): number {
+    const d = this.decks.get(id);
+    if (!d || !d.grid || d.grid.bpm <= 0) return cuePoint;
+    return downbeatOffsetFor(d.grid, cuePoint, d.buffer?.duration ?? 0);
+  }
+
+  /** Set the deck-launch quantization mode ('bar' default, 'beat', or 'off'). */
+  setLaunchQuantize(mode: 'bar' | 'beat' | 'off'): void {
+    this.launchQuantize = mode;
+  }
+
+  /**
+   * EDM quantized launch — the single hook for deck Play and CUE starts.
+   * When launchQuantize is on and a master deck is playing, the deck does
+   * NOT start mid-beat: it waits for the master's next bar boundary
+   * ('bar' mode) or next beat ('beat' mode) and starts there at its own
+   * downbeat (bar mode) or nearest beat (beat mode), so drops land
+   * together in phase. No master playing, or quantize off → immediate
+   * play, exactly like play(). A queued launch is a scheduled source:
+   * pause()/seek() cancel it, and position() reports the queued offset
+   * until the start time passes. Returns the scheduled audio time, or
+   * null when the deck has no buffer. The caller (App) gates this on the
+   * deck's Q toggle, so Q off always means manual, immediate control.
+   */
+  playQuantized(id: string, opts?: { offset?: number }): number | null {
+    const d = this.decks.get(id);
+    if (!d || !d.buffer) return null;
+    const offset = opts?.offset ?? d.posBase;
+    const masterPlaying = this.masterDeckId !== null && this.masterDeckId !== id
+      && this.isPlaying(this.masterDeckId) && this.masterBeats() !== null;
+    if (this.launchQuantize === 'off' || !masterPlaying) {
+      this.play(id, { offset });
+      return this.ctx.currentTime;
+    }
+    const mode = this.launchQuantize;
+    const startAt = mode === 'bar' ? this.nextBarTime(0.25) : this.nextBeatTime(0.1);
+    if (startAt === null) {
+      this.play(id, { offset });
+      return this.ctx.currentTime;
+    }
+    const startOffset = mode === 'bar'
+      ? this.downbeatOffset(id, offset)
+      : this.quantizeToBeat(id, offset);
+    this.play(id, { offset: startOffset, startAt });
+    debugLog('transport', 'quantized launch queued', id, { mode, at: startAt, offset: startOffset });
+    return startAt;
+  }
+
+  /** Sync lock readout for the UI: null when not a playing synced slave. */
+  syncStatus(id: string): { errBeats: number; errMs: number; locked: boolean } | null {
+    const d = this.decks.get(id);
+    if (!d || !d.syncOn || d.id === this.masterDeckId || !d.source || !d.grid || d.grid.bpm <= 0) return null;
+    const mBeats = this.masterBeats();
+    const mBpm = this.masterEffectiveBpm();
+    if (mBeats === null || !mBpm) return null;
+    const sBeats = this.beatsAtPosition(d, this.position(d.id));
+    const err = phaseErrorBeats(mBeats, sBeats, 4);
+    return { errBeats: err, errMs: (err * 60) / mBpm * 1000, locked: Math.abs(err) < 0.02 };
+  }
+
+  /** Audio time of a queued quantized launch, or null when none is queued. */
+  pendingLaunchAt(id: string): number | null {
+    return this.decks.get(id)?.pendingStartAt ?? null;
+  }
+
+  /**
+   * Absolute audio time of the next quantized boundary, or null when no
+   * reference is playing. Master reference first (tempo-aware); falls
+   * back to the first playing deck with a beat map. Shared by pad
+   * triggers (beat mode) so samples launch on the same grid as decks.
+   */
+  nextQuantizedAudioTime(mode: 'bar' | 'beat'): number | null {
+    const fromMaster = mode === 'bar' ? this.nextBarTime(0.1) : this.nextBeatTime(0.05);
+    if (fromMaster !== null) return fromMaster;
+    const refId = [...this.decks.keys()].find((id) => this.isPlaying(id) && this.decks.get(id)?.grid?.beats?.length);
+    if (!refId) return null;
+    const deck = this.decks.get(refId)!;
+    const grid = deck.grid!;
+    const pos = this.position(refId);
+    let next: number | undefined;
+    if (mode === 'bar') {
+      // Next downbeat-phase beat (index % 4 === 0, the engine's convention)
+      next = grid.beats.find((b, i) => b > pos && i % 4 === 0);
+    }
+    if (next === undefined) next = grid.beats.find((b) => b > pos);
+    if (next === undefined) return null;
+    const rate = deck.posRate || 1;
+    return this.ctx.currentTime + Math.max(0, (next - pos) / rate);
   }
 
   // ─── Mixer params ─────────────────────────────────────────────────────────
@@ -1135,6 +1303,7 @@ export class DJEngine {
     d.loopEnd = buffer.duration;
     d.posBase = 0;
     d.posBaseTime = barTime;
+    d.pendingStartAt = null;
     d.posRate = tempo;
     this.applyTempo(d);
 
@@ -1243,25 +1412,9 @@ export class DJEngine {
     this.samplerQuantize = on;
   }
 
-  /** Find seconds until the next beat on the reference deck (master or first playing deck with a grid). */
-  private secondsToNextBeat(): number | null {
-    const refId = (this.masterDeckId && this.isPlaying(this.masterDeckId))
-      ? this.masterDeckId
-      : [...this.decks.keys()].find((id) => this.isPlaying(id) && this.decks.get(id)?.grid);
-    if (!refId) return null;
-    const deck = this.decks.get(refId);
-    const grid = deck?.grid;
-    if (!deck || !grid?.beats?.length) return null;
-    const pos = this.position(refId); // track seconds
-    // Find first beat timestamp after current position
-    const next = grid.beats.find((b) => b > pos);
-    if (next == null) return null;
-    // Convert track-time delta to real-time delta (account for tempo rate)
-    const rate = deck.posRate || 1;
-    return Math.max(0, (next - pos) / rate);
-  }
-
-  /** Trigger a pad. Retriggers if already playing. Quantize snaps to next beat. */
+  /** Trigger a pad. Retriggers if already playing. Quantize snaps to the
+   * next master beat through the shared quantization hook (pads use beats
+   * so one-shots stay snappy; decks use bars). Default ON. */
   triggerSample(padIndex: number): boolean {
     if (!this.ctx || padIndex < 0 || padIndex > 7) return false;
     const pad = this.pads[padIndex];
@@ -1272,8 +1425,8 @@ export class DJEngine {
 
     let when = this.ctx.currentTime;
     if (this.samplerQuantize) {
-      const delay = this.secondsToNextBeat();
-      if (delay != null) when += delay;
+      const q = this.nextQuantizedAudioTime('beat');
+      if (q !== null) when = q;
     }
 
     const src = this.ctx.createBufferSource();
