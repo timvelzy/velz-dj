@@ -785,6 +785,7 @@ export default function App() {
             onCueUp: () => cueUp('A'),
             onStop: () => { engine.pause('deckA'); engine.seek('deckA', deckA.cuePoint); },
             onSetCue: () => setDeckState('A', { ...deckA, cuePoint: engine.position('deckA') }),
+            onToggleSync: () => toggleSync('A'),
             onSeek: (t) => engine.seek('deckA', t),
           },
           {
@@ -802,6 +803,7 @@ export default function App() {
             onCueUp: () => cueUp('B'),
             onStop: () => { engine.pause('deckB'); engine.seek('deckB', deckB.cuePoint); },
             onSetCue: () => setDeckState('B', { ...deckB, cuePoint: engine.position('deckB') }),
+            onToggleSync: () => toggleSync('B'),
             onSeek: (t) => engine.seek('deckB', t),
           },
         ]}
