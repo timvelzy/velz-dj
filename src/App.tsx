@@ -859,24 +859,43 @@ export default function App() {
         } : null}
       />
 
-      {/* Decks + mixer */}
-      <main className="grid gap-3 p-3 lg:grid-cols-[1fr_340px_1fr]">
-        <div
-          onDragOver={(e) => e.preventDefault()}
-          onDrop={(e) => {
-            e.preventDefault();
-            const id = e.dataTransfer.getData('text/track-id');
-            if (id) loadLibraryTrack(id, 'A');
-          }}
-        >
-          <Deck {...deckProps('A')} />
+      {/* Decks + mixer in stacked columns: AI under Deck A, FX +
+          sampler under Deck B, mixer alone in the center — saves
+          the vertical space the old full-width rows took. */}
+      <main className="grid items-start gap-3 p-3 lg:grid-cols-[1fr_340px_1fr]">
+        {/* Left column: Deck A, then the AI deck underneath it. */}
+        <div className="flex flex-col gap-3">
+          <div
+            onDragOver={(e) => e.preventDefault()}
+            onDrop={(e) => {
+              e.preventDefault();
+              const id = e.dataTransfer.getData('text/track-id');
+              if (id) loadLibraryTrack(id, 'A');
+            }}
+          >
+            <Deck {...deckProps('A')} />
+          </div>
+          <AIDeck
+            queue={queue}
+            masterBpm={masterBpm}
+            masterKey={masterKey}
+            onDropLoop={dropAiLoop}
+            isPlaying={aiPlaying}
+            onStop={aiStop}
+            onPlay={aiPlay}
+            onPause={aiPause}
+            onCueDown={aiCueDown}
+            onCueUp={aiCueUp}
+            onSetCue={aiSetCue}
+            aiCue={aiCue}
+            currentLoop={aiLoop}
+            buffer={aiBuffer}
+            peaks={aiPeaks}
+            lyriaKey={lyriaKey}
+            onLyriaKeyChange={applyLyriaKey}
+          />
         </div>
-        {/* Center column: mixer — the traditional three-channel
-            arrangement (deck A | center | deck B), with the top
-            center-playhead view above. The AI deck is NOT here: it
-            lives as a full-width row below the decks/mixer section,
-            as it was before cfad71c (the center-column move cramped
-            it — reverted on Tim's call). */}
+        {/* Center column: mixer alone. */}
         <Mixer
           chA={chA} chB={chB} chC={chC}
           setChA={setChA} setChB={setChB} setChC={setChC}
@@ -889,55 +908,28 @@ export default function App() {
           phonesLevel={phonesLevel}
           setPhonesLevel={(v) => { setPhonesLevel(v); engine.setPhonesLevel(v); }}
         />
-        <div
-          onDragOver={(e) => e.preventDefault()}
-          onDrop={(e) => {
-            e.preventDefault();
-            const id = e.dataTransfer.getData('text/track-id');
-            if (id) loadLibraryTrack(id, 'B');
-          }}
-        >
-          <Deck {...deckProps('B')} />
+        {/* Right column: Deck B, then FX, then the sampler. */}
+        <div className="flex flex-col gap-3">
+          <div
+            onDragOver={(e) => e.preventDefault()}
+            onDrop={(e) => {
+              e.preventDefault();
+              const id = e.dataTransfer.getData('text/track-id');
+              if (id) loadLibraryTrack(id, 'B');
+            }}
+          >
+            <Deck {...deckProps('B')} />
+          </div>
+          {/* FX unit — beat-synced send/return */}
+          <FxUnit />
+          {/* Sampler */}
+          <Sampler />
         </div>
       </main>
-
-      {/* FX unit — beat-synced send/return */}
-      <div className="px-3 pb-3">
-        <FxUnit />
-      </div>
-
-      {/* AI deck — full width, below the decks/mixer section (restored
-          pre-cfad71c placement; panel contents unchanged). */}
-      <div className="px-3 pb-3">
-        <AIDeck
-          queue={queue}
-          masterBpm={masterBpm}
-          masterKey={masterKey}
-          onDropLoop={dropAiLoop}
-          isPlaying={aiPlaying}
-          onStop={aiStop}
-          onPlay={aiPlay}
-          onPause={aiPause}
-          onCueDown={aiCueDown}
-          onCueUp={aiCueUp}
-          onSetCue={aiSetCue}
-          aiCue={aiCue}
-          currentLoop={aiLoop}
-          buffer={aiBuffer}
-          peaks={aiPeaks}
-          lyriaKey={lyriaKey}
-          onLyriaKeyChange={applyLyriaKey}
-        />
-      </div>
 
       {/* Library */}
       <div className="px-3 pb-3">
         <Library tracks={tracks} onAddFiles={addFiles} onLoadToDeck={loadLibraryTrack} />
-      </div>
-
-      {/* Sampler */}
-      <div className="px-3 pb-6 max-w-2xl">
-        <Sampler />
       </div>
 
       {/* Modals */}
