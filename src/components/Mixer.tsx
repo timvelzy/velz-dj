@@ -185,6 +185,7 @@ function ChannelStrip({ id, label, accent, ch, set, deckId, midiPrefix, fxMidiId
   useEffect(() => {
     const regs = [
       midi.registerControl(`${midiPrefix}.fader`, { kind: 'fader', onAbsolute: (v) => upd({ fader: v }) }),
+      midi.registerControl(`${midiPrefix}.trim`, { kind: 'knob', onAbsolute: (v) => upd({ trim: v * 2 }) }),
       midi.registerControl(`${midiPrefix}.eqLow`, { kind: 'knob', onAbsolute: (v) => upd({ eqLow: v * 2 - 1 }) }),
       midi.registerControl(`${midiPrefix}.eqMid`, { kind: 'knob', onAbsolute: (v) => upd({ eqMid: v * 2 - 1 }) }),
       midi.registerControl(`${midiPrefix}.eqHigh`, { kind: 'knob', onAbsolute: (v) => upd({ eqHigh: v * 2 - 1 }) }),
@@ -194,7 +195,7 @@ function ChannelStrip({ id, label, accent, ch, set, deckId, midiPrefix, fxMidiId
     ];
     return () => regs.forEach((u) => u());
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [midiPrefix, fxMidiId, ch.cue, ch.fader, ch.eqLow, ch.eqMid, ch.eqHigh, ch.filter]);
+  }, [midiPrefix, fxMidiId, ch.cue, ch.fader, ch.trim, ch.eqLow, ch.eqMid, ch.eqHigh, ch.filter]);
 
   return (
     <div className="flex flex-col items-center gap-1.5 rounded-lg border border-zinc-800 bg-zinc-950 p-2">
@@ -266,10 +267,11 @@ function SamplerStrip({ ch, set, vol, setVol, muted, setMuted }: {
       midi.registerControl('mixer.chS.filter', { kind: 'knob', onAbsolute: (v) => upd({ filter: v * 2 - 1 }) }),
       midi.registerControl('mixer.chS.cue', { kind: 'button', onButton: (p) => { if (p) upd({ cue: !ch.cue }); } }),
       midi.registerControl('fx.sendS', { kind: 'knob', onAbsolute: (v) => upd({ fxSend: v }) }),
+      midi.registerControl('mixer.chS.mute', { kind: 'button', onButton: (p) => { if (p) setMuted(!muted); } }),
     ];
     return () => regs.forEach((u) => u());
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [ch.cue, ch.trim, ch.eqLow, ch.eqMid, ch.eqHigh, ch.filter, ch.fxSend]);
+  }, [ch.cue, ch.trim, ch.eqLow, ch.eqMid, ch.eqHigh, ch.filter, ch.fxSend, muted]);
 
   return (
     <div className="flex flex-col items-center gap-1.5 rounded-lg border border-zinc-800 bg-zinc-950 p-2">

@@ -52,6 +52,8 @@ export const BINDABLE_CONTROLS: BindableControl[] = [
   { id: 'deckA.loopIn', label: 'Loop in', group: 'Deck A' },
   { id: 'deckA.loopOut', label: 'Loop out', group: 'Deck A' },
   { id: 'deckA.loopExit', label: 'Loop exit (keep playing)', group: 'Deck A' },
+  { id: 'deckA.loopHalve', label: 'Loop halve', group: 'Deck A' },
+  { id: 'deckA.loopDouble', label: 'Loop double', group: 'Deck A' },
   // Deck B
   { id: 'deckB.play', label: 'Play / Pause', group: 'Deck B' },
   { id: 'deckB.cue', label: 'Cue', group: 'Deck B' },
@@ -64,6 +66,8 @@ export const BINDABLE_CONTROLS: BindableControl[] = [
   { id: 'deckB.loopIn', label: 'Loop in', group: 'Deck B' },
   { id: 'deckB.loopOut', label: 'Loop out', group: 'Deck B' },
   { id: 'deckB.loopExit', label: 'Loop exit (keep playing)', group: 'Deck B' },
+  { id: 'deckB.loopHalve', label: 'Loop halve', group: 'Deck B' },
+  { id: 'deckB.loopDouble', label: 'Loop double', group: 'Deck B' },
   // Mixer
   { id: 'mixer.crossfader', label: 'Crossfader', group: 'Mixer' },
   { id: 'mixer.chA.fader', label: 'Ch A fader', group: 'Mixer' },
@@ -79,6 +83,22 @@ export const BINDABLE_CONTROLS: BindableControl[] = [
   { id: 'mixer.chB.filter', label: 'Ch B filter', group: 'Mixer' },
   { id: 'mixer.chA.cue', label: 'Ch A cue', group: 'Mixer' },
   { id: 'mixer.chB.cue', label: 'Ch B cue', group: 'Mixer' },
+  { id: 'mixer.chA.trim', label: 'Ch A trim', group: 'Mixer' },
+  { id: 'mixer.chB.trim', label: 'Ch B trim', group: 'Mixer' },
+  { id: 'mixer.chC.trim', label: 'Ch AI trim', group: 'Mixer' },
+  { id: 'mixer.chC.eqLow', label: 'Ch AI low EQ', group: 'Mixer' },
+  { id: 'mixer.chC.eqMid', label: 'Ch AI mid EQ', group: 'Mixer' },
+  { id: 'mixer.chC.eqHigh', label: 'Ch AI high EQ', group: 'Mixer' },
+  { id: 'mixer.chC.filter', label: 'Ch AI filter', group: 'Mixer' },
+  { id: 'mixer.chC.cue', label: 'Ch AI cue', group: 'Mixer' },
+  { id: 'mixer.chS.trim', label: 'Sampler trim', group: 'Mixer' },
+  { id: 'mixer.chS.eqLow', label: 'Sampler low EQ', group: 'Mixer' },
+  { id: 'mixer.chS.eqMid', label: 'Sampler mid EQ', group: 'Mixer' },
+  { id: 'mixer.chS.eqHigh', label: 'Sampler high EQ', group: 'Mixer' },
+  { id: 'mixer.chS.filter', label: 'Sampler filter', group: 'Mixer' },
+  { id: 'mixer.chS.cue', label: 'Sampler cue', group: 'Mixer' },
+  { id: 'mixer.chS.fader', label: 'Sampler fader', group: 'Mixer' },
+  { id: 'mixer.chS.mute', label: 'Sampler mute', group: 'Mixer' },
   { id: 'mixer.master', label: 'Master volume', group: 'Mixer' },
   { id: 'mixer.cueMix', label: 'Cue / master mix', group: 'Mixer' },
   // AI deck
@@ -92,8 +112,11 @@ export const BINDABLE_CONTROLS: BindableControl[] = [
   { id: 'fx.sendA', label: 'FX send A', group: 'FX' },
   { id: 'fx.sendB', label: 'FX send B', group: 'FX' },
   { id: 'fx.sendC', label: 'FX send AI', group: 'FX' },
+  { id: 'fx.sendS', label: 'FX send sampler', group: 'FX' },
   { id: 'fx.enable', label: 'FX on / bypass', group: 'FX' },
   { id: 'fx.selectNext', label: 'FX next effect', group: 'FX' },
+  // Autopilot
+  { id: 'autopilot.toggle', label: 'Autopilot on / off (takeover)', group: 'Autopilot' },
   // Sampler
   { id: 'sampler.pad1', label: 'Pad 1', group: 'Sampler' },
   { id: 'sampler.pad2', label: 'Pad 2', group: 'Sampler' },
@@ -112,6 +135,7 @@ export const BINDABLE_CONTROLS: BindableControl[] = [
   { id: 'sampler.pad7.volume', label: 'Pad 7 volume', group: 'Sampler' },
   { id: 'sampler.pad8.volume', label: 'Pad 8 volume', group: 'Sampler' },
   { id: 'sampler.quantize', label: 'Quantize toggle', group: 'Sampler' },
+  { id: 'sampler.rec', label: 'Record from deck (toggle)', group: 'Sampler' },
 ];
 
 /**
@@ -137,6 +161,8 @@ export const S8_TEMPLATE: { physical: string; controlId: string }[] = [
   { physical: 'Ch 2 HI / MID / LOW', controlId: 'mixer.chB.eqHigh' },
   { physical: 'Ch 1 FILTER knob', controlId: 'mixer.chA.filter' },
   { physical: 'Ch 2 FILTER knob', controlId: 'mixer.chB.filter' },
+  { physical: 'Ch 1 TRIM knob', controlId: 'mixer.chA.trim' },
+  { physical: 'Ch 2 TRIM knob', controlId: 'mixer.chB.trim' },
   { physical: 'Left remix fader 1', controlId: 'sampler.pad1.volume' },
   { physical: 'Left remix fader 2', controlId: 'sampler.pad2.volume' },
   { physical: 'Left remix fader 3', controlId: 'sampler.pad3.volume' },

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { engine } from './audio/engine';
+import { midi } from './midi';
 import { analyzeTrack } from './audio/analysis';
 import { detectKey } from './audio/keydetect';
 import {
@@ -1614,6 +1615,15 @@ export default function App() {
       debugLog('transport', 'autopilot on');
     }
   }, []);
+
+  // MIDI — autopilot toggle reuses the header button's exact path (toggleAp).
+  useEffect(() => {
+    const unreg = midi.registerControl('autopilot.toggle', {
+      kind: 'button',
+      onButton: (p) => { if (p) toggleAp(); },
+    });
+    return unreg;
+  }, [toggleAp]);
 
   const apQueueAdd = (id: string) => setApQueueIds((ids) => (ids.includes(id) ? ids : [...ids, id]));
   const apQueueRemove = (id: string) => setApQueueIds((ids) => ids.filter((x) => x !== id));
