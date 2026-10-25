@@ -232,12 +232,18 @@ export default function Sampler() {
     return () => window.removeEventListener('keydown', onKey);
   }, [trigger]);
 
-  // MIDI triggers
+  // MIDI triggers + per-pad volumes
   useEffect(() => {
     const cleanups = PAD_KEYS.map((_, i) =>
       midi.registerControl(`sampler.pad${i + 1}`, {
         kind: 'button',
         onButton: (pressed) => { if (pressed) trigger(i); },
+      })
+    );
+    const volCleanups = PAD_KEYS.map((_, i) =>
+      midi.registerControl(`sampler.pad${i + 1}.volume`, {
+        kind: 'fader',
+        onAbsolute: (v) => setVol(i, v),
       })
     );
     const qCleanup = midi.registerControl('sampler.quantize', {
@@ -250,8 +256,8 @@ export default function Sampler() {
         });
       },
     });
-    return () => { cleanups.forEach((c) => c()); qCleanup(); };
-  }, [trigger]);
+    return () => { cleanups.forEach((c) => c()); volCleanups.forEach((c) => c()); qCleanup(); };
+  }, [trigger, setVol]);
 
   // Drag-drop onto pads
   const onDrop = useCallback((e: React.DragEvent, i: number) => {
