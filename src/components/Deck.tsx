@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { engine } from '../audio/engine';
+import { keyCompatibility, keyCompatibilityLabel } from '../audio/keycompat';
 import { LOOP_SIZES, formatLoopSize } from '../audio/loop';
 import { midi } from '../midi';
 import type { BeatGrid, TrackInfo } from '../types';
@@ -13,7 +14,8 @@ export interface DeckState {
   tempo: number;
   keyLock: boolean;
   syncActive: boolean;
-  /** Quantize hotcue jumps + loop points to the beat grid (Phase 5). */
+  /** Quantize hotcue jumps + loop points to the beat grid, and Play/CUE
+   * launches to the master bar (Phase 5 + quantized launch). */
   quantize: boolean;
   hotcues: (number | null)[];
   loop: { start: number; end: number } | null;
@@ -28,6 +30,8 @@ interface DeckProps {
   deckKey: 'A' | 'B';
   state: DeckState;
   isMaster: boolean;
+  /** The sync master's Camelot key (for the compatibility badge; '' = none). */
+  masterKey?: string;
   masterBpm: number;
   accent: string;
   onPlayPause: () => void;
@@ -105,6 +109,8 @@ export default function Deck(props: DeckProps) {
   const { deckKey, state, isMaster, accent } = props;
   const deckId = `deck${deckKey}` as 'deckA' | 'deckB';
   const [elapsed, setElapsed] = useState('0:00');
+  const [lock, setLock] = useState<{ errMs: number; locked: boolean } | null>(null);
+  const [queued, setQueued] = useState(false);
 
   // 10fps ticker for time display (waveform has its own rAF)
   useEffect(() => {
@@ -114,11 +120,28 @@ export default function Deck(props: DeckProps) {
       const m = Math.floor(pos / 60);
       const s = Math.floor(pos % 60).toString().padStart(2, '0');
       setElapsed(`${m}:${s}`);
+      setLock(engine.syncStatus(deckId));
+      setQueued(engine.pendingLaunchAt(deckId) !== null);
     }, 100);
     return () => window.clearInterval(id);
   }, [state.buffer, deckId]);
 
   const isPlaying = engine.isPlaying(deckId);
+
+  // Camelot compatibility of this deck's key against the master's key.
+  // Direction: master -> candidate, so ENERGY means this track lifts +2.
+  const keyTier = !isMaster && props.masterKey && state.track?.key
+    ? keyCompatibility(props.masterKey, state.track.key)
+    : 'unknown';
+  const keyTierColor = keyTier === 'perfect'
+    ? 'text-emerald-400'
+    : keyTier === 'compatible'
+      ? 'text-sky-400'
+      : keyTier === 'energy'
+        ? 'text-violet-400'
+        : keyTier === 'clash'
+          ? 'text-red-400'
+          : '';
 
   // MIDI bindings
   useEffect(() => {
@@ -218,7 +241,19 @@ export default function Deck(props: DeckProps) {
           <div className="font-mono">
             {elapsed} / {state.track ? fmtDur(state.track.duration) : '—'}
           </div>
-          {state.track?.key && <div className="text-amber-300">{state.track.key}</div>}
+          {state.track?.key && (
+            <div className="text-amber-300">
+              {state.track.key}
+              {keyTier !== 'unknown' && (
+                <span
+                  className={`ml-1 text-[9px] font-bold ${keyTierColor}`}
+                  title={`Camelot vs master ${props.masterKey}: ${keyCompatibilityLabel(keyTier)}`}
+                >
+                  {keyTier === 'clash' ? '✕ CLASH' : `✓ ${keyCompatibilityLabel(keyTier)}`}
+                </span>
+              )}
+            </div>
+          )}
         </div>
       </div>
 
@@ -305,6 +340,16 @@ export default function Deck(props: DeckProps) {
               KEY
             </button>
           </div>
+          {(lock || queued) && (
+            <div className="flex items-center gap-2 font-mono text-[10px]">
+              {lock && (
+                <span className={lock.locked ? 'text-emerald-400' : 'text-amber-400'}>
+                  {lock.locked ? '● SYNC LOCKED' : `○ SYNC ${lock.errMs >= 0 ? '+' : ''}${lock.errMs.toFixed(0)}ms`}
+                </span>
+              )}
+              {queued && <span className="text-amber-300">▸ QUEUED — drops on the bar</span>}
+            </div>
+          )}
           <div className="flex gap-1.5">
             {(['-1', '+1'] as const).map((d) => (
               <button
@@ -392,7 +437,7 @@ export default function Deck(props: DeckProps) {
         <button
           onClick={props.onToggleQuantize}
           className={`h-8 rounded px-2 text-xs font-bold ${state.quantize ? 'bg-violet-600 text-white' : 'bg-zinc-800 text-zinc-500'}`}
-          title="Quantize: hotcue jumps and loop points snap to the beat grid"
+          title="Quantize: Play/CUE launches drop on the master bar, hotcue jumps and loop points snap to the beat grid (off = manual control)"
         >
           Q
         </button>

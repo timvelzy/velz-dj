@@ -592,8 +592,15 @@ export default function App() {
       engine.pause(deckId);
     } else {
       const st = deckState(deckKey);
-      const align = st.syncActive && masterDeck !== null && masterDeck !== deckId;
-      engine.play(deckId, { alignToMaster: align });
+      // Quantized launch (EDM sync): with Q on, Play waits for the
+      // master's next bar and drops on a downbeat instead of starting
+      // mid-beat. Q off = the old immediate start.
+      if (st.quantize) {
+        engine.playQuantized(deckId);
+      } else {
+        const align = st.syncActive && masterDeck !== null && masterDeck !== deckId;
+        engine.play(deckId, { alignToMaster: align });
+      }
     }
   }, [deckState, masterDeck]);
 
@@ -606,7 +613,11 @@ export default function App() {
       engine.pause(deckId);
       engine.seek(deckId, cue);
     } else {
-      engine.play(deckId, { offset: cue });
+      // CUE-triggered start goes through the same quantized hook as Play
+      // (CDJ-style: with Q on, hold past the next bar and the preview
+      // drops on the grid; Q off restores the instant preview).
+      if (st.quantize) engine.playQuantized(deckId, { offset: cue });
+      else engine.play(deckId, { offset: cue });
     }
   }, [deckState]);
 
@@ -704,6 +715,7 @@ export default function App() {
       deckKey,
       state: st,
       isMaster: masterDeck === deckId,
+      masterKey,
       masterBpm,
       accent: deckKey === 'A' ? '#38bdf8' : '#fb923c',
       onPlayPause: () => togglePlay(deckKey),
@@ -1088,6 +1100,7 @@ export default function App() {
       <div className="px-3 pb-3">
         <Library
           tracks={tracks}
+          masterKey={masterKey}
           onAddFiles={addFiles}
           onLoadToDeck={loadLibraryTrack}
           onRemoveTrack={removeLibraryTrack}
