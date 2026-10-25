@@ -39,7 +39,7 @@ import type { BandPeaks, BeatGrid, TrackInfo } from './types';
 import Deck, { type DeckState } from './components/Deck';
 import CenterPlayheadView, { type TopDeckView } from './components/CenterPlayheadView';
 import DebugPanel from './components/DebugPanel';
-import Mixer, { defaultChannel, type ChannelState } from './components/Mixer';
+import Mixer, { defaultChannel, defaultSamplerChannel, type ChannelState, type SamplerChannelState } from './components/Mixer';
 import AIDeck from './components/AIDeck';
 import FxUnit from './components/FxUnit';
 import Sampler from './components/Sampler';
@@ -88,6 +88,7 @@ export default function App() {
   // the sampler's single channel control (engine defaults: 0.9, unmuted).
   const [samplerVol, setSamplerVolState] = useState(0.9);
   const [samplerMuted, setSamplerMutedState] = useState(false);
+  const [samplerCh, setSamplerCh] = useState<SamplerChannelState>(defaultSamplerChannel);
   const setSamplerVol = useCallback((v: number) => {
     setSamplerVolState(v);
     engine.setSamplerMaster(v);
@@ -1732,6 +1733,7 @@ export default function App() {
             setChA={setChA} setChB={setChB} setChC={setChC}
             samplerVol={samplerVol} setSamplerVol={setSamplerVol}
             samplerMuted={samplerMuted} setSamplerMuted={setSamplerMuted}
+            samplerCh={samplerCh} setSamplerCh={setSamplerCh}
             crossfader={crossfader}
             setCrossfader={(v) => { setCrossfader(v); engine.setCrossfader(v); }}
             masterVol={masterVol}

@@ -23,6 +23,26 @@ export const defaultChannel = (): ChannelState => ({
   filter: 0, cue: false, fxSend: 0,
 });
 
+/** Sampler channel state — the trim/EQ section of a deck strip, without
+ *  filter/fx-send/cue (the sampler chain has no filter node, no FX send,
+ *  and no cue bus). Fader + mute travel on the existing samplerVol /
+ *  samplerMuted props. */
+export interface SamplerChannelState {
+  trim: number;
+  eqLow: number;
+  eqMid: number;
+  eqHigh: number;
+  lowKill: boolean;
+  midKill: boolean;
+  highKill: boolean;
+}
+
+export const defaultSamplerChannel = (): SamplerChannelState => ({
+  trim: 1,
+  eqLow: 0, eqMid: 0, eqHigh: 0,
+  lowKill: false, midKill: false, highKill: false,
+});
+
 interface MixerProps {
   chA: ChannelState; chB: ChannelState; chC: ChannelState;
   setChA: (c: ChannelState) => void;
@@ -32,6 +52,8 @@ interface MixerProps {
   setSamplerVol: (v: number) => void;
   samplerMuted: boolean;
   setSamplerMuted: (m: boolean) => void;
+  samplerCh: SamplerChannelState;
+  setSamplerCh: (c: SamplerChannelState) => void;
   crossfader: number;
   setCrossfader: (v: number) => void;
   masterVol: number;
@@ -114,6 +136,15 @@ function Meter({ getLevel, color = '#22c55e' }: { getLevel: () => number; color?
   );
 }
 
+const killBtn = (active: boolean, onClick: () => void, label: string) => (
+  <button
+    onClick={onClick}
+    className={`h-6 w-10 rounded text-[10px] font-bold ${active ? 'bg-red-600 text-white' : 'bg-zinc-800 text-zinc-500 hover:bg-zinc-700'}`}
+  >
+    {label}
+  </button>
+);
+
 function ChannelStrip({ id, label, accent, ch, set, deckId, midiPrefix, fxMidiId }: {
   id: string; label: string; accent: string;
   ch: ChannelState; set: (c: ChannelState) => void;
@@ -147,15 +178,6 @@ function ChannelStrip({ id, label, accent, ch, set, deckId, midiPrefix, fxMidiId
     return () => regs.forEach((u) => u());
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [midiPrefix, fxMidiId, ch.cue, ch.fader, ch.eqLow, ch.eqMid, ch.eqHigh, ch.filter]);
-
-  const killBtn = (active: boolean, onClick: () => void, label: string) => (
-    <button
-      onClick={onClick}
-      className={`h-6 w-10 rounded text-[10px] font-bold ${active ? 'bg-red-600 text-white' : 'bg-zinc-800 text-zinc-500 hover:bg-zinc-700'}`}
-    >
-      {label}
-    </button>
-  );
 
   return (
     <div className="flex flex-col items-center gap-1.5 rounded-lg border border-zinc-800 bg-zinc-950 p-2">
@@ -197,6 +219,58 @@ function ChannelStrip({ id, label, accent, ch, set, deckId, midiPrefix, fxMidiId
   );
 }
 
+function SamplerStrip({ ch, set, vol, setVol, muted, setMuted }: {
+  ch: SamplerChannelState; set: (c: SamplerChannelState) => void;
+  vol: number; setVol: (v: number) => void;
+  muted: boolean; setMuted: (m: boolean) => void;
+}) {
+  const upd = (p: Partial<SamplerChannelState>) => {
+    const next = { ...ch, ...p };
+    set(next);
+    engine.setSamplerTrim(next.trim);
+    engine.setSamplerEq('low', next.eqLow, next.lowKill);
+    engine.setSamplerEq('mid', next.eqMid, next.midKill);
+    engine.setSamplerEq('high', next.eqHigh, next.highKill);
+  };
+
+  return (
+    <div className="flex flex-col items-center gap-1.5 rounded-lg border border-zinc-800 bg-zinc-950 p-2">
+      <div className="flex items-center gap-1.5">
+        <span className="h-2.5 w-2.5 rounded-full" style={{ background: '#4ade80' }} />
+        <span className="text-xs font-bold text-zinc-200">SMP</span>
+      </div>
+      <Knob label="trim" value={ch.trim} min={0} max={2} onChange={(v) => upd({ trim: v })} size={40} />
+      <div className="flex items-center gap-1">
+        <Knob label="hi" value={ch.eqHigh} onChange={(v) => upd({ eqHigh: v })} size={44} />
+        {killBtn(ch.highKill, () => upd({ highKill: !ch.highKill }), 'K')}
+      </div>
+      <div className="flex items-center gap-1">
+        <Knob label="mid" value={ch.eqMid} onChange={(v) => upd({ eqMid: v })} size={44} />
+        {killBtn(ch.midKill, () => upd({ midKill: !ch.midKill }), 'K')}
+      </div>
+      <div className="flex items-center gap-1">
+        <Knob label="low" value={ch.eqLow} onChange={(v) => upd({ eqLow: v })} size={44} />
+        {killBtn(ch.lowKill, () => upd({ lowKill: !ch.lowKill }), 'K')}
+      </div>
+      <Meter getLevel={() => engine.samplerOutputLevel()} color="#4ade80" />
+      <input
+        type="range" min={0} max={1} step={0.01} value={vol}
+        onChange={(e) => setVol(Number(e.target.value))}
+        className="h-24 w-2 accent-emerald-500"
+        style={{ writingMode: 'vertical-lr', direction: 'rtl' } as React.CSSProperties}
+        title="Sampler channel fader"
+      />
+      <button
+        onClick={() => setMuted(!muted)}
+        className={`h-7 w-full rounded px-1 text-[10px] font-bold ${muted ? 'bg-red-600 text-white' : 'bg-zinc-800 text-zinc-400'}`}
+        title="Mute the sampler channel (level is kept, not lost)"
+      >
+        {muted ? 'MUTED' : 'MUTE'}
+      </button>
+    </div>
+  );
+}
+
 export default function Mixer(props: MixerProps) {
   const { crossfader, setCrossfader } = props;
 
@@ -226,33 +300,19 @@ export default function Mixer(props: MixerProps) {
         <ChannelStrip id="chA" label="A" accent="#38bdf8" ch={props.chA} set={props.setChA} deckId="deckA" midiPrefix="mixer.chA" fxMidiId="fx.sendA" />
         <ChannelStrip id="chC" label="AI" accent="#c084fc" ch={props.chC} set={props.setChC} deckId="deckC" midiPrefix="mixer.chC" fxMidiId="fx.sendC" />
         <ChannelStrip id="chB" label="B" accent="#fb923c" ch={props.chB} set={props.setChB} deckId="deckB" midiPrefix="mixer.chB" fxMidiId="fx.sendB" />
-        {/* Sampler channel strip: the sampler's ONLY channel-level volume
-            + mute. It drives the same engine state the sampler panel's
-            old VOL/MUTE row drove (samplerMaster gain; mute keeps the
-            level so unmute restores it exactly). No EQ/trim/filter here:
-            the sampler bus has none in the engine, and per-pad volumes
+        {/* Sampler channel strip — full parity with the deck strips:
+            trim, 3-band EQ with kill buttons, meter, fader, MUTE.
+            Drives the sampler's own trim/EQ nodes in the engine; the
+            fader + mute drive the same samplerMaster gain as before
+            (mute keeps the level so unmute restores it exactly).
+            No filter / fx-send / cue here: the sampler chain has no
+            filter node, no FX send, and no cue bus. Per-pad volumes
             still live on the sampler panel under Deck B. */}
-        <div className="flex flex-col items-center gap-1.5 rounded-lg border border-zinc-800 bg-zinc-950 p-2">
-          <div className="flex items-center gap-1.5">
-            <span className="h-2.5 w-2.5 rounded-full" style={{ background: '#4ade80' }} />
-            <span className="text-xs font-bold text-zinc-200">SMP</span>
-          </div>
-          <Meter getLevel={() => engine.samplerOutputLevel()} color="#4ade80" />
-          <input
-            type="range" min={0} max={1} step={0.01} value={props.samplerVol}
-            onChange={(e) => props.setSamplerVol(Number(e.target.value))}
-            className="h-24 w-2 accent-emerald-500"
-            style={{ writingMode: 'vertical-lr', direction: 'rtl' } as React.CSSProperties}
-            title="Sampler channel fader"
-          />
-          <button
-            onClick={() => props.setSamplerMuted(!props.samplerMuted)}
-            className={`h-7 w-full rounded px-1 text-[10px] font-bold ${props.samplerMuted ? 'bg-red-600 text-white' : 'bg-zinc-800 text-zinc-400'}`}
-            title="Mute the sampler channel (level is kept, not lost)"
-          >
-            {props.samplerMuted ? 'MUTED' : 'MUTE'}
-          </button>
-        </div>
+        <SamplerStrip
+          ch={props.samplerCh} set={props.setSamplerCh}
+          vol={props.samplerVol} setVol={props.setSamplerVol}
+          muted={props.samplerMuted} setMuted={props.setSamplerMuted}
+        />
       </div>
 
       {/* Crossfader */}
