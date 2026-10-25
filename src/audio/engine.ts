@@ -197,6 +197,7 @@ export class DJEngine {
   // Sampler — 8 one-shot pads
   private samplerBus!: GainNode;
   private samplerMaster!: GainNode;
+  private samplerAnalyser!: AnalyserNode;
   pads: SamplerPad[] = Array.from({ length: 8 }, () => ({
     buffer: null, name: '', volume: 0.8, source: null,
   }));
@@ -252,6 +253,11 @@ export class DJEngine {
     this.samplerMaster.gain.value = 0.9;
     this.samplerBus.connect(this.samplerMaster);
     this.samplerMaster.connect(this.masterBus);
+    // Passive meter tap for the sampler channel strip (analyser does not
+    // alter the audio passing through samplerMaster).
+    this.samplerAnalyser = this.ctx.createAnalyser();
+    this.samplerAnalyser.fftSize = 256;
+    this.samplerMaster.connect(this.samplerAnalyser);
 
     // Master limiter (Phase 3): the old −18 dB / 12:1 settings were a gentle
     // bus compressor that still let summed decks clip the output (and any
@@ -1380,6 +1386,10 @@ export class DJEngine {
 
   masterLevel(): number {
     return this.meter(this.masterAnalyser);
+  }
+
+  samplerOutputLevel(): number {
+    return this.samplerAnalyser ? this.meter(this.samplerAnalyser) : 0;
   }
 
   phonesLevel(): number {

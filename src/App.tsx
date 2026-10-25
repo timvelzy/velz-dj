@@ -74,6 +74,18 @@ export default function App() {
   const [chA, setChA] = useState<ChannelState>(defaultChannel);
   const [chB, setChB] = useState<ChannelState>(defaultChannel);
   const [chC, setChC] = useState<ChannelState>(defaultChannel);
+  // Sampler channel level/mute live in App state so the mixer strip is
+  // the sampler's single channel control (engine defaults: 0.9, unmuted).
+  const [samplerVol, setSamplerVolState] = useState(0.9);
+  const [samplerMuted, setSamplerMutedState] = useState(false);
+  const setSamplerVol = useCallback((v: number) => {
+    setSamplerVolState(v);
+    engine.setSamplerMaster(v);
+  }, []);
+  const setSamplerMuted = useCallback((m: boolean) => {
+    setSamplerMutedState(m);
+    engine.setSamplerMuted(m);
+  }, []);
   const [crossfader, setCrossfader] = useState(0);
   const [masterVol, setMasterVol] = useState(0.8);
   const [cueMix, setCueMix] = useState(0.5);
@@ -1044,11 +1056,11 @@ export default function App() {
         } : null}
       />
 
-      {/* Decks + mixer in stacked columns: AI under Deck A, sampler
-          channel in the center under the mixer (next to the AI
-          channel), FX under Deck B — saves the vertical space the
-          old full-width rows took. */}
-      <main className="grid items-start gap-3 p-3 lg:grid-cols-[1fr_340px_1fr]">
+      {/* Decks + mixer in stacked columns (Traktor-style): AI under
+          Deck A, FX above the mixer in the center, sampler back under
+          Deck B. The center column is wider now so the 4-channel
+          mixer (A, AI, B, sampler) fits in one row. */}
+      <main className="grid items-start gap-3 p-3 lg:grid-cols-[1fr_460px_1fr]">
         {/* Left column: Deck A, then the AI deck underneath it. */}
         <div className="flex flex-col gap-3">
           <div
@@ -1081,12 +1093,15 @@ export default function App() {
             onLyriaKeyChange={applyLyriaKey}
           />
         </div>
-        {/* Center column: mixer, then the sampler as its own channel
-            next to the AI channel (left column, under Deck A). */}
+        {/* Center column: FX unit on top (Traktor-style), mixer below. */}
         <div className="flex flex-col gap-3">
+          {/* FX unit — beat-synced send/return */}
+          <FxUnit />
           <Mixer
             chA={chA} chB={chB} chC={chC}
             setChA={setChA} setChB={setChB} setChC={setChC}
+            samplerVol={samplerVol} setSamplerVol={setSamplerVol}
+            samplerMuted={samplerMuted} setSamplerMuted={setSamplerMuted}
             crossfader={crossfader}
             setCrossfader={(v) => { setCrossfader(v); engine.setCrossfader(v); }}
             masterVol={masterVol}
@@ -1096,10 +1111,8 @@ export default function App() {
             phonesLevel={phonesLevel}
             setPhonesLevel={(v) => { setPhonesLevel(v); engine.setPhonesLevel(v); }}
           />
-          {/* Sampler — own channel (VOL + MUTE) feeding the master */}
-          <Sampler />
         </div>
-        {/* Right column: Deck B, then FX. */}
+        {/* Right column: Deck B, then the sampler underneath it. */}
         <div className="flex flex-col gap-3">
           <div
             onDragOver={(e) => e.preventDefault()}
@@ -1111,8 +1124,9 @@ export default function App() {
           >
             <Deck {...deckProps('B')} />
           </div>
-          {/* FX unit — beat-synced send/return */}
-          <FxUnit />
+          {/* Sampler — pads + REC FROM DECK, back under Deck B. Its
+              channel VOL + MUTE now live on the mixer strip. */}
+          <Sampler />
         </div>
       </main>
 
