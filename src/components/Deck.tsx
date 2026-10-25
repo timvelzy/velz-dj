@@ -116,6 +116,13 @@ export default function Deck(props: DeckProps) {
   const [elapsed, setElapsed] = useState('0:00');
   const [lock, setLock] = useState<{ errMs: number; locked: boolean } | null>(null);
   const [queued, setQueued] = useState(false);
+  // Round 5: smoothed copy of the raw phase readout. The engine's errMs
+  // is instantaneous, so a raw 10fps poll jumps with every PLL tick;
+  // a ~300ms EMA makes the number readable. Display-only — the LOCKED
+  // claim itself comes from the engine's sustained criterion, not this
+  // smoothing. A >500ms jump snaps straight to the raw value (bar-wrap
+  // or a real phase jump must never be averaged through zero).
+  const errMsSm = useRef<number | null>(null);
 
   // 10fps ticker for time display (waveform has its own rAF)
   useEffect(() => {
@@ -125,7 +132,18 @@ export default function Deck(props: DeckProps) {
       const m = Math.floor(pos / 60);
       const s = Math.floor(pos % 60).toString().padStart(2, '0');
       setElapsed(`${m}:${s}`);
-      setLock(engine.syncStatus(deckId));
+      const s2 = engine.syncStatus(deckId);
+      if (s2) {
+        const prev = errMsSm.current;
+        const sm = prev === null || Math.abs(s2.errMs - prev) > 500
+          ? s2.errMs
+          : prev + (s2.errMs - prev) * 0.3;
+        errMsSm.current = sm;
+        setLock({ errMs: sm, locked: s2.locked });
+      } else {
+        errMsSm.current = null;
+        setLock(null);
+      }
       setQueued(engine.pendingLaunchAt(deckId) !== null);
     }, 100);
     return () => window.clearInterval(id);
