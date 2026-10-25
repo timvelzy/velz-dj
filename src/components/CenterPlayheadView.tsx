@@ -56,11 +56,27 @@
  * Waveform colors (Rekordbox/Traktor style): velz-dj's Phase 4 BandPeaks
  * already carry per-bucket low/mid/high energies at 100 buckets/sec, so no
  * new analysis pass was invented. The dominant band per bucket picks the
- * color — low = warm orange, mid = green, high = pale sky — IDENTICAL for
- * every deck, so A, B, and AI read the same way. The beatgrid draws ON TOP
- * of the colors. When a track has no band peaks yet (analysis still running
- * or Traktor import without peaks), the row falls back to the deck's accent
- * color, exactly like the side waveforms.
+ * color — low = #ff2d55, mid = #32d74b, high = #007aff (groove's vivid
+ * dominant-band palette, adopted exactly) — IDENTICAL for every deck, so
+ * A, B, and AI read the same way. The beatgrid draws ON TOP of the colors.
+ * When a track has no band peaks yet (analysis still running or Traktor
+ * import without peaks), the row falls back to the deck's accent color,
+ * exactly like the side waveforms.
+ *
+ * Top-view design (2026-10-24, Tim's pick): groove's DualOverviewWaveform
+ * look — a bright center playhead with diamond markers and a glow, and
+ * the per-deck controls in a left overlay cluster over the waveform
+ * (deck label + SYNC/LEAD badge, title, BPM badge, play / CUE / SYNC
+ * buttons, time readout), instead of the header strip above the row.
+ * Playhead recipe, groove's own: white line with shadowBlur 15 glow plus
+ * a crisp core pass, and filled 10px diamonds at the row's top and bottom
+ * ends (so the card reads top / middle-seam / bottom, as in groove).
+ * The playhead stays fixed at exact center with the unclamped scrolling
+ * math — diamonds and glow change only how it looks, never where it sits.
+ * Groove's third left-cluster button is a SYNC toggle; velz-dj already
+ * has that function (App toggleSync), so it is wired here for decks A/B
+ * rather than invented. The AI row has no sync toggle, so its cluster
+ * keeps play / CUE / Stop / Set cue.
  */
 
 import { useEffect, useMemo, useRef, useState } from 'react';
@@ -92,6 +108,9 @@ export interface TopDeckView {
   onCueUp: () => void;
   onStop: () => void;
   onSetCue: () => void;
+  /** Sync toggle (groove's third left-cluster button). Decks A/B only;
+   *  omitted for the AI row, which has no sync toggle. */
+  onToggleSync?: () => void;
   onSeek: (t: number) => void;
   /** Traktor loop controls (decks A/B only; omitted for the AI row). */
   loopActive?: boolean;
@@ -347,15 +366,42 @@ function TopWaveformRow({ deck, pxPerSec, height }: RowProps) {
         }
       }
 
-      // Fixed center playhead — white, always on top.
-      ctx.fillStyle = '#ffffff';
-      ctx.fillRect(centerX - 1, 0, 2, h);
+      // Fixed center playhead — groove DualOverviewWaveform look: bright
+      // white line with a glow pass plus a crisp core pass, and filled
+      // diamonds at the row's top and bottom ends (across the stacked
+      // rows this reads top / middle-seam / bottom, as in groove). Drawn
+      // last, always on top. The diamonds and glow change only how the
+      // line looks: centerX is still exactly the audio position at every
+      // point in the track, per the unclamped math above.
+      const drawDiamond = (cy: number) => {
+        const s = 10;
+        ctx.beginPath();
+        ctx.moveTo(centerX, cy - s);
+        ctx.lineTo(centerX + s, cy);
+        ctx.lineTo(centerX, cy + s);
+        ctx.lineTo(centerX - s, cy);
+        ctx.closePath();
+        ctx.fill();
+      };
+      ctx.save();
+      ctx.strokeStyle = '#ffffff';
+      ctx.shadowColor = '#ffffff';
+      ctx.shadowBlur = 15;
+      ctx.lineWidth = 3;
       ctx.beginPath();
-      ctx.moveTo(centerX - 5, 0);
-      ctx.lineTo(centerX + 5, 0);
-      ctx.lineTo(centerX, 8);
-      ctx.closePath();
-      ctx.fill();
+      ctx.moveTo(centerX, 10);
+      ctx.lineTo(centerX, h - 10);
+      ctx.stroke();
+      ctx.shadowBlur = 0;
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(centerX, 10);
+      ctx.lineTo(centerX, h - 10);
+      ctx.stroke();
+      ctx.fillStyle = '#ffffff';
+      drawDiamond(20);
+      drawDiamond(h - 20);
+      ctx.restore();
     };
     raf = requestAnimationFrame(draw);
     return () => cancelAnimationFrame(raf);
@@ -375,72 +421,10 @@ function TopWaveformRow({ deck, pxPerSec, height }: RowProps) {
   };
 
   return (
-    <div>
-      {/* Per-deck header + second transport set (groove DualOverviewWaveform
-          row content: dot + label + SYNC/LEAD badge + BPM badge + title) */}
-      <div className="flex flex-wrap items-center gap-2 px-2 py-1.5">
-        <span className="h-2.5 w-2.5 rounded-full" style={{ background: deck.color }} />
-        <span className="text-xs font-bold text-zinc-200">DECK {deck.label}</span>
-        {deck.syncActive !== undefined && (
-          <span className={`rounded px-1.5 py-0.5 text-[10px] font-bold ${deck.syncActive ? 'bg-cyan-500/20 text-cyan-300' : 'bg-orange-500/20 text-orange-300'}`}>
-            {deck.syncActive ? 'SYNC' : 'LEAD'}
-          </span>
-        )}
-        {deck.bpm > 0 && (
-          <span className="rounded border border-zinc-700 px-1.5 py-0.5 font-mono text-[10px] text-zinc-300">
-            {deck.bpm.toFixed(1)} BPM
-          </span>
-        )}
-        <span className="max-w-72 truncate text-xs text-zinc-400" title={deck.title}>{deck.title}</span>
-        <span className="ml-auto flex items-center gap-1.5">
-          <LoopSizeControl deck={deck} />
-          <button
-            onClick={deck.onPlayPause}
-            disabled={!deck.buffer}
-            className="rounded bg-zinc-800 px-2.5 py-1 text-xs font-bold text-zinc-100 hover:bg-zinc-700 disabled:opacity-40"
-          >
-            {deck.isPlaying ? '❚❚ Pause' : '▶ Play'}
-          </button>
-          <button
-            onPointerDown={(e) => { e.preventDefault(); deck.onCueDown(); }}
-            onPointerUp={deck.onCueUp}
-            onPointerLeave={deck.onCueUp}
-            onPointerCancel={deck.onCueUp}
-            disabled={!deck.buffer}
-            className="rounded bg-orange-900/60 px-2.5 py-1 text-xs font-bold text-orange-300 hover:bg-orange-800 disabled:opacity-40"
-          >
-            CUE
-          </button>
-          <button
-            onClick={deck.onStop}
-            disabled={!deck.buffer}
-            className="rounded bg-zinc-800 px-2.5 py-1 text-xs font-bold text-zinc-300 hover:bg-zinc-700 disabled:opacity-40"
-          >
-            ■ Stop
-          </button>
-          <button
-            onClick={deck.onSetCue}
-            disabled={!deck.buffer}
-            className="rounded bg-zinc-800 px-2 py-1 text-xs text-zinc-400 hover:bg-zinc-700 disabled:opacity-40"
-            title="Set cue point to current position"
-          >
-            Set cue
-          </button>
-          <TimeReadout deckId={deck.deckId} duration={deck.buffer?.duration ?? 0} isPlaying={deck.isPlaying} />
-        </span>
-      </div>
-      {/* Track-card info line (screenshot deck panels) */}
-      {deck.artist !== undefined && (
-        <div className="flex flex-wrap items-center gap-2 px-2 pb-1 text-[11px] text-zinc-500">
-          <span>{deck.artist.trim() ? deck.artist : 'Unknown Artist'}</span>
-          {deck.fileSize !== undefined && <span>{fmtSize(deck.fileSize)}</span>}
-          {deck.format && (
-            <span className="rounded border border-zinc-700 px-1 py-px font-mono text-[10px] text-zinc-400">{deck.format}</span>
-          )}
-          {deck.stability !== undefined && <span>STABILITY: {Math.round(deck.stability * 100)}%</span>}
-        </div>
-      )}
-      {/* Scrolling waveform, center playhead */}
+    <div className="relative">
+      {/* Scrolling waveform, center playhead. The wrapper spans the full
+          row width, so the canvas center (and the playhead) never move
+          when the overlay below is added. */}
       <div
         ref={wrapRef}
         className="relative cursor-pointer overflow-hidden rounded border border-zinc-800"
@@ -461,6 +445,94 @@ function TopWaveformRow({ deck, pxPerSec, height }: RowProps) {
             Load Track {deck.label} to See Waveform
           </div>
         )}
+      </div>
+      {/* Left control cluster — groove DualOverviewWaveform overlay: a
+          dark gradient panel over the waveform's left end, controls
+          stacked vertically (label + badge, title, BPM, buttons, time).
+          The panel itself ignores pointer events so clicks on its faded
+          area still seek the waveform; only the inner content captures
+          clicks, so the buttons never trigger a seek. Every control from
+          the old header strip lives here — nothing was removed, only
+          moved into groove's arrangement. */}
+      <div className="pointer-events-none absolute left-0 top-0 z-10 h-full w-80 bg-gradient-to-r from-black/90 via-black/70 to-transparent">
+        <div className="pointer-events-auto flex h-full flex-col justify-center gap-0.5 p-2">
+          <div className="flex items-center gap-1.5">
+            <span className="h-3 w-3 rounded-full" style={{ background: deck.color }} />
+            <span className="text-xs font-bold text-zinc-100">DECK {deck.label}</span>
+            {deck.syncActive !== undefined && (
+              <span className={`rounded px-1.5 py-px text-[10px] font-bold ${deck.syncActive ? 'bg-cyan-500/20 text-cyan-300' : 'bg-orange-500/20 text-orange-300'}`}>
+                {deck.syncActive ? 'SYNC' : 'LEAD'}
+              </span>
+            )}
+            {deck.bpm > 0 && (
+              <span className="rounded border border-zinc-700 px-1.5 py-px font-mono text-[10px] text-zinc-300">
+                {deck.bpm.toFixed(1)} BPM
+              </span>
+            )}
+          </div>
+          <div className="truncate text-xs text-zinc-300" title={deck.title}>
+            {deck.title}
+            {deck.artist !== undefined && (
+              <span className="text-zinc-500">
+                {' · '}
+                {deck.artist.trim() ? deck.artist : 'Unknown Artist'}
+                {deck.fileSize !== undefined && ` · ${fmtSize(deck.fileSize)}`}
+                {deck.format && ` · ${deck.format}`}
+                {deck.stability !== undefined && ` · STABILITY: ${Math.round(deck.stability * 100)}%`}
+              </span>
+            )}
+          </div>
+          <div className="flex items-center gap-1.5">
+            <LoopSizeControl deck={deck} />
+          </div>
+          <div className="flex items-center gap-1.5">
+            <button
+              onClick={deck.onPlayPause}
+              disabled={!deck.buffer}
+              className="h-7 rounded bg-zinc-800/90 px-2 text-xs font-bold text-zinc-100 hover:bg-zinc-700 disabled:opacity-40"
+            >
+              {deck.isPlaying ? '❚❚' : '▶'}
+            </button>
+            <button
+              onPointerDown={(e) => { e.preventDefault(); deck.onCueDown(); }}
+              onPointerUp={deck.onCueUp}
+              onPointerLeave={deck.onCueUp}
+              onPointerCancel={deck.onCueUp}
+              disabled={!deck.buffer}
+              className="h-7 rounded bg-orange-900/60 px-2.5 text-xs font-bold text-orange-300 hover:bg-orange-800 disabled:opacity-40"
+            >
+              CUE
+            </button>
+            {deck.onToggleSync && (
+              <button
+                onClick={deck.onToggleSync}
+                disabled={!deck.buffer}
+                className={`h-7 rounded px-2 text-xs font-bold disabled:opacity-40 ${deck.syncActive ? 'bg-cyan-900/60 text-cyan-300 hover:bg-cyan-800' : 'bg-zinc-800/90 text-zinc-400 hover:bg-zinc-700'}`}
+                title={deck.syncActive ? 'Sync on — click to turn off' : 'Sync off — click to follow the master tempo'}
+              >
+                SYNC
+              </button>
+            )}
+          </div>
+          <div className="flex items-center gap-1.5">
+            <button
+              onClick={deck.onStop}
+              disabled={!deck.buffer}
+              className="h-6 rounded bg-zinc-800/90 px-2 text-[11px] font-bold text-zinc-300 hover:bg-zinc-700 disabled:opacity-40"
+            >
+              ■ Stop
+            </button>
+            <button
+              onClick={deck.onSetCue}
+              disabled={!deck.buffer}
+              className="h-6 rounded bg-zinc-800/90 px-2 text-[11px] text-zinc-400 hover:bg-zinc-700 disabled:opacity-40"
+              title="Set cue point to current position"
+            >
+              Set cue
+            </button>
+          </div>
+          <TimeReadout deckId={deck.deckId} duration={deck.buffer?.duration ?? 0} isPlaying={deck.isPlaying} />
+        </div>
       </div>
     </div>
   );
