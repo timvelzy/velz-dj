@@ -23,6 +23,7 @@ import {
   barsToOutro,
   outroStartSeconds,
   pickNextTrack,
+  resolvePlaylistTracks,
   swapReady,
   trackBassEnvelope,
 } from './audio/autopilot';
@@ -35,6 +36,13 @@ import {
   requestLibraryPersistence,
   saveLibraryRecord,
 } from './audio/libraryStore';
+import {
+  deletePlaylist,
+  loadPlaylists,
+  renamePlaylist,
+  savePlaylist,
+  type PlaylistRecord,
+} from './audio/playlistStore';
 import type { BandPeaks, BeatGrid, TrackInfo } from './types';
 import Deck, { type DeckState } from './components/Deck';
 import CenterPlayheadView, { type TopDeckView } from './components/CenterPlayheadView';
@@ -690,12 +698,27 @@ export default function App() {
   }, []);
 
   // ─── AI DJ autopilot ──────────────────────────────────────────────────
-  // State machine (ref-held so the 250ms driver tick never goes stale):
-  // waiting → preparing (load + sync) → crossfading → waiting (roles
-  // swapped), with fallback (loop the outro, never silence) and generating
-  // (AI bridge) as the no-candidate tiers. Audio is never interrupted by
-  // the machine itself: takeover just stops the driver and restores EQ.
-  type ApMachinePhase = 'waiting' | 'preparing' | 'crossfading' | 'fallback' | 'generating';
+  // State machine (ref-held so the driver tick never goes stale).
+  //
+  // AUDIO-CLOCK SCHEDULING (background-tab fix): the audible transition
+  // is programmed on the audio clock, not on the JS interval. When a blend
+  // is due, the driver schedules the incoming deck's start (play with a
+  // future startAt), the full crossfader curve, and the bass-swap curves
+  // as AudioParam automation at audio times — the audio thread then
+  // renders the blend even if the browser throttles JS timers to a crawl
+  // in a hidden tab. The 250ms interval is then only a UI status ticker
+  // plus a catch-up watchdog: it samples audio-clock positions, finishes
+  // bookkeeping (role swap) once a scheduled blend's end time passes,
+  // reads the live bass envelopes for an early swap, and recovers if a
+  // track ends while JS slept. The outro-loop hold remains the no-silence
+  // safety net. Phases: waiting → preparing (legacy/no-arm path) →
+  // scheduled (blend programmed on the audio clock) → crossfading
+  // (immediate/catch-up path, ramps still audio-scheduled from now) →
+  // waiting (roles swapped), with fallback (loop the outro, never
+  // silence) and generating (AI bridge) as the no-candidate tiers.
+  // Audio is never interrupted by the machine itself: takeover cancels
+  // scheduled automation, restores EQ, and touches nothing else.
+  type ApMachinePhase = 'waiting' | 'preparing' | 'scheduled' | 'crossfading' | 'fallback' | 'generating';
   interface ApMachine {
     phase: ApMachinePhase;
     playingKey: 'A' | 'B';
@@ -707,12 +730,20 @@ export default function App() {
     immediateBlend: boolean;
     prepareAt: number;
     outroStart: number;
-    blendStartWall: number;
+    /** Audio time the scheduled blend starts (scheduled/crossfading only). */
+    blendStartAt: number;
+    /** Audio time the scheduled blend ends (scheduled/crossfading only). */
+    blendEndAt: number;
     blendSec: number;
     fromV: number;
     toV: number;
     bassSwapped: boolean;
-    swapStartWall: number | null;
+    /** True while scheduled AudioParam automation is outstanding. */
+    automated: boolean;
+    /** True when the armed pick came from auto-pick (swappable if the queue fills before the blend). */
+    provisional: boolean;
+    /** True while recovering from a natural track end that JS slept through (do not treat the dead deck as a user pause). */
+    recovering: boolean;
     eqSnap: { outLow: number; inLow: number } | null;
     loadStartWall: number;
     failedIds: string[];
@@ -727,6 +758,13 @@ export default function App() {
   const [apQueueIds, setApQueueIds] = useState<string[]>([]);
   const [apOutroBars, setApOutroBars] = useState(8);
   const [apStatus, setApStatus] = useState<ApStatus>(AP_OFF_STATUS);
+  const [playlists, setPlaylists] = useState<PlaylistRecord[]>([]);
+  const [apPlaylistLoop, setApPlaylistLoop] = useState(false);
+  const [apLoadedPlaylist, setApLoadedPlaylist] = useState<string | null>(null);
+  const [apPlaylistNote, setApPlaylistNote] = useState<string | null>(null);
+  const apPlaylistLoopRef = useRef(false);
+  apPlaylistLoopRef.current = apPlaylistLoop;
+  const apPlaylistKeysRef = useRef<string[]>([]);
   const apRef = useRef<ApMachine | null>(null);
   const apOnRef = useRef(false);
   apOnRef.current = apOn;
@@ -759,12 +797,15 @@ export default function App() {
     immediateBlend: false,
     prepareAt: 0,
     outroStart: 0,
-    blendStartWall: 0,
+    blendStartAt: 0,
+    blendEndAt: 0,
     blendSec: 0,
     fromV: 0,
     toV: 0,
     bassSwapped: false,
-    swapStartWall: null,
+    automated: false,
+    provisional: false,
+    recovering: false,
     eqSnap: null,
     loadStartWall: 0,
     failedIds: [],
@@ -873,6 +914,59 @@ export default function App() {
     };
   };
 
+  /**
+   * Pick the next track, with loop-playlist refill: when the queue runs
+   * dry with loop on and a playlist loaded, the playlist restarts from
+   * the top (history cleared — a new pass) instead of falling through
+   * to auto-pick. Without loop, an exhausted playlist falls through to
+   * auto-pick exactly as before, so the music never stops.
+   */
+  const apPick = (m: ApMachine) => {
+    if (
+      apQueueRef.current.length === 0 &&
+      apPlaylistLoopRef.current &&
+      apPlaylistKeysRef.current.length > 0
+    ) {
+      const { found } = resolvePlaylistTracks(apPlaylistKeysRef.current, tracksRef.current);
+      const ids = found.map((t) => t.id);
+      if (ids.length > 0) {
+        m.recentIds = [];
+        apQueueRef.current = ids;
+        setApQueueIds(ids);
+      }
+    }
+    return pickNextTrack(apPickArgs(m));
+  };
+
+  /**
+   * Lookahead arm: load the next pick onto the free deck WELL ahead of
+   * the outro window (at cycle start, not at the last tick), so a
+   * throttled tab cannot miss the load window. Only when the free deck
+   * is empty or still holds the just-finished track — never clobber a
+   * track the user loaded manually. Provisional auto-picks (queue was
+   * empty at arm time) can still be swapped for a queue pick at finalize.
+   */
+  const apArmNext = (m: ApMachine, expectFreeId: string | null) => {
+    const pSt = deckStateRef.current[m.playingKey];
+    const fSt = deckStateRef.current[m.freeKey];
+    if (!pSt.track || isBridgeTrack(pSt.track)) return;
+    if (m.nextId) return;
+    if (fSt.track && fSt.track.id !== expectFreeId) return;
+    if (fSt.loop) apClearLoop(m.freeKey);
+    const pick = apPick(m);
+    if (!pick) return;
+    if (pick.fromQueue) setApQueueIds((ids) => ids.filter((id) => id !== pick.track.id));
+    m.nextId = pick.track.id;
+    m.nextTitle = pick.track.title;
+    m.nextIsBridge = false;
+    m.provisional = !pick.fromQueue;
+    m.synced = false;
+    loadLibRef.current(pick.track.id, m.freeKey);
+    debugLog('transport', 'autopilot armed next', `deck${m.freeKey}`, {
+      track: pick.track.title, fromQueue: pick.fromQueue, provisional: m.provisional,
+    });
+  };
+
   const apBeginPrepare = (m: ApMachine, pick: { track: TrackInfo; fromQueue: boolean }, immediate: boolean, now: number) => {
     const fk = m.freeKey;
     const fSt = deckStateRef.current[fk];
@@ -958,6 +1052,102 @@ export default function App() {
       });
   };
 
+  /**
+   * Schedule a blend on the audio clock: the incoming deck starts at the
+   * outro-start audio time (existing play(startAt) queued-launch path),
+   * the crossfader curve and the fallback bass swap are AudioParam
+   * automation at audio times. After this call the AUDIBLE blend no
+   * longer depends on JS wakeups — a throttled tab only delays the
+   * bookkeeping (role swap), never the blend itself. Falls back to an
+   * immediate blend when the start time is already due or uncomputable
+   * (looping deck: position wraps, so the linear audio-time map fails).
+   */
+  const apScheduleBlend = (m: ApMachine) => {
+    const pSt = deckStateRef.current[m.playingKey];
+    const fSt = deckStateRef.current[m.freeKey];
+    const pId = `deck${m.playingKey}`;
+    const fId = `deck${m.freeKey}`;
+    if (!pSt.track) return;
+    engine.setMaster(pId);
+    setMasterDeck(pId as 'deckA' | 'deckB');
+    engine.setSync(fId, true);
+    setDeckState(m.freeKey, { ...fSt, syncActive: true });
+    m.synced = true;
+    const fCh = chRef.current[m.freeKey];
+    if (fCh.fader < 0.05) {
+      engine.setFader(fId, 0.8);
+      (m.freeKey === 'A' ? setChA : setChB)({ ...fCh, fader: 0.8 });
+    }
+    const tempoRatio =
+      masterBpmRef.current > 0 && pSt.track.bpm > 0 ? masterBpmRef.current / pSt.track.bpm : 1;
+    const blendSec = Math.max(2, (pSt.track.duration - m.outroStart) / tempoRatio);
+    const nowAudio = engine.ctx.currentTime;
+    const blendStartAt = engine.audioTimeAtTrackPos(pId, m.outroStart);
+    m.eqSnap = {
+      outLow: chRef.current[m.playingKey].eqLow,
+      inLow: chRef.current[m.freeKey].eqLow,
+    };
+    m.bassSwapped = false;
+    m.blendSec = blendSec;
+    m.fromV = crossfaderRef.current;
+    m.toV = m.playingKey === 'A' ? 1 : -1;
+    if (blendStartAt !== null && blendStartAt > nowAudio + 0.05) {
+      // Audio-scheduled path.
+      engine.play(fId, { offset: 0, alignToMaster: true, startAt: blendStartAt });
+      engine.scheduleEqLowHold(fId, -1, blendStartAt); // incoming bass cut at blend start
+      engine.scheduleCrossfaderCurve(m.fromV, m.toV, blendStartAt, blendSec);
+      const beatSec = barSeconds(pSt.track.beatGrid) / 4;
+      const swapDur = Math.min(beatSec, blendSec);
+      const swapStart = blendStartAt + blendSec - swapDur;
+      engine.scheduleEqLowCurve(pId, m.eqSnap.outLow, -1, swapStart, swapDur);
+      engine.scheduleEqLowCurve(fId, -1, m.eqSnap.inLow, swapStart, swapDur);
+      m.phase = 'scheduled';
+      m.blendStartAt = blendStartAt;
+      m.blendEndAt = blendStartAt + blendSec;
+      m.automated = true;
+      debugLog('transport', 'autopilot blend scheduled', undefined, { at: blendStartAt, blendSec });
+    } else {
+      // Due now (late wakeup) or uncomputable — begin now, still
+      // audio-scheduled from the current audio time.
+      apBeginCrossfade(m, Date.now() / 1000);
+    }
+  };
+
+  /**
+   * Live bass-swap read, shared by the scheduled and immediate blend
+   * paths: at the first musical moment (outgoing bass out, incoming bass
+   * in, never before 2 bars into the blend), cancel ONLY the scheduled
+   * EQ automation — the crossfader curve keeps running untouched — and
+   * schedule a 1-beat EQ cross-ramp from the schedule's current values.
+   * If JS never wakes during the blend, the scheduled fallback swap at
+   * blend end still executes on the audio clock.
+   */
+  const apLiveSwapCheck = (m: ApMachine, nowAudio: number) => {
+    if (m.bassSwapped || !m.eqSnap) return;
+    const pSt = deckStateRef.current[m.playingKey];
+    const fSt = deckStateRef.current[m.freeKey];
+    if (!pSt.track) return;
+    const barSec = barSeconds(pSt.track.beatGrid);
+    if (nowAudio - m.blendStartAt < 2 * barSec) return;
+    const outPos = engine.position(`deck${m.playingKey}`);
+    const inPos = engine.position(`deck${m.freeKey}`);
+    if (!swapReady(trackBassEnvelope(pSt.track), outPos, trackBassEnvelope(fSt.track), inPos)) return;
+    const beatSec = barSec / 4;
+    const swapDur = Math.min(beatSec, Math.max(0.1, m.blendEndAt - nowAudio));
+    // Current EQ values from the schedule: flat until the fallback
+    // window, then interpolating through it.
+    const fbStart = m.blendEndAt - Math.min(beatSec, m.blendSec);
+    const span = Math.max(0.1, m.blendEndAt - fbStart);
+    const f = nowAudio < fbStart ? 0 : Math.min(1, (nowAudio - fbStart) / span);
+    const outNow = m.eqSnap.outLow + (-1 - m.eqSnap.outLow) * f;
+    const inNow = -1 + (m.eqSnap.inLow - -1) * f;
+    engine.cancelEqAutomation(`deck${m.playingKey}`);
+    engine.cancelEqAutomation(`deck${m.freeKey}`);
+    engine.scheduleEqLowCurve(`deck${m.playingKey}`, outNow, -1, nowAudio, swapDur);
+    engine.scheduleEqLowCurve(`deck${m.freeKey}`, inNow, m.eqSnap.inLow, nowAudio, swapDur);
+    m.bassSwapped = true;
+  };
+
   const apBeginCrossfade = (m: ApMachine, now: number) => {
     const pSt = deckStateRef.current[m.playingKey];
     const fSt = deckStateRef.current[m.freeKey];
@@ -982,7 +1172,6 @@ export default function App() {
     const tempoRatio =
       masterBpmRef.current > 0 && pSt.track.bpm > 0 ? masterBpmRef.current / pSt.track.bpm : 1;
     m.phase = 'crossfading';
-    m.blendStartWall = now;
     m.blendSec = m.immediateBlend
       ? Math.max(4, (16 * 60) / (masterBpmRef.current || 124))
       : Math.max(2, (pSt.track.duration - m.outroStart) / tempoRatio);
@@ -993,10 +1182,23 @@ export default function App() {
       inLow: chRef.current[m.freeKey].eqLow,
     };
     m.bassSwapped = false;
-    m.swapStartWall = null;
-    // ONE-BASS RULE, blend start: the incoming track enters with its bass
-    // cut. The outgoing track keeps the bass until the swap point.
-    apSetEq(m.freeKey, -1);
+    // Audio-scheduled from now (catch-up path): the crossfader curve and
+    // the fallback bass swap are AudioParam automation, so the blend
+    // completes on the audio clock even if JS sleeps again mid-blend.
+    // Any earlier schedule is cancelled first so curves cannot fight.
+    engine.cancelDeckAutomation(pId);
+    engine.cancelDeckAutomation(fId);
+    const startAt = engine.ctx.currentTime;
+    m.blendStartAt = startAt;
+    m.blendEndAt = startAt + m.blendSec;
+    m.automated = true;
+    engine.scheduleEqLowHold(fId, -1, startAt); // ONE-BASS RULE at blend start
+    engine.scheduleCrossfaderCurve(m.fromV, m.toV, startAt, m.blendSec);
+    const beatSec = barSeconds(pSt.track.beatGrid) / 4;
+    const swapDur = Math.min(beatSec, m.blendSec);
+    const swapStart = m.blendEndAt - swapDur;
+    engine.scheduleEqLowCurve(pId, m.eqSnap.outLow, -1, swapStart, swapDur);
+    engine.scheduleEqLowCurve(fId, -1, m.eqSnap.inLow, swapStart, swapDur);
     debugLog('transport', 'autopilot blending', undefined, {
       from: pSt.track.title, to: m.nextTitle, blendSec: m.blendSec,
     });
@@ -1007,6 +1209,11 @@ export default function App() {
     const fSt = deckStateRef.current[m.freeKey];
     const pId = `deck${m.playingKey}`;
     const fId = `deck${m.freeKey}`;
+    // Cancel scheduled automation FIRST so it cannot override the restore
+    // below (a curve event in the future would otherwise win over an
+    // immediate move made now).
+    engine.cancelDeckAutomation(pId);
+    engine.cancelDeckAutomation(fId);
     apSetCrossfader(m.toV);
     // If the bass never swapped (no readable envelope moment), swap at the
     // handover: outgoing bass cut, incoming bass to its pre-blend value.
@@ -1032,7 +1239,13 @@ export default function App() {
     engine.setSync(fId, false);
     setDeckState(m.freeKey, nextDeckState);
     const recent = [...m.recentIds, pSt.track?.id].filter((x): x is string => !!x).slice(-50);
-    apRef.current = freshMachine(m.freeKey, m.playingKey, recent);
+    const next = freshMachine(m.freeKey, m.playingKey, recent);
+    apRef.current = next;
+    // Lookahead arm for the next cycle (only when the new free deck still
+    // holds the just-finished track — never clobber a manual load).
+    if (!deckStateRef.current[next.freeKey].track || deckStateRef.current[next.freeKey].track?.id === pSt.track?.id) {
+      apArmNext(next, pSt.track?.id ?? null);
+    }
     debugLog('transport', 'autopilot transition done', undefined, { nowPlaying: m.nextTitle });
   };
 
@@ -1061,14 +1274,46 @@ export default function App() {
       m.outroStart = outro;
       m.prepareAt = outro - 4 * barSec;
       apRef.current = m;
+      // Lookahead arm: load the next pick now (well ahead of the outro)
+      // when the free deck is empty — never clobber a manual load.
+      if (!decks[fk].track) apArmNext(m, null);
     }
     const pId = `deck${m.playingKey}`;
     const fId = `deck${m.freeKey}`;
     const pSt = deckStateRef.current[m.playingKey];
 
-    // Playing deck stopped unexpectedly (user pause, manual stop). The
-    // machine lets go and re-acquires on the next tick; audio untouched.
-    if (!engine.isPlaying(pId) && m.phase !== 'crossfading') {
+    // Playing deck stopped unexpectedly. Scheduled blends are exempt: the
+    // old deck ending at blend end is the normal finish, handled by the
+    // scheduled block below. Otherwise distinguish a natural end (JS slept
+    // through the outro in a throttled tab) from a user pause: a natural
+    // end recovers by blending the next pick in from silence, a user pause
+    // lets go (never fight the user).
+    if (!engine.isPlaying(pId) && m.phase !== 'crossfading' && m.phase !== 'scheduled' && !m.recovering) {
+      const endedNaturally = !!pSt.track && engine.position(pId) >= pSt.track.duration - 0.5;
+      if (endedNaturally && apOnRef.current) {
+        if (m.phase === 'preparing' && m.nextId) {
+          // A load is already in flight — just blend it in immediately
+          // when it arms instead of starting a second load (race).
+          m.recovering = true;
+          m.immediateBlend = true;
+        } else {
+          const pick = apPick(m);
+          if (pick) {
+            if (pick.fromQueue) setApQueueIds((ids) => ids.filter((id) => id !== pick.track.id));
+            m.nextId = pick.track.id;
+            m.nextTitle = pick.track.title;
+            m.nextIsBridge = false;
+            m.phase = 'preparing';
+            m.immediateBlend = true;
+            m.recovering = true;
+            m.loadStartWall = now;
+            loadLibRef.current(pick.track.id, m.freeKey);
+          } else {
+            apRef.current = null;
+          }
+        }
+        return;
+      }
       apRef.current = null;
       return;
     }
@@ -1080,7 +1325,7 @@ export default function App() {
       }
       if (isBridgeTrack(pSt.track)) {
         // A generated bridge loops forever: hunt for a real track.
-        const pick = pickNextTrack(apPickArgs(m));
+        const pick = apPick(m);
         if (pick) apBeginPrepare(m, pick, true, now);
         else {
           pushApStatus({
@@ -1093,18 +1338,53 @@ export default function App() {
         return;
       }
       const pos = engine.position(pId);
-      if (pos >= m.prepareAt) {
-        const pick = pickNextTrack(apPickArgs(m));
+      const fSt = deckStateRef.current[m.freeKey];
+      const armed = m.nextId !== null && fSt.track?.id === m.nextId && !!fSt.buffer;
+      // Finalize: a queue pick arrived after the provisional auto-pick arm
+      // — swap to it (reload the free deck). In a visible tab this always
+      // lands; in a throttled tab it may not, and the armed pick plays
+      // instead (graceful, never silence).
+      if (armed && m.provisional && apQueueRef.current.length > 0) {
+        const q = apPick(m);
+        if (q && q.fromQueue && q.track.id !== m.nextId) {
+          if (fSt.loop) apClearLoop(m.freeKey);
+          setApQueueIds((ids) => ids.filter((id) => id !== q.track.id));
+          m.nextId = q.track.id;
+          m.nextTitle = q.track.title;
+          m.nextIsBridge = false;
+          m.provisional = false;
+          m.synced = false;
+          m.loadStartWall = now;
+          loadLibRef.current(q.track.id, m.freeKey);
+          pushApStatus({
+            on: true, phase: 'preparing', playingKey: m.playingKey,
+            nextTitle: m.nextTitle, barsToGo: null, blendProgress: null, bass: null, note: null,
+          });
+          return;
+        }
+      }
+      if (armed && pos >= m.prepareAt) {
+        // Blend window reached with the next track already loaded:
+        // schedule the blend on the audio clock (or begin immediately
+        // when the start time is already due — late wakeup catch-up).
+        apScheduleBlend(m);
+        return;
+      }
+      if (!armed && pos >= m.prepareAt) {
+        // No arm (free deck was occupied at cycle start, or no pick
+        // then): legacy path — pick and load now.
+        const pick = apPick(m);
         if (pick) apBeginPrepare(m, pick, false, now);
         else if (!m.genAttempted) apStartGeneration(m);
         else apEnterFallback(m, m.genError);
-      } else {
-        pushApStatus({
-          on: true, phase: 'waiting', playingKey: m.playingKey,
-          nextTitle: null, barsToGo: barsToOutro(pSt.track.beatGrid, pSt.track.duration, pos, apOutroRef.current),
-          blendProgress: null, bass: null, note: null,
-        });
+        return;
       }
+      pushApStatus({
+        on: true, phase: 'waiting', playingKey: m.playingKey,
+        nextTitle: armed ? m.nextTitle : null,
+        barsToGo: barsToOutro(pSt.track.beatGrid, pSt.track.duration, pos, apOutroRef.current),
+        blendProgress: null, bass: null, note: null,
+      });
       return;
     }
 
@@ -1130,7 +1410,7 @@ export default function App() {
       } else if (now > m.loadStartWall + 20) {
         // Load timed out — skip to the next candidate, never stall.
         if (m.nextId) m.failedIds.push(m.nextId);
-        const pick = pickNextTrack(apPickArgs(m));
+        const pick = apPick(m);
         if (pick) apBeginPrepare(m, pick, m.immediateBlend, now);
         else if (!m.genAttempted) apStartGeneration(m);
         else apEnterFallback(m, m.genError);
@@ -1143,9 +1423,67 @@ export default function App() {
       return;
     }
 
+    // ── scheduled: the blend is programmed on the audio clock ──
+    // The tick here does NO audible work: it only reads live bass
+    // envelopes for an early swap, updates the strip, and finishes the
+    // bookkeeping once the scheduled blend end passes. If JS slept
+    // through the whole blend, the curves already executed — this tick
+    // just performs the role swap on wakeup.
+    if (m.phase === 'scheduled') {
+      const nowAudio = engine.ctx.currentTime;
+      const fSt = deckStateRef.current[m.freeKey];
+      const oldAlive = engine.isPlaying(pId);
+      const inStarted = nowAudio >= m.blendStartAt;
+      if (!oldAlive) {
+        // Old deck stopped before/during the scheduled blend.
+        const endedNaturally = !!pSt.track && engine.position(pId) >= pSt.track.duration - 0.5;
+        if (endedNaturally && inStarted && engine.isPlaying(fId)) {
+          // Old deck ended at blend end while the incoming deck rolls:
+          // finish now (role swap) instead of waiting for blendEndAt.
+          apFinishTransition(m);
+        } else if (!endedNaturally) {
+          // User paused mid-blend: cancel the program, cancel a
+          // not-yet-started incoming launch, restore EQ, let go.
+          engine.cancelDeckAutomation(pId);
+          engine.cancelDeckAutomation(fId);
+          if (nowAudio < m.blendStartAt) engine.pause(fId);
+          if (m.eqSnap) apRestoreEq(m);
+          apRef.current = null;
+        }
+        // Natural end before the incoming started (should not happen —
+        // the blend starts before track end): fall through to the finish
+        // watchdog below, which recovers via the normal path.
+        if (apRef.current !== m) return;
+      }
+      if (inStarted && !engine.isPlaying(fId) && nowAudio > m.blendStartAt + 1) {
+        // Incoming deck died mid-blend: snap back, restore EQ, let go.
+        engine.cancelDeckAutomation(pId);
+        engine.cancelDeckAutomation(fId);
+        apSetCrossfader(m.fromV);
+        if (m.eqSnap) apRestoreEq(m);
+        apRef.current = null;
+        return;
+      }
+      if (inStarted) apLiveSwapCheck(m, nowAudio);
+      if (nowAudio >= m.blendEndAt - 0.05) {
+        apFinishTransition(m);
+        return;
+      }
+      pushApStatus({
+        on: true, phase: 'scheduled', playingKey: m.playingKey,
+        nextTitle: m.nextTitle, barsToGo: null,
+        blendProgress: nowAudio < m.blendStartAt
+          ? null
+          : Math.round(Math.min(1, Math.max(0, (nowAudio - m.blendStartAt) / Math.max(0.1, m.blendSec))) * 100) / 100,
+        bass: m.bassSwapped ? 'swapped' : 'cut',
+        note: inStarted ? null : 'Blend programmed — starts on the audio clock at the outro.',
+      });
+      return;
+    }
+
     if (m.phase === 'generating') {
       // A real track may have appeared while Lyria works — it wins.
-      const pick = pickNextTrack(apPickArgs(m));
+      const pick = apPick(m);
       if (pick) {
         m.genToken += 1; // invalidate the in-flight generation result
         m.genAttempted = true;
@@ -1176,7 +1514,7 @@ export default function App() {
     }
 
     if (m.phase === 'fallback') {
-      const pick = pickNextTrack(apPickArgs(m));
+      const pick = apPick(m);
       if (pick) {
         apClearLoop(m.playingKey);
         m.fallbackLoop = null;
@@ -1191,63 +1529,77 @@ export default function App() {
       return;
     }
 
-    // ── crossfading ──
+    // ── crossfading (immediate/catch-up path) ──
+    // Ramps are audio-scheduled (see apBeginCrossfade), so this tick
+    // does no audible stepping: it only reads live bass for an early
+    // swap, updates the strip, and finishes once the scheduled blend
+    // end passes on the audio clock.
     const fSt = deckStateRef.current[m.freeKey];
     if (!engine.isPlaying(fId)) {
       // Incoming deck died mid-blend: snap back, restore EQ, let go.
+      engine.cancelDeckAutomation(pId);
+      engine.cancelDeckAutomation(fId);
       apSetCrossfader(m.fromV);
       if (m.eqSnap) apRestoreEq(m);
       apRef.current = null;
       return;
     }
-    const prog = Math.min(1, Math.max(0, (now - m.blendStartWall) / Math.max(0.1, m.blendSec)));
-    apSetCrossfader(m.fromV + (m.toV - m.fromV) * prog);
-    // EQ-aware handover: read both tracks' bass envelopes live and swap
-    // the bass at the first musical moment (outgoing bass out, incoming
-    // bass in), never before 2 bars into the blend.
-    if (!m.bassSwapped && m.eqSnap) {
-      const minBlendSec = 2 * barSeconds(pSt.track!.beatGrid);
-      if (now - m.blendStartWall >= minBlendSec) {
-        const outPos = engine.position(pId);
-        const inPos = engine.position(fId);
-        if (swapReady(trackBassEnvelope(pSt.track), outPos, trackBassEnvelope(fSt.track), inPos)) {
-          m.bassSwapped = true;
-          m.swapStartWall = now;
-        }
-      }
-    }
-    if (m.bassSwapped && m.swapStartWall !== null && m.eqSnap) {
-      // Simultaneous 1-beat cross-ramp: at no point are both basses full.
-      const beatSec = barSeconds(pSt.track!.beatGrid) / 4;
-      const sp = Math.min(1, Math.max(0, (now - m.swapStartWall) / Math.max(0.1, beatSec)));
-      apSetEq(m.playingKey, m.eqSnap.outLow + (-1 - m.eqSnap.outLow) * sp);
-      apSetEq(m.freeKey, -1 + (m.eqSnap.inLow - -1) * sp);
-      if (sp >= 1) m.swapStartWall = null;
-    }
-    const oldEnded = !engine.isPlaying(pId);
-    if (prog >= 1 || oldEnded) {
+    const nowAudio = engine.ctx.currentTime;
+    apLiveSwapCheck(m, nowAudio);
+    // A recovering blend (old deck already dead) finishes on time only
+    // — never on old-deck death, which is already true.
+    if (nowAudio >= m.blendEndAt - 0.05 || (!m.recovering && !engine.isPlaying(pId))) {
       apFinishTransition(m);
       return;
     }
     pushApStatus({
       on: true, phase: 'crossfading', playingKey: m.playingKey,
       nextTitle: m.nextTitle, barsToGo: null,
-      blendProgress: Math.round(prog * 100) / 100,
+      blendProgress: Math.round(Math.min(1, Math.max(0, (nowAudio - m.blendStartAt) / Math.max(0.1, m.blendSec))) * 100) / 100,
       bass: m.bassSwapped ? 'swapped' : 'cut', note: null,
     });
   }, []);
 
+  // UI status ticker + catch-up watchdog (see the header comment on the
+  // autopilot machine): the tick samples audio-clock positions and
+  // performs JS-only work — loads, scheduling decisions, bookkeeping,
+  // recovery. It never times a ramp: every audible move is AudioParam
+  // automation scheduled at an audio time.
   useEffect(() => {
     if (!apOn) return;
     const id = window.setInterval(() => apTick(), 250);
     return () => window.clearInterval(id);
   }, [apOn, apTick]);
 
-  /** Takeover: stop driving NOW, restore automated EQ, touch nothing else. */
+  // Catch-up watchdog: when the tab becomes visible again, run the
+  // driver immediately instead of waiting for the next 250ms tick (a
+  // throttled tab's tick may be a minute stale).
+  useEffect(() => {
+    if (!apOn) return;
+    const onVis = () => {
+      if (document.visibilityState === 'visible') apTick();
+    };
+    document.addEventListener('visibilitychange', onVis);
+    return () => document.removeEventListener('visibilitychange', onVis);
+  }, [apOn, apTick]);
+
+  /** Takeover: stop driving NOW, cancel scheduled automation, restore automated EQ, touch nothing else. */
   const toggleAp = useCallback(() => {
     if (apOnRef.current) {
       const m = apRef.current;
-      if (m?.eqSnap) apRestoreEq(m);
+      if (m) {
+        // Cancel scheduled curves FIRST so they cannot override the
+        // restore below (a future curve event would otherwise win).
+        engine.cancelDeckAutomation(`deck${m.playingKey}`);
+        engine.cancelDeckAutomation(`deck${m.freeKey}`);
+        // A blend scheduled but not yet started: cancel the incoming
+        // launch (pause clears the pending start). A blend already
+        // rolling is left playing — takeover never interrupts audio.
+        if (m.phase === 'scheduled' && engine.ctx.currentTime < m.blendStartAt) {
+          engine.pause(`deck${m.freeKey}`);
+        }
+        if (m.eqSnap) apRestoreEq(m);
+      }
       apRef.current = null;
       setApOn(false);
       setApStatus(AP_OFF_STATUS);
@@ -1279,6 +1631,79 @@ export default function App() {
   const apQueueTracks = apQueueIds
     .map((id) => tracks.find((t) => t.id === id))
     .filter((t): t is TrackInfo => !!t);
+
+  // ─── Saved playlists (IndexedDB — survive reload) ────────────────────
+  // Load once on mount; resolution against the live library happens at
+  // playlist-load time (tracks may have been added/removed since save).
+  useEffect(() => {
+    void loadPlaylists().then(setPlaylists).catch((e) => console.warn('Playlists load failed', e));
+  }, []);
+
+  /** Save the current queue as a named playlist (same name replaces that playlist). */
+  const apPlaylistSave = (name: string) => {
+    const fileKeys = apQueueTracks.map((t) => t.fileKey).filter((k): k is string => !!k);
+    if (!fileKeys.length) return;
+    void savePlaylist(name, fileKeys)
+      .then((rec) => {
+        setPlaylists((ps) => {
+          const next = ps.filter((p) => p.id !== rec.id);
+          next.push(rec);
+          next.sort((a, b) => a.name.localeCompare(b.name));
+          return next;
+        });
+        setApLoadedPlaylist(rec.name);
+        apPlaylistKeysRef.current = rec.fileKeys;
+        setApPlaylistNote(`Saved “${rec.name}” (${fileKeys.length} track${fileKeys.length === 1 ? '' : 's'}).`);
+      })
+      .catch((e) => console.warn('Playlist save failed', e));
+  };
+
+  /**
+   * Load a playlist into the autopilot queue, REPLACING the current queue
+   * (the UI label says so). Missing tracks are skipped gracefully and
+   * reported — never breaking the queue.
+   */
+  const apPlaylistLoad = (id: string) => {
+    const rec = playlists.find((p) => p.id === id);
+    if (!rec) return;
+    const { found, missing } = resolvePlaylistTracks(rec.fileKeys, tracksRef.current);
+    setApQueueIds(found.map((t) => t.id));
+    setApLoadedPlaylist(rec.name);
+    apPlaylistKeysRef.current = rec.fileKeys;
+    setApPlaylistNote(
+      missing > 0
+        ? `Loaded “${rec.name}” — ${missing} track${missing === 1 ? '' : 's'} skipped (no longer in library).`
+        : `Loaded “${rec.name}” (${found.length} track${found.length === 1 ? '' : 's'}).`,
+    );
+  };
+
+  const apPlaylistDelete = (id: string) => {
+    const rec = playlists.find((p) => p.id === id);
+    void deletePlaylist(id)
+      .then(() => {
+        setPlaylists((ps) => ps.filter((p) => p.id !== id));
+        if (rec && apLoadedPlaylist === rec.name) {
+          setApLoadedPlaylist(null);
+          apPlaylistKeysRef.current = [];
+          setApPlaylistNote(null);
+        }
+      })
+      .catch((e) => console.warn('Playlist delete failed', e));
+  };
+
+  const apPlaylistRename = (id: string, name: string) => {
+    void renamePlaylist(id, name)
+      .then(() => {
+        setPlaylists((ps) => ps.map((p) => (p.id === id ? { ...p, name, updatedAt: new Date().toISOString() } : p)));
+        setApLoadedPlaylist((cur) => {
+          const rec = playlists.find((p) => p.id === id);
+          return rec && cur === rec.name ? name : cur;
+        });
+      })
+      .catch((e) => console.warn('Playlist rename failed', e));
+  };
+
+  const apLoopPlaylist = (v: boolean) => setApPlaylistLoop(v);
 
   // ─── AI deck ──────────────────────────────────────────────────────────────
   const dropAiLoop = useCallback((loop: GeneratedLoop) => {
@@ -1614,6 +2039,15 @@ export default function App() {
           onQueueRemove={apQueueRemove}
           onQueueMove={apQueueMove}
           onQueueClear={apQueueClear}
+          playlists={playlists}
+          onPlaylistSave={apPlaylistSave}
+          onPlaylistLoad={apPlaylistLoad}
+          onPlaylistDelete={apPlaylistDelete}
+          onPlaylistRename={apPlaylistRename}
+          loadedPlaylistName={apLoadedPlaylist}
+          playlistNote={apPlaylistNote}
+          loopPlaylist={apPlaylistLoop}
+          onLoopPlaylist={apLoopPlaylist}
         />
       )}
       {debugOpen && <div className="pt-3"><DebugPanel /></div>}

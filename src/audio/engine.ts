@@ -1245,6 +1245,114 @@ export class DJEngine {
     debugLog('param', 'crossfader', undefined, { v, gA, gB });
   }
 
+  // ─── Audio-clock automation (autopilot background scheduling) ────────
+  // The autopilot driver programs transitions on the audio clock so the
+  // AUDIBLE blend executes even when the browser throttles JS timers in
+  // a hidden tab. These are AudioParam automation events: once scheduled,
+  // the audio thread renders them with no further JS involvement. A later
+  // JS wakeup only does bookkeeping (role swap, status) and catch-up.
+  // NOTE: these touch deck crossfader/EQ params only — never the sampler
+  // chain (a separate branch owns sampler strip parity).
+
+  /**
+   * Audio time (ctx.currentTime) when a deck reaches a track position, or
+   * null when it cannot be computed: no buffer, no positive rate, or the
+   * deck is looping (position wraps, so the linear map does not hold).
+   * position() itself is this same linear map, so this is the audio-clock
+   * truth the driver schedules against — not wall-clock time.
+   */
+  audioTimeAtTrackPos(id: string, trackPos: number): number | null {
+    const d = this.decks.get(id);
+    if (!d || !d.buffer || d.posRate <= 0) return null;
+    if (d.loopStart !== null && d.loopEnd !== null) return null;
+    return d.posBaseTime + (trackPos - d.posBase) / d.posRate;
+  }
+
+  private crossfaderGains(v: number): [number, number] {
+    const angle = ((clamp(v, -1, 1) + 1) / 2) * (Math.PI / 2);
+    return [Math.cos(angle), Math.sin(angle)];
+  }
+
+  /**
+   * Schedule a full crossfader move on the audio clock (sampled
+   * equal-power curve). After the curve ends the gains hold at the target
+   * values, so the blend completes even if JS never wakes again.
+   */
+  scheduleCrossfaderCurve(fromV: number, toV: number, startAt: number, durSec: number): void {
+    const a = this.decks.get('deckA');
+    const b = this.decks.get('deckB');
+    if (!a || !b) return;
+    if (durSec <= 0) { this.setCrossfader(toV); return; }
+    const start = Math.max(startAt, this.ctx.currentTime);
+    const pts = 128;
+    const curveA = new Float32Array(pts);
+    const curveB = new Float32Array(pts);
+    for (let i = 0; i < pts; i++) {
+      const v = fromV + (toV - fromV) * (i / (pts - 1));
+      const [ga, gb] = this.crossfaderGains(v);
+      curveA[i] = ga;
+      curveB[i] = gb;
+    }
+    const [gA0, gB0] = this.crossfaderGains(fromV);
+    for (const [node, g0, curve] of [
+      [a.xfade, gA0, curveA],
+      [b.xfade, gB0, curveB],
+    ] as const) {
+      node.gain.cancelScheduledValues(start);
+      node.gain.setValueAtTime(g0, start);
+      node.gain.setValueCurveAtTime(curve, start, durSec);
+    }
+  }
+
+  /**
+   * Schedule a low-EQ move (knob values, dB = knob × 26, same mapping as
+   * setEqAuto) on the audio clock. durSec <= 0 steps the value at startAt.
+   */
+  scheduleEqLowCurve(id: string, fromKnob: number, toKnob: number, startAt: number, durSec: number): void {
+    const d = this.decks.get(id);
+    if (!d) return;
+    const start = Math.max(startAt, this.ctx.currentTime);
+    const fromDb = clamp(fromKnob, -1, 1) * 26;
+    const toDb = clamp(toKnob, -1, 1) * 26;
+    if (durSec <= 0) {
+      d.eqLow.gain.cancelScheduledValues(start);
+      d.eqLow.gain.setValueAtTime(toDb, start);
+      return;
+    }
+    const pts = 64;
+    const curve = new Float32Array(pts);
+    for (let i = 0; i < pts; i++) curve[i] = fromDb + (toDb - fromDb) * (i / (pts - 1));
+    d.eqLow.gain.cancelScheduledValues(start);
+    d.eqLow.gain.setValueAtTime(fromDb, start);
+    d.eqLow.gain.setValueCurveAtTime(curve, start, durSec);
+  }
+
+  /** Hold a low-EQ value from an audio time (step — used for the blend-start bass cut). */
+  scheduleEqLowHold(id: string, knob: number, at: number): void {
+    const d = this.decks.get(id);
+    if (!d) return;
+    d.eqLow.gain.cancelScheduledValues(at);
+    d.eqLow.gain.setValueAtTime(clamp(knob, -1, 1) * 26, at);
+  }
+
+  /** Cancel outstanding scheduled automation on a deck's low EQ only (live bass-swap: the crossfader curve keeps running). */
+  cancelEqAutomation(id: string): void {
+    this.decks.get(id)?.eqLow.gain.cancelScheduledValues(this.ctx.currentTime);
+  }
+
+  /**
+   * Cancel outstanding scheduled automation on a deck's crossfader (both
+   * sides — the crossfader is shared) and low EQ. Call before any
+   * immediate move (takeover, blend finish) so a scheduled curve cannot
+   * override it afterwards.
+   */
+  cancelDeckAutomation(id: string): void {
+    const t = this.ctx.currentTime;
+    this.decks.get(id)?.eqLow.gain.cancelScheduledValues(t);
+    this.decks.get('deckA')?.xfade.gain.cancelScheduledValues(t);
+    this.decks.get('deckB')?.xfade.gain.cancelScheduledValues(t);
+  }
+
   setMasterVolume(v: number): void {
     this.masterGain.gain.setTargetAtTime(clamp(v, 0, 1.5), this.ctx.currentTime, 0.05);
     debugLog('param', 'masterVol', undefined, { v });
