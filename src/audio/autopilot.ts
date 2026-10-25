@@ -263,3 +263,390 @@ export function swapReady(
     bassState(outEnv, outPos) === 'absent' && bassState(inEnv, inPos) === 'present'
   );
 }
+
+// ─── Smart mix-in planning (round 6) ─────────────────────────────────────
+// Tim's DJ technique, done by measurement instead of hearing: look at the
+// incoming track's waveform/beat grid, find where its kick drums come in,
+// start it so its intro plays over the outgoing track's outro, and switch
+// the basslines at the phrase where the incoming drop arrives and the
+// outgoing energy dips. Everything below is pure planning over the two
+// tracks' existing analysis — no new detection, no guessing.
+//
+// The mix-in cue is the incoming track's first sustained kick bar: the
+// analysis auto-1.1 anchor (auto hotcue slot 1), or a manual hotcue-1 edit
+// when the DJ set one. The driver resolves manual-over-auto before it
+// calls planTransition (deck-state hotcues), so the plan just reads slot 1.
+//
+// Four modes, picked per transition in this order:
+//   1. fallback — either grid is below the codebase's own confidence line
+//      (round 5's LOCKED threshold, 0.4) or the cue data is missing: the
+//      driver runs today's outro-bars + bass-threshold behavior exactly.
+//   2. extend — the incoming intro (bars from track start to the first
+//      sustained kick) is SHORTER than the desired blend window: loop a
+//      4-bar phrase at the mix-in cue region to manufacture room, then
+//      loop-out into the drop. Complement of sustain, not the same thing.
+//   3. sustain — the incoming intro is LONG and the outgoing ending would
+//      otherwise lose energy during it (thin outro, or the outgoing track
+//      simply ends first): loop the outgoing track's last high-energy
+//      phrase (the 4 bars before its outro point) while the full incoming
+//      intro plays over it, then release as the drop arrives.
+//   4. tease — room is plentiful: loop the incoming track's 4 bars before
+//      its first kick during the outgoing track's second-drop area (after
+//      its breakdown), then loop-out exactly into the drop while the
+//      outgoing fades. Fun/tension, only when it fits.
+//   5. straight — the default: phrase-aligned launch (the first-kick bar
+//      lands on a bar boundary of the outgoing track) with a whole-phrase
+//      blend, and the bass switched structurally at the drop.
+// The bass switch point is the first kick (slot 1, where the incoming kick
+// and bass fully arrive), NOT the analyzer's later "first drop" rise
+// (slot 2) — slot 2 usually falls after the blend, so switching there
+// would never fire inside the window. The outgoing side of the switch is
+// its outro point (slot 4) or its bass dropping out, whichever the driver
+// can read first.
+
+import { barPhaseOf } from './loop';
+
+/** Round 5's own confidence line for "this grid can be trusted". */
+export const SMART_MIN_CONFIDENCE = 0.4;
+/** Whole-phrase blend lengths (bars); the Outro control overrides when set to one of these. */
+export const SMART_BLEND_PHRASES = [8, 16, 32];
+export const SMART_DEFAULT_BLEND_BARS = 16;
+/** Tease loop length + how long the tease runs before the blend begins (bars). */
+export const TEASE_LOOP_BARS = 4;
+export const TEASE_BARS = 16;
+/** Extend loop length (bars) and the release fade after a tease (bars). */
+export const EXTEND_LOOP_BARS = 4;
+export const TEASE_RELEASE_FADE_BARS = 4;
+/** Straight blends run the phrase length plus this tail, so the drop lands over the fading outgoing. */
+export const STRAIGHT_TAIL_BARS = 2;
+/** Sustain only bridges intros up to this many bars — longer than that, slice it like straight. */
+export const SUSTAIN_MAX_INTRO_BARS = 32;
+/** Outro counts as "thin" when its mean low energy is below this fraction of the track's own p90. */
+export const OUTRO_THIN_RATIO = 0.35;
+
+export type SmartMode = 'fallback' | 'straight' | 'tease' | 'extend' | 'sustain';
+
+export interface SmartPlan {
+  mode: SmartMode;
+  /** Incoming first sustained kick bar (mix-in cue / drop point), seconds. */
+  firstKick: number | null;
+  /** Outgoing outro point (hotcue slot 4), seconds. */
+  outOutro: number | null;
+  /** Blend length in whole phrases (bars). */
+  blendBars: number;
+  /** Incoming start offset for the blend launch (straight/extend/sustain; tease uses teaseLoopStart). */
+  launchPos: number;
+  /** Outgoing position where the blend begins (straight/extend). */
+  blendStartOut: number | null;
+  /** Crossfader length in bars (straight: phrases + tail; extend: phrases; tease: release fade; sustain: intro). */
+  blendSecBars: number;
+  /** Tease: outgoing position where the incoming loop launches. */
+  teaseStart: number | null;
+  teaseLoopStart: number | null;
+  teaseLoopEnd: number | null;
+  /** Tease: outgoing position where the loop releases into the drop. */
+  outBlendStart: number | null;
+  extendLoopStart: number | null;
+  extendLoopEnd: number | null;
+  sustainStart: number | null;
+  sustainEnd: number | null;
+  /** Outgoing position the waiting tick watches for this plan's trigger. */
+  triggerPos: number;
+  /** Status-strip text (null for fallback — today's display is unchanged there). */
+  note: string | null;
+}
+
+export interface SmartPlanInput {
+  out: TrackInfo;
+  in: TrackInfo;
+  /** Deck-state hotcues (manual wins per slot, else auto) for both tracks. */
+  outHotcues: (number | null)[];
+  inHotcues: (number | null)[];
+  /** Outgoing position at plan time (seconds). */
+  outPos: number;
+  /** The Outro-bars control value. */
+  outroBars: number;
+}
+
+/** Last beat-map index at or before `t` whose residue marks a downbeat, or -1. */
+function downbeatIndexAtOrBefore(grid: BeatGrid, t: number): number {
+  const beats = grid.beats;
+  if (beats.length === 0) return -1;
+  const phase = barPhaseOf(grid);
+  let lo = 0;
+  let hi = beats.length - 1;
+  let j = -1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (beats[mid] <= t) { j = mid; lo = mid + 1; }
+    else hi = mid - 1;
+  }
+  while (j >= 0 && (((j - phase) % 4) + 4) % 4 !== 0) j--;
+  return j;
+}
+
+/** Last downbeat time at or before `t`, or null when the grid has no downbeat there. */
+export function downbeatAtOrBefore(grid: BeatGrid, t: number): number | null {
+  const j = downbeatIndexAtOrBefore(grid, t);
+  return j >= 0 ? grid.beats[j] : null;
+}
+
+/** First downbeat time at or after `t`, or null. */
+export function downbeatAtOrAfter(grid: BeatGrid, t: number): number | null {
+  const beats = grid.beats;
+  if (beats.length === 0) return null;
+  const phase = barPhaseOf(grid);
+  let lo = 0;
+  let hi = beats.length - 1;
+  let j = beats.length;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (beats[mid] < t) lo = mid + 1;
+    else { j = mid; hi = mid - 1; }
+  }
+  while (j < beats.length && (((j - phase) % 4) + 4) % 4 !== 0) j++;
+  return j < beats.length ? beats[j] : null;
+}
+
+/** First downbeat at or after track start, or null. */
+export function firstDownbeat(grid: BeatGrid): number | null {
+  return downbeatAtOrAfter(grid, 0);
+}
+
+/** Downbeat `bars` bars before time `t` (t itself should be a downbeat), or null if it does not fit. */
+export function downbeatBarsBefore(grid: BeatGrid, t: number, bars: number): number | null {
+  const j = downbeatIndexAtOrBefore(grid, t);
+  if (j < 0) return null;
+  const k = j - bars * 4;
+  return k >= 0 ? grid.beats[k] : null;
+}
+
+/** Downbeat `bars` bars after time `t` (t itself should be a downbeat), or null if the map runs out. */
+export function downbeatBarsAfter(grid: BeatGrid, t: number, bars: number): number | null {
+  const j = downbeatIndexAtOrBefore(grid, t);
+  if (j < 0) return null;
+  const k = j + bars * 4;
+  return k < grid.beats.length ? grid.beats[k] : null;
+}
+
+/** Mean low energy over [t0, t1] as a fraction of the track's own p90, or null with no envelope. */
+function outroLowRatio(out: TrackInfo, t0: number, t1: number): number | null {
+  const env = trackBassEnvelope(out);
+  if (!env || env.data.length === 0) return null;
+  const ref = p90(env.data);
+  if (ref <= 0) return null;
+  let sum = 0;
+  let n = 0;
+  for (let t = t0; t <= t1; t += 0.25) {
+    sum += envAt(env, t);
+    n++;
+  }
+  if (!n) return null;
+  return sum / n / ref;
+}
+
+function fmtTime(s: number): string {
+  const m = Math.floor(s / 60);
+  const sec = Math.floor(s % 60);
+  return `${m}:${sec.toString().padStart(2, '0')}`;
+}
+
+const FALLBACK_PLAN: SmartPlan = {
+  mode: 'fallback',
+  firstKick: null,
+  outOutro: null,
+  blendBars: SMART_DEFAULT_BLEND_BARS,
+  launchPos: 0,
+  blendStartOut: null,
+  blendSecBars: 0,
+  teaseStart: null,
+  teaseLoopStart: null,
+  teaseLoopEnd: null,
+  outBlendStart: null,
+  extendLoopStart: null,
+  extendLoopEnd: null,
+  sustainStart: null,
+  sustainEnd: null,
+  triggerPos: 0,
+  note: null,
+};
+
+/**
+ * Pick the mix-in mode + all launch/blend geometry for one transition.
+ * Pure: the driver calls it once per cycle when the next track arms, and
+ * the plan then drives the waiting tick's triggers. Never throws — any
+ * missing data degrades to the fallback plan (today's behavior).
+ */
+export function planTransition(a: SmartPlanInput): SmartPlan {
+  const outGrid = a.out.beatGrid;
+  const inGrid = a.in.beatGrid;
+  const conf = (g: BeatGrid | null | undefined): number =>
+    g && typeof g.confidence === 'number' ? g.confidence : 0;
+  if (
+    !outGrid || !inGrid || outGrid.bpm <= 0 || inGrid.bpm <= 0 ||
+    a.out.duration <= 0 || a.in.duration <= 0 ||
+    conf(outGrid) < SMART_MIN_CONFIDENCE || conf(inGrid) < SMART_MIN_CONFIDENCE
+  ) {
+    return { ...FALLBACK_PLAN };
+  }
+  // Mix-in cue: manual hotcue 1 wins (deck-state resolution), else the
+  // analysis anchor/downbeat, else the first mapped beat. Without it
+  // there is nothing smart to aim at — fall back, no guessing.
+  // Both cue points snap to their bar's downbeat: a manual cue can sit
+  // mid-bar, and every loop boundary, launch offset, and switch point
+  // below must sit on a barline or the phrase math drifts.
+  const firstKickRaw =
+    a.inHotcues[0] ?? firstDownbeat(inGrid) ?? inGrid.beats[0] ?? null;
+  if (firstKickRaw == null || firstKickRaw < 0 || firstKickRaw >= a.in.duration) {
+    return { ...FALLBACK_PLAN };
+  }
+  const firstKick =
+    downbeatAtOrBefore(inGrid, firstKickRaw) ??
+    downbeatAtOrAfter(inGrid, firstKickRaw) ??
+    firstKickRaw;
+  const outOutroRaw = a.outHotcues[3] ?? null;
+  const outOutro =
+    outOutroRaw == null
+      ? null
+      : (downbeatAtOrBefore(outGrid, outOutroRaw) ??
+        downbeatAtOrAfter(outGrid, outOutroRaw) ??
+        outOutroRaw);
+  const outBarSec = barSeconds(outGrid);
+  const inBarSec = barSeconds(inGrid);
+  const P = SMART_BLEND_PHRASES.includes(a.outroBars) ? a.outroBars : SMART_DEFAULT_BLEND_BARS;
+  const firstDb = firstDownbeat(inGrid) ?? 0;
+  const introBars = Math.max(0, Math.round((firstKick - firstDb) / inBarSec));
+  // Blend start for straight/extend/tease-release: the outro point when
+  // it leaves room for the full phrase blend, else exactly P bars before
+  // the end — snapped back to an outgoing downbeat so the blend always
+  // starts on the 1 and always fits before the track ends.
+  const outStartP = outroStartSeconds(outGrid, a.out.duration, P);
+  let blendStart = outOutro != null ? Math.min(outOutro, outStartP) : outStartP;
+  blendStart = downbeatAtOrBefore(outGrid, blendStart) ?? blendStart;
+  blendStart = Math.max(0, blendStart);
+
+  // 2. EXTEND — short intro: manufacture room with a 4-bar loop at the
+  // mix-in cue region. The loop starts AT the first kick (it teases the
+  // drop itself, which the spec allows) and the release lands on a phrase
+  // boundary into the main part (driver exits at a downbeat).
+  if (introBars < P) {
+    const extEnd = downbeatBarsAfter(inGrid, firstKick, EXTEND_LOOP_BARS);
+    if (extEnd != null && extEnd > firstKick && extEnd <= a.in.duration) {
+      return {
+        mode: 'extend',
+        firstKick,
+        outOutro,
+        blendBars: P,
+        launchPos: firstDb,
+        blendStartOut: blendStart,
+        blendSecBars: P,
+        teaseStart: null,
+        teaseLoopStart: null,
+        teaseLoopEnd: null,
+        outBlendStart: null,
+        extendLoopStart: firstKick,
+        extendLoopEnd: extEnd,
+        sustainStart: null,
+        sustainEnd: null,
+        triggerPos: blendStart,
+        note: `Smart mix-in · extend: 4-bar loop fills a ${introBars}-bar intro (blend ${P} bars)`,
+      };
+    }
+    // Loop does not fit (kick too close to track end) — fall through to
+    // tease/straight with a short intro instead of forcing a bad loop.
+  }
+
+  // 3. SUSTAIN — long intro + an outgoing ending that would sag: loop the
+  // outgoing track's last high-energy phrase (4 bars before its outro
+  // point) while the FULL incoming intro plays over it. Triggers on a
+  // thin outro (measured low energy) or on the outgoing track simply
+  // ending before the intro completes (late autopilot engagement).
+  if (introBars > P && introBars <= SUSTAIN_MAX_INTRO_BARS && outOutro != null) {
+    const susStart = downbeatBarsBefore(outGrid, outOutro, 4);
+    const remainingBars = (a.out.duration - a.outPos) / outBarSec;
+    const ratio = outroLowRatio(a.out, outOutro, a.out.duration);
+    const thin = ratio != null && ratio < OUTRO_THIN_RATIO;
+    if (susStart != null && susStart > a.outPos + outBarSec && (thin || remainingBars < introBars)) {
+      return {
+        mode: 'sustain',
+        firstKick,
+        outOutro,
+        blendBars: introBars,
+        launchPos: firstDb,
+        blendStartOut: susStart,
+        blendSecBars: introBars,
+        teaseStart: null,
+        teaseLoopStart: null,
+        teaseLoopEnd: null,
+        outBlendStart: null,
+        extendLoopStart: null,
+        extendLoopEnd: null,
+        sustainStart: susStart,
+        sustainEnd: outOutro,
+        triggerPos: susStart,
+        note: `Smart mix-in · outro-sustain: looping the last high-energy phrase under a ${introBars}-bar intro`,
+      };
+    }
+  }
+
+  // 4. TEASE — room plentiful: loop the incoming track's 4 bars before its
+  // first kick during the outgoing track's second-drop area (after its
+  // breakdown, when one exists), then release into the drop as the blend
+  // begins. Room must hold the tease plus the phrase blend, end to end.
+  const teaseLoopStart = downbeatBarsBefore(inGrid, firstKick, TEASE_LOOP_BARS);
+  const teaseStart = teaseLoopStart != null ? downbeatBarsBefore(outGrid, blendStart, TEASE_BARS) : null;
+  const outHC3 = a.outHotcues[2] ?? null;
+  const roomBars = teaseStart != null ? (a.out.duration - teaseStart) / outBarSec : 0;
+  if (
+    teaseLoopStart != null && teaseStart != null &&
+    teaseStart > a.outPos + outBarSec &&
+    (outHC3 == null || teaseStart >= outHC3) &&
+    roomBars >= TEASE_BARS + P
+  ) {
+    return {
+      mode: 'tease',
+      firstKick,
+      outOutro,
+      blendBars: P,
+      launchPos: teaseLoopStart,
+      blendStartOut: blendStart,
+      blendSecBars: TEASE_RELEASE_FADE_BARS,
+      teaseStart,
+      teaseLoopStart,
+      teaseLoopEnd: firstKick,
+      outBlendStart: blendStart,
+      extendLoopStart: null,
+      extendLoopEnd: null,
+      sustainStart: null,
+      sustainEnd: null,
+      triggerPos: teaseStart,
+      note: `Smart mix-in · teasing a 4-bar loop until the drop at ${fmtTime(firstKick)}`,
+    };
+  }
+
+  // 5. STRAIGHT — phrase-aligned launch: start P bars before the first
+  // kick (snapped to an incoming downbeat) so the kick lands exactly on
+  // an outgoing bar boundary P bars into the blend; the crossfader runs
+  // P + tail bars so the drop lands over the fading outgoing, and the
+  // bass switches structurally at the kick (driver).
+  const launchPos = downbeatBarsBefore(inGrid, firstKick, P) ?? firstDb;
+  return {
+    mode: 'straight',
+    firstKick,
+    outOutro,
+    blendBars: P,
+    launchPos,
+    blendStartOut: blendStart,
+    blendSecBars: P + STRAIGHT_TAIL_BARS,
+    teaseStart: null,
+    teaseLoopStart: null,
+    teaseLoopEnd: null,
+    outBlendStart: null,
+    extendLoopStart: null,
+    extendLoopEnd: null,
+    sustainStart: null,
+    sustainEnd: null,
+    triggerPos: blendStart,
+    note: `Smart mix-in · ${P}-bar phrase blend · first kick ${fmtTime(firstKick)}`,
+  };
+}

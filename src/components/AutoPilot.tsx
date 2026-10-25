@@ -7,7 +7,7 @@ import { useState } from 'react';
 import type { TrackInfo } from '../types';
 import type { PlaylistRecord } from '../audio/playlistStore';
 
-export type ApPhase = 'idle' | 'waiting' | 'preparing' | 'scheduled' | 'crossfading' | 'fallback' | 'generating';
+export type ApPhase = 'idle' | 'waiting' | 'preparing' | 'scheduled' | 'crossfading' | 'fallback' | 'generating' | 'teasing';
 
 export interface ApStatus {
   on: boolean;
@@ -67,6 +67,7 @@ const PHASE_LABEL: Record<ApPhase, string> = {
   crossfading: 'Blending into the next track',
   fallback: 'No next track — looping the outro',
   generating: 'Generating next with AI…',
+  teasing: 'Teasing the next track in a loop',
 };
 
 export default function AutoPilot(p: AutoPilotProps) {
