@@ -259,6 +259,20 @@ export default function Sampler() {
     return () => { cleanups.forEach((c) => c()); volCleanups.forEach((c) => c()); qCleanup(); };
   }, [trigger, setVol]);
 
+  // MIDI — record-from-deck toggle: same paths as the REC / STOP buttons,
+  // using the current recDeck / recPad selections (via refs in startRec).
+  useEffect(() => {
+    const unreg = midi.registerControl('sampler.rec', {
+      kind: 'button',
+      onButton: (p) => {
+        if (!p) return;
+        if (recording) void stopRec();
+        else startRec();
+      },
+    });
+    return unreg;
+  }, [recording, startRec, stopRec]);
+
   // Drag-drop onto pads
   const onDrop = useCallback((e: React.DragEvent, i: number) => {
     e.preventDefault();
