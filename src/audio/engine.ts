@@ -1512,15 +1512,34 @@ export class DJEngine {
 
   // ─── Loops & hotcues ─────────────────────────────────────────────────────
 
-  setLoop(id: string, start: number | null, end: number | null): void {
+  setLoop(id: string, start: number | null, end: number | null, opts?: { allowEndAtDuration?: boolean }): void {
     const d = this.decks.get(id);
     if (!d) return;
+    let s = start;
+    let e = end;
+    if (s != null && e != null && d.buffer) {
+      const dur = d.buffer.duration;
+      if (!opts?.allowEndAtDuration && e >= dur) {
+        // Boundary hazard: a loop ending exactly at file end can play
+        // through the dead tail and hit source end before the wrap
+        // fires. Pull back one beat (grid) so the wrap always fires
+        // first. Generated bridge buffers opt out (their loop IS the
+        // whole buffer, by construction).
+        const beat = d.grid && d.grid.bpm > 0 ? 60 / d.grid.bpm : 0.5;
+        debugLog('transport', 'loop end clamped', id, { from: e, to: dur - beat });
+        e = dur - beat;
+      }
+      if (e <= s) {
+        debugLog('transport', 'loop refused', id, { start: s, end: e });
+        return;
+      }
+    }
     const wasPlaying = !!d.source;
     const pos = this.position(id);
     if (wasPlaying) this.pause(id);
-    d.loopStart = start;
-    d.loopEnd = end;
-    debugLog('transport', 'loop set', id, { start, end });
+    d.loopStart = s;
+    d.loopEnd = e;
+    debugLog('transport', 'loop set', id, { start: s, end: e, length: s != null && e != null ? e - s : null });
     if (wasPlaying) this.play(id, { offset: pos });
   }
 

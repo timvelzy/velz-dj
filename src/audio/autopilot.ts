@@ -451,6 +451,58 @@ function fmtTime(s: number): string {
   return `${m}:${sec.toString().padStart(2, '0')}`;
 }
 
+// ─── Fallback hold loop (round 7) ─────────────────────────────────────
+// The no-candidate safety net. NEVER a span from a detected outro point
+// to track end: that is how a 62-second loop to a dead tail happened —
+// the loop played through the track's own fade-out, then wrapped.
+// A hold loop is a short, musical, bar-snapped phrase: 8 bars by
+// default, hard-capped at 16, ending at least one bar short of track
+// end, and placed so the playhead reaches it naturally when possible.
+export const HOLD_LOOP_BARS = 8;
+export const HOLD_LOOP_MAX_BARS = 16;
+
+export interface HoldLoop {
+  start: number;
+  end: number;
+  /** True when the playhead is already past the loop end and must jump back into it. */
+  jump: boolean;
+}
+
+/**
+ * Pick the hold loop for a track with no next candidate. Prefers the
+ * outro-anchored phrase when it still lies ahead of the playhead, else
+ * the final phrase before the end cap. Only when the playhead is already
+ * past every candidate end (last bar of the track) does the caller need
+ * to jump back into it (jump: true). Length is capped by construction:
+ * exactly HOLD_LOOP_BARS from the snap, never over HOLD_LOOP_MAX_BARS.
+ */
+export function holdLoopFor(
+  track: TrackInfo,
+  hotcues: (number | null)[],
+  posSec: number,
+): HoldLoop | null {
+  const grid = track.beatGrid;
+  const dur = track.duration;
+  if (!grid || grid.bpm <= 0 || dur <= 0) return null;
+  const barSec = barSeconds(grid);
+  if (dur < 2 * barSec) return null;
+  // Loop end must sit at least one bar short of track end (the boundary
+  // hazard: a loop ending at file end plays the dead tail, then wraps).
+  const endCap = downbeatAtOrBefore(grid, dur - barSec) ?? Math.max(0, dur - barSec);
+  if (endCap <= 0) return null;
+  const outro = hotcues[3];
+  const outroEnd = outro != null ? (downbeatAtOrBefore(grid, outro) ?? outro) : null;
+  const end =
+    outroEnd != null && outroEnd > posSec + barSec && outroEnd <= endCap ? outroEnd : endCap;
+  const jump = posSec >= end;
+  let start = downbeatBarsBefore(grid, end, HOLD_LOOP_BARS) ?? (end - HOLD_LOOP_BARS * barSec);
+  // Hard cap, whatever the snap did.
+  if (end - start > HOLD_LOOP_MAX_BARS * barSec) start = end - HOLD_LOOP_MAX_BARS * barSec;
+  if (start < 0) start = firstDownbeat(grid) ?? 0;
+  if (end <= start) return null;
+  return { start, end, jump };
+}
+
 const FALLBACK_PLAN: SmartPlan = {
   mode: 'fallback',
   firstKick: null,
