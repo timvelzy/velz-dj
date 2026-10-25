@@ -19,6 +19,8 @@ import { computeBandPeaks, peaksKey } from './audio/peaks';
 import { loadPeaks, savePeaks } from './audio/peaksStore';
 import type { BandPeaks, TrackInfo } from './types';
 import Deck, { type DeckState } from './components/Deck';
+import CenterPlayheadView, { type TopDeckView } from './components/CenterPlayheadView';
+import DebugPanel from './components/DebugPanel';
 import Mixer, { defaultChannel, type ChannelState } from './components/Mixer';
 import AIDeck from './components/AIDeck';
 import FxUnit from './components/FxUnit';
@@ -65,6 +67,9 @@ export default function App() {
   const [aiLoop, setAiLoop] = useState<GeneratedLoop | null>(null);
   const [aiBuffer, setAiBuffer] = useState<AudioBuffer | null>(null);
   const [aiPlaying, setAiPlaying] = useState(false);
+  const [aiCue, setAiCue] = useState(0);
+  const [aiPeaks, setAiPeaks] = useState<BandPeaks | null>(null);
+  const [debugOpen, setDebugOpen] = useState(false);
   // Traktor collection.nml — source of truth for beat grids when imported.
   // Persisted in IndexedDB so the import survives reloads (import once).
   const [traktor, setTraktor] = useState<TraktorCollection | null>(null);
@@ -151,6 +156,18 @@ export default function App() {
       if (rec?.recording) setRecElapsed(rec.elapsed());
     }, 250);
     return () => window.clearInterval(id);
+  }, [ready]);
+
+  // Dropout hardening (item 4): a backgrounded tab can leave the
+  // AudioContext suspended and the <audio> device elements paused while the
+  // engine still reports decks as playing. Resume on return to the tab.
+  useEffect(() => {
+    if (!ready) return;
+    const onVis = () => {
+      if (!document.hidden) void engine.resume();
+    };
+    document.addEventListener('visibilitychange', onVis);
+    return () => document.removeEventListener('visibilitychange', onVis);
   }, [ready]);
 
   // Never lose a set to an accidental tab close
@@ -448,6 +465,10 @@ export default function App() {
       });
       setAiLoop(loop);
       setAiBuffer(loop.buffer);
+      setAiCue(0);
+      // Band peaks for the ported colored waveforms (reuses the existing
+      // peaks pipeline; generated loops never went through track analysis).
+      void computeBandPeaks(loop.buffer).then(setAiPeaks).catch(() => setAiPeaks(null));
       // Make sure the AI channel is audible
       setChC((c) => {
         const next = { ...c, fader: Math.max(c.fader, 0.8) };
@@ -456,6 +477,36 @@ export default function App() {
       });
     }
   }, [masterBpm]);
+
+  // AI deck transport (item 5) — same feel as the regular decks.
+  const aiPlay = useCallback(() => {
+    if (!aiBuffer) return;
+    engine.play('deckC', { offset: aiCue });
+  }, [aiBuffer, aiCue]);
+  const aiPause = useCallback(() => {
+    engine.pause('deckC');
+  }, []);
+  const aiStop = useCallback(() => {
+    engine.pause('deckC');
+    engine.seek('deckC', aiCue);
+  }, [aiCue]);
+  const aiCueDown = useCallback(() => {
+    if (engine.isPlaying('deckC')) {
+      engine.pause('deckC');
+      engine.seek('deckC', aiCue);
+    } else {
+      engine.play('deckC', { offset: aiCue });
+    }
+  }, [aiCue]);
+  const aiCueUp = useCallback(() => {
+    if (engine.isPlaying('deckC')) {
+      engine.pause('deckC');
+      engine.seek('deckC', aiCue);
+    }
+  }, [aiCue]);
+  const aiSetCue = useCallback(() => {
+    setAiCue(engine.position('deckC'));
+  }, []);
 
   const masterKey = masterDeck === 'deckA' ? deckA.track?.key ?? '' : masterDeck === 'deckB' ? deckB.track?.key ?? '' : '';
 
@@ -484,6 +535,14 @@ export default function App() {
         setDeckState(deckKey, { ...st, keyLock: on });
       },
       onSeek: (t: number) => engine.seek(deckId, t),
+      onSetCue: () => {
+        const st = deckState(deckKey);
+        setDeckState(deckKey, { ...st, cuePoint: engine.position(deckId) });
+      },
+      onStop: () => {
+        engine.pause(deckId);
+        engine.seek(deckId, deckState(deckKey).cuePoint);
+      },
       onHotcue: (i: number, set: boolean) => {
         const hcs = [...st.hotcues];
         if (set || hcs[i] === null) {
@@ -634,6 +693,13 @@ export default function App() {
             🎛 MIDI
           </button>
           <button
+            onClick={() => setDebugOpen((o) => !o)}
+            className={`rounded px-3 py-1.5 text-xs font-bold ${debugOpen ? 'bg-amber-600 text-black' : 'bg-zinc-800 text-zinc-300 hover:bg-zinc-700'}`}
+            title="View / copy / download the debug log — paste it to us after a dropout"
+          >
+            🐛 Log
+          </button>
+          <button
             onClick={() => nmlInputRef.current?.click()}
             className="rounded bg-emerald-800 px-3 py-1.5 text-xs font-bold text-white hover:bg-emerald-700"
             title="Import Traktor collection.nml — matching tracks use your Traktor beat grids + hotcues, no re-analysis"
@@ -673,6 +739,50 @@ export default function App() {
           />
         </div>
       </header>
+
+      {debugOpen && <div className="pt-3"><DebugPanel /></div>}
+
+      {/* Sync view — ported top waveforms, center playhead (item 1) */}
+      <CenterPlayheadView
+        decks={[
+          {
+            label: 'A', deckId: 'deckA', color: '#38bdf8',
+            title: deckA.track ? `${deckA.track.artist} — ${deckA.track.title}` : 'No track',
+            buffer: deckA.buffer, grid: deckA.track?.beatGrid ?? null, peaks: deckA.track?.peaks ?? null,
+            bpm: deckA.track?.bpm ?? 0, isPlaying: engine.isPlaying('deckA'),
+            onPlayPause: () => togglePlay('A'),
+            onCueDown: () => cueDown('A'),
+            onCueUp: () => cueUp('A'),
+            onStop: () => { engine.pause('deckA'); engine.seek('deckA', deckA.cuePoint); },
+            onSetCue: () => setDeckState('A', { ...deckA, cuePoint: engine.position('deckA') }),
+            onSeek: (t) => engine.seek('deckA', t),
+          },
+          {
+            label: 'B', deckId: 'deckB', color: '#fb923c',
+            title: deckB.track ? `${deckB.track.artist} — ${deckB.track.title}` : 'No track',
+            buffer: deckB.buffer, grid: deckB.track?.beatGrid ?? null, peaks: deckB.track?.peaks ?? null,
+            bpm: deckB.track?.bpm ?? 0, isPlaying: engine.isPlaying('deckB'),
+            onPlayPause: () => togglePlay('B'),
+            onCueDown: () => cueDown('B'),
+            onCueUp: () => cueUp('B'),
+            onStop: () => { engine.pause('deckB'); engine.seek('deckB', deckB.cuePoint); },
+            onSetCue: () => setDeckState('B', { ...deckB, cuePoint: engine.position('deckB') }),
+            onSeek: (t) => engine.seek('deckB', t),
+          },
+        ]}
+        ai={aiBuffer ? {
+          label: 'AI', deckId: 'deckC', color: '#c084fc',
+          title: aiLoop ? `${aiLoop.spec.style} · ${aiLoop.spec.bars} bars` : 'AI loop',
+          buffer: aiBuffer, grid: aiLoop?.grid ?? null, peaks: aiPeaks,
+          bpm: aiLoop?.grid.bpm ?? 0, isPlaying: aiPlaying,
+          onPlayPause: () => { aiPlaying ? aiPause() : aiPlay(); },
+          onCueDown: aiCueDown,
+          onCueUp: aiCueUp,
+          onStop: aiStop,
+          onSetCue: aiSetCue,
+          onSeek: (t) => engine.seek('deckC', t),
+        } : null}
+      />
 
       {/* Decks + mixer */}
       <main className="grid gap-3 p-3 lg:grid-cols-[1fr_340px_1fr]">
@@ -723,9 +833,16 @@ export default function App() {
           masterKey={masterKey}
           onDropLoop={dropAiLoop}
           isPlaying={aiPlaying}
-          onStop={() => engine.pause('deckC')}
+          onStop={aiStop}
+          onPlay={aiPlay}
+          onPause={aiPause}
+          onCueDown={aiCueDown}
+          onCueUp={aiCueUp}
+          onSetCue={aiSetCue}
+          aiCue={aiCue}
           currentLoop={aiLoop}
           buffer={aiBuffer}
+          peaks={aiPeaks}
         />
       </div>
 

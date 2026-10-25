@@ -18,6 +18,7 @@
 import type { BeatGrid } from '../types';
 import wsolaWorkletUrl from './wsola-processor.ts?worker&url';
 import recorderWorkletUrl from './recorder-processor.ts?worker&url';
+import { debugLog } from './debugLog';
 
 export interface DeckNodes {
   id: string;
@@ -163,6 +164,10 @@ export class DJEngine {
   async init(): Promise<void> {
     const AC = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
     this.ctx = new AC({ latencyHint: 'interactive' });
+    this.ctx.onstatechange = () => {
+      debugLog('audio', `AudioContext state -> ${this.ctx.state}`);
+    };
+    debugLog('audio', 'engine init', undefined, { state: this.ctx.state });
 
     await this.ctx.audioWorklet.addModule(wsolaWorkletUrl);
     await this.ctx.audioWorklet.addModule(recorderWorkletUrl);
@@ -238,6 +243,7 @@ export class DJEngine {
 
   async resume(): Promise<void> {
     if (!this.ctx) return;
+    const before = this.ctx.state;
     if (this.ctx.state === 'suspended') await this.ctx.resume();
     try {
       await this.masterEl.play();
@@ -245,6 +251,7 @@ export class DJEngine {
     } catch {
       /* autoplay policy — will start on next gesture */
     }
+    debugLog('audio', 'resume', undefined, { before, after: this.ctx.state });
   }
 
   destroy(): void {
@@ -476,6 +483,21 @@ export class DJEngine {
       numberOfOutputs: 1,
       outputChannelCount: [2],
     });
+    // Worklet health reports (resyncs / processor errors) come back over the
+    // port — log them so a dropout leaves a trail (item 6). Throttled: the
+    // first report and every 100th, so a flapping worklet can't flood the ring.
+    let workletLogCount = 0;
+    stretch.port.onmessage = (e: MessageEvent) => {
+      const d = e.data as { type?: string; count?: number; message?: string };
+      if (!d || (d.type !== 'wsola-resync' && d.type !== 'wsola-error')) return;
+      workletLogCount++;
+      if (workletLogCount === 1 || workletLogCount % 100 === 0) {
+        debugLog('error', `worklet ${d.type} (report ${workletLogCount})`, id, {
+          count: d.count ?? workletLogCount,
+          message: d.message ?? '',
+        });
+      }
+    };
 
     const trim = ctx.createGain();
     const eqLow = ctx.createBiquadFilter();
@@ -619,6 +641,21 @@ export class DJEngine {
     d.posBaseTime = t;
     d.posRate = this.effectiveTempo(d);
     this.applyTempo(d);
+    // Natural-end reporting (dropout hardening): a BufferSource that runs
+    // out used to leave d.source set, so the deck kept reporting "playing"
+    // while outputting silence. Now the end clears the transport + logs.
+    // pause()/play() replace d.source synchronously, so a stopped source's
+    // late onended is ignored by the identity check.
+    src.onended = () => {
+      if (d.source === src) {
+        d.source = null;
+        const dur = d.buffer?.duration ?? 0;
+        d.posBase = dur;
+        d.posBaseTime = this.ctx.currentTime;
+        debugLog('transport', 'track ended (source exhausted)', id, { at: dur });
+      }
+    };
+    debugLog('transport', 'play', id, { offset, rate: d.posRate });
     // Start slightly in the future for clean scheduling
     src.start(t, offset % d.buffer.duration);
   }
@@ -633,6 +670,7 @@ export class DJEngine {
     d.posBaseTime = this.ctx.currentTime;
     d.nudge = 0; // momentary bend never survives a pause
     d.nudgeDeadline = 0;
+    debugLog('transport', 'pause', id, { at: d.posBase });
   }
 
   seek(id: string, time: number): void {
@@ -642,6 +680,7 @@ export class DJEngine {
     if (wasPlaying) this.pause(id);
     d.posBase = clamp(time, 0, d.buffer.duration);
     d.posBaseTime = this.ctx.currentTime;
+    debugLog('transport', 'seek', id, { to: d.posBase, wasPlaying });
     if (wasPlaying) this.play(id, { offset: d.posBase });
   }
 
@@ -657,6 +696,7 @@ export class DJEngine {
     this.rebase(d);
     d.userTempo = clamp(tempo, 0.5, 2);
     this.applyTempo(d);
+    debugLog('param', 'tempo', id, { tempo: d.userTempo });
   }
 
   /**
@@ -694,12 +734,14 @@ export class DJEngine {
     this.rebase(d);
     d.keyLock = on;
     this.applyTempo(d);
+    debugLog('param', 'keyLock', id, { on });
   }
 
   setSync(id: string, on: boolean): void {
     const d = this.decks.get(id);
     if (!d) return;
     d.syncOn = on;
+    debugLog('transport', `sync ${on ? 'on' : 'off'}`, id);
     if (on) {
       // Immediate tempo match against the slave's local BPM
       const mBpm = this.masterEffectiveBpm();
@@ -926,13 +968,20 @@ export class DJEngine {
 
   // ─── Mixer params ─────────────────────────────────────────────────────────
 
-  setEq(id: string, band: 'low' | 'mid' | 'high', db: number, kill: boolean): void {
+  /**
+   * DJ-style 3-band EQ. Knob value v in [-1, 1] maps to ±26 dB (isolator
+   * feel, center detent = flat) — the old ×1.5 mapping capped the knobs at
+   * ±1.5 dB, which is why they felt dead. Kill still drops the band to -60 dB.
+   */
+  setEq(id: string, band: 'low' | 'mid' | 'high', v: number, kill: boolean): void {
     const d = this.decks.get(id);
     if (!d) return;
     const t = this.ctx.currentTime;
     const node = band === 'low' ? d.eqLow : band === 'mid' ? d.eqMid : d.eqHigh;
-    node.gain.setTargetAtTime(kill ? -60 : db * 1.5, t, 0.05);
+    const db = kill ? -60 : clamp(v, -1, 1) * 26;
+    node.gain.setTargetAtTime(db, t, 0.05);
     if (band === 'mid') node.Q.setTargetAtTime(kill ? 2 : 1, t, 0.05);
+    debugLog('param', `eq ${band}`, id, { knob: v, db, kill });
   }
 
   setFilter(id: string, v: number): void {
@@ -953,24 +1002,28 @@ export class DJEngine {
       d.filter.frequency.setTargetAtTime(f, t, 0.05);
       d.filter.Q.value = 1 + v * 2;
     }
+    debugLog('param', 'filter', id, { v });
   }
 
   setFader(id: string, v: number): void {
     const d = this.decks.get(id);
     if (!d) return;
     d.fader.gain.setTargetAtTime(clamp(v, 0, 1), this.ctx.currentTime, 0.03);
+    debugLog('param', 'fader', id, { v });
   }
 
   setTrim(id: string, v: number): void {
     const d = this.decks.get(id);
     if (!d) return;
     d.trim.gain.setTargetAtTime(clamp(v, 0, 2), this.ctx.currentTime, 0.03);
+    debugLog('param', 'trim', id, { v });
   }
 
   setCue(id: string, on: boolean): void {
     const d = this.decks.get(id);
     if (!d) return;
     d.cueGain.gain.setTargetAtTime(on ? 1 : 0, this.ctx.currentTime, 0.02);
+    debugLog('param', 'cue', id, { on });
   }
 
   /** Equal-power crossfader: v in [-1, 1], -1 = full A, +1 = full B. AI deck bypasses it. */
@@ -981,10 +1034,12 @@ export class DJEngine {
     const gB = Math.sin(angle);
     this.decks.get('deckA')?.xfade.gain.setTargetAtTime(gA, t, 0.03);
     this.decks.get('deckB')?.xfade.gain.setTargetAtTime(gB, t, 0.03);
+    debugLog('param', 'crossfader', undefined, { v, gA, gB });
   }
 
   setMasterVolume(v: number): void {
     this.masterGain.gain.setTargetAtTime(clamp(v, 0, 1.5), this.ctx.currentTime, 0.05);
+    debugLog('param', 'masterVol', undefined, { v });
   }
 
   /** 0 = cue only … 1 = master only (equal power). */
@@ -993,10 +1048,12 @@ export class DJEngine {
     const x = clamp(v, 0, 1) * (Math.PI / 2);
     this.cueToPhones.gain.setTargetAtTime(Math.cos(x), t, 0.05);
     this.masterToPhones.gain.setTargetAtTime(Math.sin(x), t, 0.05);
+    debugLog('param', 'cueMix', undefined, { v });
   }
 
   setPhonesLevel(v: number): void {
     this.phonesGain.gain.setTargetAtTime(clamp(v, 0, 1.5), this.ctx.currentTime, 0.05);
+    debugLog('param', 'phonesLevel', undefined, { v });
   }
 
   // ─── Loops & hotcues ─────────────────────────────────────────────────────
@@ -1009,6 +1066,7 @@ export class DJEngine {
     if (wasPlaying) this.pause(id);
     d.loopStart = start;
     d.loopEnd = end;
+    debugLog('transport', 'loop set', id, { start, end });
     if (wasPlaying) this.play(id, { offset: pos });
   }
 
@@ -1070,6 +1128,7 @@ export class DJEngine {
     d.fader.gain.exponentialRampToValueAtTime(targetLevel, barTime + beatSec);
 
     src.start(barTime, 0);
+    debugLog('transport', 'ai loop dropped', id, { tempo, barTime });
     return barTime;
   }
 

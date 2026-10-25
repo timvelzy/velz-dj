@@ -52,6 +52,18 @@ class WsolaProcessor extends AudioWorkletProcessor {
   private lastA = -1; // absolute input index of last grain start (-1 = uninitialized)
   private channels = 2;
 
+  private resyncCount = 0;
+  private errorCount = 0;
+
+  /** Report a worklet-side event to the main thread (engine logs it, throttled). */
+  private report(type: string, extra?: Record<string, unknown>): void {
+    try {
+      this.port.postMessage({ type, ...(extra ?? {}) });
+    } catch {
+      /* port closed — nothing to do */
+    }
+  }
+
   constructor() {
     super();
     this.port.onmessage = (e: MessageEvent) => {
@@ -98,7 +110,21 @@ class WsolaProcessor extends AudioWorkletProcessor {
       const aNom = this.lastA + Ha;
       // Do we have enough input? need [aNom - TOL, aNom + TOL + N)
       if (aNom + TOL + N > this.inWrite) return false;
-      if (aNom - TOL < this.inWrite - RING_SIZE) return false; // overrun; resync
+      if (aNom - TOL < this.inWrite - RING_SIZE) {
+        // OVERRUN (dropout hardening): the read pointer fell more than a
+        // full ring behind the write pointer — sustained tempo < 1, or a
+        // long stall, can get here. The old code returned false forever,
+        // which meant permanent silence with the transport still running.
+        // Resync instead: drop the stale input and restart grains from the
+        // freshest full grain on the next step. Costs one brief click;
+        // audio comes back instead of dying.
+        this.lastA = -1;
+        this.ola[0].fill(0);
+        this.ola[1].fill(0);
+        this.resyncCount++;
+        this.report('wsola-resync', { count: this.resyncCount });
+        return false;
+      }
 
       // Skip search on near-silence (saves CPU, avoids garbage matches)
       let tailEnergy = 0;
@@ -164,7 +190,41 @@ class WsolaProcessor extends AudioWorkletProcessor {
     return true;
   }
 
+  /**
+   * Guarded entry point: a processor exception used to risk killing this
+   * deck's audio while the engine's transport kept running. Now any throw
+   * resets the stretch state, reports once over the port, and outputs
+   * silence for just this quantum — the next quantum plays again.
+   */
   process(inputs: Float32Array[][], outputs: Float32Array[][]): boolean {
+    try {
+      return this.processInner(inputs, outputs);
+    } catch (err) {
+      this.lastA = -1;
+      this.ola[0].fill(0);
+      this.ola[1].fill(0);
+      this.outCount = 0;
+      this.errorCount++;
+      this.report('wsola-error', { count: this.errorCount, message: String(err) });
+      // Zero this quantum's output if the output block is well-formed.
+      // (Guarded: a malformed block must not turn the guard itself into
+      // a second throw.)
+      try {
+        const output = outputs[0];
+        if (output) {
+          for (let i = 0; i < output.length; i++) {
+            const ch = output[i] as unknown;
+            if (ch && typeof (ch as Float32Array).fill === 'function') (ch as Float32Array).fill(0);
+          }
+        }
+      } catch {
+        /* give up on this quantum */
+      }
+      return true;
+    }
+  }
+
+  private processInner(inputs: Float32Array[][], outputs: Float32Array[][]): boolean {
     const input = inputs[0];
     const output = outputs[0];
     if (!input || input.length === 0 || !output || output.length === 0) return true;

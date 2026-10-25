@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { engine } from '../audio/engine';
 import { LoopQueue, type GeneratedLoop, type QueueState } from '../audio/ai';
+import type { BandPeaks } from '../types';
 import { midi } from '../midi';
 import Waveform from './Waveform';
 
@@ -11,11 +12,18 @@ interface AIDeckProps {
   onDropLoop: (loop: GeneratedLoop) => void;
   isPlaying: boolean;
   onStop: () => void;
+  onPlay: () => void;
+  onPause: () => void;
+  onCueDown: () => void;
+  onCueUp: () => void;
+  onSetCue: () => void;
+  aiCue: number;
   currentLoop: GeneratedLoop | null;
   buffer: AudioBuffer | null;
+  peaks: BandPeaks | null;
 }
 
-export default function AIDeck({ queue, masterBpm, masterKey, onDropLoop, isPlaying, onStop, currentLoop, buffer }: AIDeckProps) {
+export default function AIDeck({ queue, masterBpm, masterKey, onDropLoop, isPlaying, onStop, onPlay, onPause, onCueDown, onCueUp, onSetCue, aiCue, currentLoop, buffer, peaks }: AIDeckProps) {
   const [qs, setQs] = useState<QueueState>(queue.state);
   const [style, setStyle] = useState('deep house drums');
   const [bars, setBars] = useState<4 | 8>(4);
@@ -25,7 +33,8 @@ export default function AIDeck({ queue, masterBpm, masterKey, onDropLoop, isPlay
 
   useEffect(() => {
     const regs = [
-      midi.registerControl('deckC.play', { kind: 'button', onButton: (p) => { if (p) { isPlaying ? onStop() : void 0; } } }),
+      // Play button toggles like the regular decks (it used to only stop).
+      midi.registerControl('deckC.play', { kind: 'button', onButton: (p) => { if (p) { isPlaying ? onPause() : onPlay(); } } }),
       midi.registerControl('deckC.drop', {
         kind: 'button',
         onButton: (p) => {
@@ -123,6 +132,52 @@ export default function AIDeck({ queue, masterBpm, masterKey, onDropLoop, isPlay
         </div>
       )}
 
+      {/* Transport — same feel as the regular decks: play/pause, momentary
+          CUE preview, STOP back to cue, SET CUE. AI loops are pre-generated
+          buffers, so cue = a position inside the current loop (default: the
+          loop start); the loop itself keeps looping from its bar-aligned
+          loop points, like a regular deck with a loop engaged. */}
+      <div className="mb-2 flex flex-wrap items-center gap-1.5">
+        <button
+          onClick={isPlaying ? onPause : onPlay}
+          disabled={!buffer}
+          className="rounded bg-violet-700 px-3 py-1 text-xs font-bold text-white hover:bg-violet-600 disabled:opacity-40"
+        >
+          {isPlaying ? '❚❚ Pause' : '▶ Play'}
+        </button>
+        <button
+          onPointerDown={(e) => { e.preventDefault(); onCueDown(); }}
+          onPointerUp={onCueUp}
+          onPointerLeave={onCueUp}
+          onPointerCancel={onCueUp}
+          disabled={!buffer}
+          className="rounded bg-orange-900/60 px-3 py-1 text-xs font-bold text-orange-300 hover:bg-orange-800 disabled:opacity-40"
+        >
+          CUE
+        </button>
+        <button
+          onClick={onStop}
+          disabled={!buffer}
+          className="rounded bg-zinc-800 px-3 py-1 text-xs font-bold text-zinc-300 hover:bg-zinc-700 disabled:opacity-40"
+        >
+          ■ Stop
+        </button>
+        <button
+          onClick={onSetCue}
+          disabled={!buffer}
+          className="rounded bg-zinc-800 px-2 py-1 text-xs text-zinc-400 hover:bg-zinc-700 disabled:opacity-40"
+          title="Set cue point to current position"
+        >
+          Set cue
+        </button>
+        <span className="font-mono text-[11px] text-zinc-500">
+          cue {aiCue.toFixed(1)}s
+        </span>
+        {!buffer && (
+          <span className="text-[11px] text-zinc-600">Drop a loop from the queue to enable transport.</span>
+        )}
+      </div>
+
       {buffer && (
         <Waveform
           deckId="deckC"
@@ -133,6 +188,7 @@ export default function AIDeck({ queue, masterBpm, masterKey, onDropLoop, isPlay
           loop={null}
           hotcues={[]}
           onSeek={(t) => engine.seek('deckC', t)}
+          peaks={peaks}
         />
       )}
 
