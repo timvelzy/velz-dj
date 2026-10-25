@@ -1028,9 +1028,10 @@ export default function App() {
         } : null}
       />
 
-      {/* Decks + mixer in stacked columns: AI under Deck A, FX +
-          sampler under Deck B, mixer alone in the center — saves
-          the vertical space the old full-width rows took. */}
+      {/* Decks + mixer in stacked columns: AI under Deck A, sampler
+          channel in the center under the mixer (next to the AI
+          channel), FX under Deck B — saves the vertical space the
+          old full-width rows took. */}
       <main className="grid items-start gap-3 p-3 lg:grid-cols-[1fr_340px_1fr]">
         {/* Left column: Deck A, then the AI deck underneath it. */}
         <div className="flex flex-col gap-3">
@@ -1064,20 +1065,25 @@ export default function App() {
             onLyriaKeyChange={applyLyriaKey}
           />
         </div>
-        {/* Center column: mixer alone. */}
-        <Mixer
-          chA={chA} chB={chB} chC={chC}
-          setChA={setChA} setChB={setChB} setChC={setChC}
-          crossfader={crossfader}
-          setCrossfader={(v) => { setCrossfader(v); engine.setCrossfader(v); }}
-          masterVol={masterVol}
-          setMasterVol={(v) => { setMasterVol(v); engine.setMasterVolume(v); }}
-          cueMix={cueMix}
-          setCueMix={(v) => { setCueMix(v); engine.setCueMix(v); }}
-          phonesLevel={phonesLevel}
-          setPhonesLevel={(v) => { setPhonesLevel(v); engine.setPhonesLevel(v); }}
-        />
-        {/* Right column: Deck B, then FX, then the sampler. */}
+        {/* Center column: mixer, then the sampler as its own channel
+            next to the AI channel (left column, under Deck A). */}
+        <div className="flex flex-col gap-3">
+          <Mixer
+            chA={chA} chB={chB} chC={chC}
+            setChA={setChA} setChB={setChB} setChC={setChC}
+            crossfader={crossfader}
+            setCrossfader={(v) => { setCrossfader(v); engine.setCrossfader(v); }}
+            masterVol={masterVol}
+            setMasterVol={(v) => { setMasterVol(v); engine.setMasterVolume(v); }}
+            cueMix={cueMix}
+            setCueMix={(v) => { setCueMix(v); engine.setCueMix(v); }}
+            phonesLevel={phonesLevel}
+            setPhonesLevel={(v) => { setPhonesLevel(v); engine.setPhonesLevel(v); }}
+          />
+          {/* Sampler — own channel (VOL + MUTE) feeding the master */}
+          <Sampler />
+        </div>
+        {/* Right column: Deck B, then FX. */}
         <div className="flex flex-col gap-3">
           <div
             onDragOver={(e) => e.preventDefault()}
@@ -1091,8 +1097,6 @@ export default function App() {
           </div>
           {/* FX unit — beat-synced send/return */}
           <FxUnit />
-          {/* Sampler */}
-          <Sampler />
         </div>
       </main>
 
