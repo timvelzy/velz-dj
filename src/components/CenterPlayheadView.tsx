@@ -82,7 +82,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { engine } from '../audio/engine';
 import type { BandPeaks, BeatGrid } from '../types';
-import { bandColor } from '../audio/peaks';
+import { amplitudeRGB, bucketAmplitude } from '../audio/peaks';
 
 export interface TopDeckView {
   label: string;
@@ -278,21 +278,39 @@ function TopWaveformRow({ deck, pxPerSec, height }: RowProps) {
       const midY = h / 2;
       const halfH = h / 2 - 6;
 
-      // Waveform — band-colored when peaks exist, deck accent otherwise.
+      // Waveform — groove ScrollingWaveformRenderer method: color varies
+      // with playback amplitude (quiet deep blue → cyan → green/yellow
+      // → loud orange/red), each bar with a vertical gradient (lighter
+      // top, base middle, darker bottom) and played/unplayed alpha
+      // (0.95 / 0.65). The previous dominant-band coloring read almost
+      // entirely green because the analysis "mid" band is effectively
+      // the full unfiltered signal (peaking filter, gain 0dB), so it
+      // won the max-band pick on nearly every bucket. The black
+      // unplayed dim overlay is gone — per-bar alpha does that job now,
+      // so upcoming colors stay visible instead of dulled. Bar height
+      // is groove's sqrt(amplitude) scaling, symmetric around midY.
       if (deck.peaks) {
         const rate = deck.peaks.rate;
         const b0 = Math.max(0, Math.floor(viewStart * rate));
         const b1 = Math.min(deck.peaks.min.length - 1, Math.ceil(viewEnd * rate));
         const bw = Math.max(1, pxPerSec / rate);
-        for (let b = b0; b <= b1; b++) {
-          const x = t2x(b / rate);
-          const top = Math.min(1, deck.peaks.max[b]) * halfH;
-          const bot = Math.min(1, -deck.peaks.min[b]) * halfH;
-          ctx.fillStyle = bandColor(deck.peaks, b);
-          ctx.globalAlpha = 0.95;
-          ctx.fillRect(x, midY - top, bw, Math.max(1, top + bot));
-        }
+        const maxBar = h * 0.85;
         ctx.globalAlpha = 1;
+        for (let b = b0; b <= b1; b++) {
+          const amp = bucketAmplitude(deck.peaks, b);
+          if (amp < 0.005) continue;
+          const barH = Math.max(4, Math.sqrt(Math.min(1, amp)) * maxBar);
+          const x = t2x(b / rate);
+          const alpha = b / rate <= pos ? 0.95 : 0.65;
+          const [r, g, bl] = amplitudeRGB(deck.peaks, b);
+          const grad = ctx.createLinearGradient(0, midY - barH / 2, 0, midY + barH / 2);
+          grad.addColorStop(0, `rgba(${Math.min(255, r + 40)}, ${Math.min(255, g + 40)}, ${Math.min(255, bl + 40)}, ${alpha})`);
+          grad.addColorStop(0.3, `rgba(${r}, ${g}, ${bl}, ${alpha})`);
+          grad.addColorStop(0.7, `rgba(${r}, ${g}, ${bl}, ${alpha})`);
+          grad.addColorStop(1, `rgba(${Math.max(0, r - 30)}, ${Math.max(0, g - 30)}, ${Math.max(0, bl - 30)}, ${alpha})`);
+          ctx.fillStyle = grad;
+          ctx.fillRect(x, midY - barH / 2, bw, barH);
+        }
       } else if (mono) {
         ctx.fillStyle = deck.color;
         const bucketDur = dur / mono.length;
@@ -307,15 +325,6 @@ function TopWaveformRow({ deck, pxPerSec, height }: RowProps) {
         }
         ctx.globalAlpha = 1;
       }
-
-      // Unplayed region dimmed — drawn BEFORE the beatgrid so grid lines
-      // stay full-strength over the dimmed upcoming audio (beatgrid
-      // contrast against the vivid band colors). With the unclamped
-      // window, px is identically centerX: played audio left of the
-      // line, upcoming audio right of it.
-      const px = t2x(pos);
-      ctx.fillStyle = 'rgba(0,0,0,0.30)';
-      ctx.fillRect(Math.max(0, px), 0, w - Math.max(0, px), h);
 
       // Beatgrid overlay, groove style: deck-colored lines drawn OVER the
       // colors — downbeats solid + thick, off-beats dashed + thin, with a

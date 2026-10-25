@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { engine } from '../audio/engine';
 import type { BandPeaks, BeatGrid } from '../types';
-import { bandColor, resamplePeaks } from '../audio/peaks';
+import { amplitudeRGB, resamplePeaks } from '../audio/peaks';
 
 interface WaveformProps {
   deckId: 'deckA' | 'deckB' | 'deckC';
@@ -94,9 +94,13 @@ export default function Waveform({
         ctx.strokeRect(t2x(loop.start) + 0.5, 0.5, (loop.end - loop.start) * pxPerSec - 1, h - 1);
       }
 
-      // Waveform — band-colored when precomputed peaks are available
-      // (Rekordbox-style: color = dominant frequency band per bucket),
-      // otherwise the classic single-color mono peaks.
+      // Waveform — groove amplitude-banded colors when precomputed peaks
+      // are available (quiet deep blue → cyan → green/yellow → loud
+      // orange/red, with a vertical gradient per bar), otherwise the
+      // classic single-color mono peaks. The previous dominant-band
+      // coloring read almost entirely green: the analysis "mid" band
+      // is effectively the full unfiltered signal, so it won the
+      // max-band pick on nearly every bucket.
       const midY = h / 2;
       const halfH = h / 2 - 4;
       if (bandPeaks) {
@@ -108,7 +112,13 @@ export default function Waveform({
           const x = t2x(b / rate);
           const top = Math.min(1, bandPeaks.max[b]) * halfH;
           const bot = Math.min(1, -bandPeaks.min[b]) * halfH;
-          ctx.fillStyle = bandColor(bandPeaks, b);
+          const [r, g, bl] = amplitudeRGB(bandPeaks, b);
+          const grad = ctx.createLinearGradient(0, midY - top, 0, midY + bot);
+          grad.addColorStop(0, `rgba(${Math.min(255, r + 40)}, ${Math.min(255, g + 40)}, ${Math.min(255, bl + 40)}, 1)`);
+          grad.addColorStop(0.3, `rgba(${r}, ${g}, ${bl}, 1)`);
+          grad.addColorStop(0.7, `rgba(${r}, ${g}, ${bl}, 1)`);
+          grad.addColorStop(1, `rgba(${Math.max(0, r - 30)}, ${Math.max(0, g - 30)}, ${Math.max(0, bl - 30)}, 1)`);
+          ctx.fillStyle = grad;
           ctx.globalAlpha = 0.95;
           ctx.fillRect(x, midY - top, bw, Math.max(1, top + bot));
         }
@@ -328,7 +338,13 @@ export function OverviewWaveform({ deckId, buffer, peaks, grid, color, loop, hot
           const x = (b / n) * w;
           const top = Math.min(1, small.max[b]) * (midY - 2);
           const bot = Math.min(1, -small.min[b]) * (midY - 2);
-          ctx.fillStyle = bandColor(small, b);
+          const [r, g, bl] = amplitudeRGB(small, b);
+          const grad = ctx.createLinearGradient(0, midY - top, 0, midY + bot);
+          grad.addColorStop(0, `rgba(${Math.min(255, r + 40)}, ${Math.min(255, g + 40)}, ${Math.min(255, bl + 40)}, 1)`);
+          grad.addColorStop(0.3, `rgba(${r}, ${g}, ${bl}, 1)`);
+          grad.addColorStop(0.7, `rgba(${r}, ${g}, ${bl}, 1)`);
+          grad.addColorStop(1, `rgba(${Math.max(0, r - 30)}, ${Math.max(0, g - 30)}, ${Math.max(0, bl - 30)}, 1)`);
+          ctx.fillStyle = grad;
           ctx.globalAlpha = 0.9;
           ctx.fillRect(x, midY - top, bw, Math.max(1, top + bot));
         }
