@@ -51,6 +51,7 @@ export const BINDABLE_CONTROLS: BindableControl[] = [
   { id: 'deckA.keyLock', label: 'Key lock', group: 'Deck A' },
   { id: 'deckA.loopIn', label: 'Loop in', group: 'Deck A' },
   { id: 'deckA.loopOut', label: 'Loop out', group: 'Deck A' },
+  { id: 'deckA.loopExit', label: 'Loop exit (keep playing)', group: 'Deck A' },
   // Deck B
   { id: 'deckB.play', label: 'Play / Pause', group: 'Deck B' },
   { id: 'deckB.cue', label: 'Cue', group: 'Deck B' },
@@ -62,6 +63,7 @@ export const BINDABLE_CONTROLS: BindableControl[] = [
   { id: 'deckB.keyLock', label: 'Key lock', group: 'Deck B' },
   { id: 'deckB.loopIn', label: 'Loop in', group: 'Deck B' },
   { id: 'deckB.loopOut', label: 'Loop out', group: 'Deck B' },
+  { id: 'deckB.loopExit', label: 'Loop exit (keep playing)', group: 'Deck B' },
   // Mixer
   { id: 'mixer.crossfader', label: 'Crossfader', group: 'Mixer' },
   { id: 'mixer.chA.fader', label: 'Ch A fader', group: 'Mixer' },

@@ -1070,6 +1070,25 @@ export class DJEngine {
     if (wasPlaying) this.play(id, { offset: pos });
   }
 
+  /**
+   * Loop-out (Traktor loop exit): release the loop and keep playing
+   * forward from the current position. It never jumps back to the track
+   * start or to the loop end — pause() captures the exact wrapped
+   * position, the loop state is cleared, and play() restarts from that
+   * same position with no loop region.
+   */
+  exitLoop(id: string): void {
+    const d = this.decks.get(id);
+    if (!d) return;
+    const wasPlaying = !!d.source;
+    const pos = this.position(id);
+    if (wasPlaying) this.pause(id);
+    d.loopStart = null;
+    d.loopEnd = null;
+    debugLog('transport', 'loop exit', id, { at: pos, wasPlaying });
+    if (wasPlaying) this.play(id, { offset: pos });
+  }
+
   // ─── AI loop drop-in ──────────────────────────────────────────────────────
   // Schedules a generated loop to start exactly on the next master bar
   // boundary with a 1-beat fade-in.
