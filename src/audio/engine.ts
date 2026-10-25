@@ -92,6 +92,17 @@ export interface SamplerPad {
   source: AudioBufferSourceNode | null; // currently playing voice (for retrigger)
 }
 
+/** Pads are one-shots: deck→sampler recordings cap at 30s with auto-stop. */
+const SAMPLER_RECORD_MAX_SECONDS = 30;
+
+/** One in-flight deck→sampler recording (single session at a time). */
+interface DeckRecordSession {
+  deckId: string;
+  left: Float32Array[];
+  right: Float32Array[];
+  timer: number | null;
+}
+
 export class DJEngine {
   ctx!: AudioContext;
   private workletReady = false;
@@ -146,6 +157,15 @@ export class DJEngine {
     buffer: null, name: '', volume: 0.8, source: null,
   }));
   samplerQuantize = false;
+
+  // Sampler channel mute (level kept so unmute restores it)
+  private samplerMuted = false;
+  private samplerLevel = 0.9;
+
+  // Deck → sampler recording (one session at a time)
+  private deckRecordNode: AudioWorkletNode | null = null;
+  private deckRecordSession: DeckRecordSession | null = null;
+  private deckRecordPending: AudioBuffer | null = null;
 
   // Device routing (master + headphones on separate devices via setSinkId)
   private masterDest!: MediaStreamAudioDestinationNode;
@@ -1236,11 +1256,137 @@ export class DJEngine {
 
   setSamplerMaster(v: number): void {
     if (!this.ctx) return;
-    this.samplerMaster.gain.setTargetAtTime(Math.min(1, Math.max(0, v)), this.ctx.currentTime, 0.02);
+    this.samplerLevel = Math.min(1, Math.max(0, v));
+    this.samplerMaster.gain.setTargetAtTime(
+      this.samplerMuted ? 0 : this.samplerLevel, this.ctx.currentTime, 0.02);
+  }
+
+  setSamplerMuted(muted: boolean): void {
+    if (!this.ctx) return;
+    this.samplerMuted = muted;
+    this.samplerMaster.gain.setTargetAtTime(
+      muted ? 0 : this.samplerLevel, this.ctx.currentTime, 0.02);
+  }
+
+  isSamplerMuted(): boolean {
+    return this.samplerMuted;
   }
 
   setSamplerQuantize(on: boolean): void {
     this.samplerQuantize = on;
+  }
+
+  // ─── Deck → sampler recording ─────────────────────────────────────
+  // Tap: the deck's `fader` output — post-trim/EQ/filter, post-channel
+  // fader, pre-crossfader. That is the deck's own channel sound (what
+  // the DJ hears from that deck, EQ + fader applied) regardless of
+  // crossfader position, so a cued deck can be sampled while it is
+  // crossfaded out. FX return is NOT included (it feeds masterBus
+  // separately). The tap is parallel — fader → record node in addition
+  // to fader → xfade — so recording never interrupts the playing deck
+  // or the master output. The recorder worklet outputs silence; its
+  // output feeds masterDest (zeros, inaudible), the same pattern as the
+  // master recorder tap, so the node stays pulled. Pads are one-shots,
+  // so recordings cap at 30s with an auto-stop.
+
+  startDeckRecord(deckId: string): boolean {
+    if (!this.ctx || !this.workletReady || !this.masterDest) return false;
+    if (this.deckRecordSession) return false;
+    const d = this.decks.get(deckId);
+    if (!d || !d.buffer || !this.isPlaying(deckId)) return false;
+    if (!this.deckRecordNode) {
+      const node = new AudioWorkletNode(this.ctx, 'velz-recorder', {
+        numberOfInputs: 1,
+        numberOfOutputs: 1,
+        outputChannelCount: [2],
+      });
+      node.port.onmessage = (e: MessageEvent) => {
+        const m = e.data as { type?: string; left?: Float32Array; right?: Float32Array };
+        if (m?.type === 'data' && this.deckRecordSession) {
+          if (m.left) this.deckRecordSession.left.push(m.left);
+          if (m.right) this.deckRecordSession.right.push(m.right);
+        }
+      };
+      node.connect(this.masterDest);
+      this.deckRecordNode = node;
+    }
+    try {
+      d.fader.connect(this.deckRecordNode);
+    } catch {
+      return false;
+    }
+    const session: DeckRecordSession = { deckId, left: [], right: [], timer: null };
+    session.timer = window.setTimeout(() => {
+      void this.finishDeckRecord(true);
+    }, SAMPLER_RECORD_MAX_SECONDS * 1000);
+    this.deckRecordSession = session;
+    this.deckRecordNode.port.postMessage({ type: 'start' });
+    debugLog('audio', 'record start', deckId, {});
+    return true;
+  }
+
+  isDeckRecording(): boolean {
+    return !!this.deckRecordSession;
+  }
+
+  /** Manual stop: returns the captured buffer (null if nothing captured). */
+  async stopDeckRecord(): Promise<AudioBuffer | null> {
+    return this.finishDeckRecord(false);
+  }
+
+  /** Buffer assembled by an auto-stop (cap reached); the UI takes it once. */
+  takePendingRecord(): AudioBuffer | null {
+    const b = this.deckRecordPending;
+    this.deckRecordPending = null;
+    return b;
+  }
+
+  private async finishDeckRecord(auto: boolean): Promise<AudioBuffer | null> {
+    const session = this.deckRecordSession;
+    if (!session) return null;
+    this.deckRecordSession = null;
+    if (session.timer !== null) window.clearTimeout(session.timer);
+    const d = this.decks.get(session.deckId);
+    try {
+      d?.fader.disconnect(this.deckRecordNode as AudioWorkletNode);
+    } catch {
+      // Tap was already disconnected.
+    }
+    this.deckRecordNode?.port.postMessage({ type: 'stop' });
+    // The worklet flushes its partial block asynchronously; give the port
+    // message a moment to land before assembling.
+    await new Promise((r) => setTimeout(r, 120));
+    const buffer = this.assembleRecordBuffer(session.left, session.right);
+    if (auto) this.deckRecordPending = buffer;
+    debugLog('audio', auto ? 'record auto-stop' : 'record stop', session.deckId, {
+      seconds: buffer?.duration ?? 0,
+    });
+    return buffer;
+  }
+
+  private assembleRecordBuffer(left: Float32Array[], right: Float32Array[]): AudioBuffer | null {
+    const total = left.reduce((n, c) => n + c.length, 0);
+    if (total === 0) return null;
+    const sr = this.ctx.sampleRate;
+    const buffer = this.ctx.createBuffer(2, total, sr);
+    const l = buffer.getChannelData(0);
+    const r = buffer.getChannelData(1);
+    let o = 0;
+    for (let i = 0; i < left.length; i++) {
+      l.set(left[i], o);
+      r.set(right[i] ?? left[i], o);
+      o += left[i].length;
+    }
+    // Short fades at both ends so the cut never clicks.
+    const fade = Math.min(Math.floor(sr * 0.005), Math.floor(total / 2));
+    for (let i = 0; i < fade; i++) {
+      const g = i / fade;
+      l[i] *= g;
+      r[i] *= g;
+      l[total - 1 - i] *= g;
+      r[total - 1 - i] *= g;
+    }
+    return buffer;
   }
 
   /** Find seconds until the next beat on the reference deck (master or first playing deck with a grid). */

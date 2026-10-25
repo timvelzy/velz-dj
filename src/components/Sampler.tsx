@@ -112,8 +112,22 @@ export default function Sampler() {
   );
   const [quantize, setQuantize] = useState(false);
   const [master, setMaster] = useState(0.9);
+  const [muted, setMuted] = useState(false);
   const [open, setOpen] = useState(true);
   const flashTimers = useRef<number[]>([]);
+
+  // Deck → sampler recording: source deck, target pad, live state.
+  const [recDeck, setRecDeck] = useState<'A' | 'B'>('A');
+  const [recPad, setRecPad] = useState(0);
+  const [recording, setRecording] = useState(false);
+  const [recElapsed, setRecElapsed] = useState(0);
+  const [recError, setRecError] = useState<string | null>(null);
+  const recStartAt = useRef(0);
+  const autoStopSeenAt = useRef(0);
+  const recPadRef = useRef(0);
+  const recDeckRef = useRef<'A' | 'B'>('A');
+  recPadRef.current = recPad;
+  recDeckRef.current = recDeck;
 
   const refreshPad = useCallback((i: number) => {
     const p = engine.pads[i];
@@ -157,6 +171,62 @@ export default function Sampler() {
     engine.setPadVolume(i, v);
     refreshPad(i);
   }, [refreshPad]);
+
+  const toggleMute = useCallback(() => {
+    setMuted((m) => {
+      engine.setSamplerMuted(!m);
+      return !m;
+    });
+  }, []);
+
+  const startRec = useCallback(() => {
+    setRecError(null);
+    const deckId = recDeckRef.current === 'A' ? 'deckA' : 'deckB';
+    if (!engine.startDeckRecord(deckId)) {
+      setRecError(`Start Deck ${recDeckRef.current} playing first (or stop the current recording).`);
+      return;
+    }
+    autoStopSeenAt.current = 0;
+    recStartAt.current = Date.now();
+    setRecElapsed(0);
+    setRecording(true);
+  }, []);
+
+  const finishRecToPad = useCallback((buffer: AudioBuffer | null) => {
+    if (buffer) {
+      engine.loadSample(recPadRef.current, buffer, `Deck ${recDeckRef.current} rec`);
+      refreshPad(recPadRef.current);
+      flash(recPadRef.current);
+    } else {
+      setRecError('No audio captured — was the deck still playing?');
+    }
+  }, [refreshPad, flash]);
+
+  const stopRec = useCallback(async () => {
+    setRecording(false);
+    const buffer = await engine.stopDeckRecord();
+    finishRecToPad(buffer);
+  }, [finishRecToPad]);
+
+  // While recording: elapsed clock + auto-stop detection (the 30s cap
+  // stops the engine session; the UI picks up the finished buffer a
+  // tick later, once the worklet flush has landed).
+  useEffect(() => {
+    if (!recording) return;
+    const timer = window.setInterval(() => {
+      setRecElapsed((Date.now() - recStartAt.current) / 1000);
+      if (!engine.isDeckRecording()) {
+        if (!autoStopSeenAt.current) {
+          autoStopSeenAt.current = Date.now();
+        } else if (Date.now() - autoStopSeenAt.current > 250) {
+          window.clearInterval(timer);
+          setRecording(false);
+          finishRecToPad(engine.takePendingRecord());
+        }
+      }
+    }, 250);
+    return () => window.clearInterval(timer);
+  }, [recording, finishRecToPad]);
 
   // Keyboard triggers 1-8
   useEffect(() => {
@@ -245,7 +315,68 @@ export default function Sampler() {
               }}
             />
           </label>
+          <button
+            onClick={toggleMute}
+            title="Mute the sampler channel"
+            className={`rounded px-2 py-0.5 text-[10px] font-mono font-bold ${
+              muted ? 'bg-red-900/60 text-red-300' : 'bg-zinc-800 text-zinc-400 hover:text-zinc-200'
+            }`}
+          >
+            {muted ? 'MUTED' : 'MUTE'}
+          </button>
         </div>
+      </div>
+      {/* Record from a playing deck into a pad. Tap is parallel to the
+          deck output, so recording never interrupts the deck or master. */}
+      <div className="flex flex-wrap items-center gap-2 mb-2 rounded border border-zinc-800 bg-black/30 px-2 py-1.5">
+        <span className="text-[10px] font-mono text-zinc-400 tracking-widest">REC FROM DECK</span>
+        <select
+          value={recDeck}
+          disabled={recording}
+          onChange={(e) => setRecDeck(e.target.value as 'A' | 'B')}
+          className="h-6 rounded border border-zinc-700 bg-zinc-900 px-1 text-[11px] text-zinc-200 disabled:opacity-40"
+        >
+          <option value="A">Deck A</option>
+          <option value="B">Deck B</option>
+        </select>
+        <span className="text-[10px] font-mono text-zinc-500">→ PAD</span>
+        <select
+          value={recPad}
+          disabled={recording}
+          onChange={(e) => setRecPad(Number(e.target.value))}
+          className="h-6 rounded border border-zinc-700 bg-zinc-900 px-1 text-[11px] text-zinc-200 disabled:opacity-40"
+        >
+          {pads.map((_, i) => (
+            <option key={i} value={i}>{i + 1}{pads[i].loaded ? ` (${pads[i].name})` : ''}</option>
+          ))}
+        </select>
+        {recording ? (
+          <button
+            onClick={stopRec}
+            className="h-6 rounded bg-red-700 px-2.5 text-[11px] font-bold text-white hover:bg-red-600"
+          >
+            ■ STOP
+          </button>
+        ) : (
+          <button
+            onClick={startRec}
+            className="h-6 rounded bg-zinc-800 px-2.5 text-[11px] font-bold text-red-300 hover:bg-zinc-700"
+          >
+            ● REC
+          </button>
+        )}
+        {recording && (
+          <span className="flex items-center gap-1.5 text-[11px] font-mono text-red-300">
+            <span className="h-2 w-2 rounded-full bg-red-500 animate-pulse" />
+            REC {recElapsed.toFixed(0)}s / 30s
+          </span>
+        )}
+        {recError && (
+          <span className="text-[11px] text-amber-300">{recError}</span>
+        )}
+        {!recording && !recError && (
+          <span className="text-[10px] font-mono text-zinc-600">records the playing deck, max 30s</span>
+        )}
       </div>
       <div
         className="grid grid-cols-4 gap-1.5"
