@@ -29,6 +29,33 @@ import type { BeatGrid } from '../types';
 /** Traktor loop sizes, in bars. 1/2 bar = 2 beats. */
 export const LOOP_SIZES: number[] = [0.5, 1, 2, 4, 8, 16, 32];
 
+/**
+ * Bar-phase residue (0..3) of a grid: beat-map indices i with
+ * (i - barPhase) % 4 === 0 are downbeats. Explicit barPhase wins (set by
+ * auto-1.1 analysis or manual Set 1.1); otherwise derived from
+ * downbeatOffset (nearest mapped beat) so legacy grids keep the downbeat
+ * the detector and the loop code already used; otherwise 0 (the
+ * historical beats[0]-is-downbeat convention). Every bar-phase consumer
+ * (engine launch/quantize, waveform and top-view markers, loop barlines
+ * via downbeatOffset) reads through this so the whole app agrees on 1.1.
+ */
+export function barPhaseOf(grid: BeatGrid): number {
+  if (typeof grid.barPhase === 'number' && grid.barPhase >= 0 && grid.barPhase <= 3) {
+    return Math.floor(grid.barPhase);
+  }
+  if (grid.beats.length > 0 && grid.downbeatOffset >= 0) {
+    const j = lastIndexAtOrBefore(grid.beats, grid.downbeatOffset);
+    let best = j >= 0 ? j : 0;
+    if (j + 1 < grid.beats.length) {
+      const d0 = j >= 0 ? Math.abs(grid.beats[j] - grid.downbeatOffset) : Infinity;
+      const d1 = Math.abs(grid.beats[j + 1] - grid.downbeatOffset);
+      if (d1 < d0) best = j + 1;
+    }
+    return ((best % 4) + 4) % 4;
+  }
+  return 0;
+}
+
 export interface BarLoop {
   start: number;
   end: number;

@@ -19,6 +19,7 @@ import type { BeatGrid } from '../types';
 import wsolaWorkletUrl from './wsola-processor.ts?worker&url';
 import recorderWorkletUrl from './recorder-processor.ts?worker&url';
 import { debugLog } from './debugLog';
+import { barPhaseOf } from './loop';
 
 export interface DeckNodes {
   id: string;
@@ -97,8 +98,11 @@ export function nextBoundaryWaitBeats(mBeats: number, cycleBeats: number, minAhe
 
 /**
  * First downbeat-phase beat at/after `cuePoint` on this grid (the engine's
- * phase convention: beat index % 4 === 0 is a downbeat). Falls back to
- * flat downbeatOffset/firstBeat math when the map is thin. Pure.
+ * phase convention: beat indices i with (i - barPhase) % 4 === 0 are
+ * downbeats, where barPhase comes from barPhaseOf() — explicit anchor or
+ * derived from downbeatOffset — so a manual Set 1.1 or auto-1.1 anchor
+ * moves every downbeat computation together). Falls back to flat
+ * downbeatOffset/firstBeat math when the map is thin. Pure.
  */
 export function downbeatOffsetFor(grid: BeatGrid, cuePoint: number, duration: number): number {
   if (grid.beats.length > 0) {
@@ -109,7 +113,8 @@ export function downbeatOffsetFor(grid: BeatGrid, cuePoint: number, duration: nu
       else lo = mid + 1;
     }
     if (first < grid.beats.length) {
-      const j = first + ((4 - (first % 4)) % 4);
+      const phase = barPhaseOf(grid);
+      const j = first + (((phase - first) % 4) + 4) % 4;
       if (j < grid.beats.length) return grid.beats[j];
     }
   }
@@ -968,7 +973,15 @@ export class DJEngine {
     const d = this.decks.get(id);
     const mBeats = this.masterBeats();
     if (!d || !d.grid || d.grid.bpm <= 0 || mBeats === null) return cuePoint;
-    const masterBarPhase = Math.round((((mBeats % 4) + 4) % 4)) % 4;
+    // Within-bar positions, each in its own grid's phase frame: the
+    // master's fractional position relative to ITS downbeats, and the
+    // slave beat's position relative to ITS downbeats. Matching those
+    // (not raw index residues) is what keeps drops phrase-aligned when
+    // either grid has been re-anchored by Set 1.1 / auto-1.1.
+    const mGrid = this.masterDeckId ? this.decks.get(this.masterDeckId)?.grid : null;
+    const mPhase = mGrid ? barPhaseOf(mGrid) : 0;
+    const masterBarPhase = ((((Math.round(mBeats - mPhase)) % 4) + 4) % 4);
+    const sPhase = barPhaseOf(d.grid);
 
     const beats = d.grid.beats;
     if (beats.length > 0) {
@@ -981,7 +994,7 @@ export class DJEngine {
       }
       if (first < beats.length) {
         // Nearest beat at/after `first` whose bar phase matches the master
-        const phase = ((first % 4) + 4) % 4;
+        const phase = (((first - sPhase) % 4) + 4) % 4;
         const delta = (masterBarPhase - phase + 4) % 4;
         const j = first + delta;
         if (j < beats.length) return beats[j];
@@ -1094,7 +1107,14 @@ export class DJEngine {
     const mBpm = this.masterEffectiveBpm();
     if (mBeats === null || !mBpm) return null;
     const spb = 60 / mBpm;
-    const wait = nextBoundaryWaitBeats(mBeats, cycleBeats, minAheadSec / spb);
+    // Bar boundaries live on the master grid's phase: downbeats are at
+    // mBeats === barPhase (mod 4), not at 0, once the grid is re-anchored.
+    // Beat boundaries (cycle 1) are phase-free by definition.
+    const mGrid = cycleBeats === 4 && this.masterDeckId
+      ? this.decks.get(this.masterDeckId)?.grid ?? null
+      : null;
+    const phase = mGrid ? barPhaseOf(mGrid) : 0;
+    const wait = nextBoundaryWaitBeats(mBeats - phase, cycleBeats, minAheadSec / spb);
     return this.ctx.currentTime + wait * spb;
   }
 
@@ -1190,8 +1210,9 @@ export class DJEngine {
     const pos = this.position(refId);
     let next: number | undefined;
     if (mode === 'bar') {
-      // Next downbeat-phase beat (index % 4 === 0, the engine's convention)
-      next = grid.beats.find((b, i) => b > pos && i % 4 === 0);
+      // Next downbeat-phase beat (index ≡ barPhase mod 4 on that grid)
+      const phase = barPhaseOf(grid);
+      next = grid.beats.find((b, i) => b > pos && (((i - phase) % 4) + 4) % 4 === 0);
     }
     if (next === undefined) next = grid.beats.find((b) => b > pos);
     if (next === undefined) return null;

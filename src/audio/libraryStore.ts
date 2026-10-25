@@ -42,6 +42,10 @@ export interface StoredLibraryTrack {
   beatGrid: BeatGrid;
   spectralData?: SpectralData;
   peaks?: BandPeaks;
+  /** Per-slot manual hotcue overrides (null = no override, slot falls
+      back to the grid's auto hotcue). Persisted so a manual edit on a
+      slot survives reloads and fresh-file re-adds. */
+  manualHotcues?: (number | null)[];
   savedAt: string; // ISO
   /** The audio itself. Stored as the picked File; read back as a Blob. */
   file: Blob;
@@ -114,6 +118,7 @@ export function trackToRecord(track: TrackInfo): StoredLibraryTrack | null {
     beatGrid: track.beatGrid,
     spectralData: track.spectralData,
     peaks: track.peaks,
+    manualHotcues: track.manualHotcues,
     savedAt: new Date().toISOString(),
     file: track.file,
   };
@@ -153,6 +158,7 @@ export function recordToTrack(record: StoredLibraryTrack): TrackInfo | null {
     beatGrid: record.beatGrid,
     spectralData: record.spectralData,
     peaks: record.peaks,
+    manualHotcues: record.manualHotcues,
     file,
     fileKey: record.fileKey,
     restored: true,
@@ -164,6 +170,14 @@ export async function saveLibraryRecord(track: TrackInfo): Promise<void> {
   const record = trackToRecord(track);
   if (!record) return;
   await tx('readwrite', (store) => store.put(record));
+}
+
+/** One saved track by fileKey, or null. Used on fresh-file loads to
+    re-apply manual hotcue overrides (and the stored anchor) without
+    pulling the whole library. */
+export async function getLibraryRecord(fileKey: string): Promise<TrackInfo | null> {
+  const record = await tx<StoredLibraryTrack | undefined>('readonly', (store) => store.get(fileKey));
+  return record ? recordToTrack(record) : null;
 }
 
 /** All saved tracks, oldest first. Skips damaged records instead of failing. */

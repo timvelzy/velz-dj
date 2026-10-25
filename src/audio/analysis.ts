@@ -171,6 +171,13 @@ async function buildBeatMap(
             const cand = baseBpm * mult;
             if (Math.abs(localBpm - cand) / cand < 0.06) { snapped = cand; break; }
           }
+          // Dotted-eighth hijack: a section reading ~4/3 of base is
+          // locking onto the dotted grid (the reported 122 -> 163 error),
+          // not a real tempo change — the section tempo is base. A
+          // genuine 33% tempo jump inside one 8 s section of a
+          // steady-tempo track is not credible, so map it back to base
+          // instead of letting the beat map run at the dotted rate.
+          if (Math.abs(localBpm / baseBpm - 4 / 3) < 0.06) snapped = baseBpm;
           sections.push({ start: s / dsRate, bpm: snapped, weight: ok.length / ivals.length });
         }
       }
@@ -471,6 +478,216 @@ export async function analyzeSpectrum(buffer: AudioBuffer): Promise<SpectralData
   }
 }
 
+// ─── Track structure: auto 1.1 anchor + auto hotcues ────────────────────────
+
+export interface StructureAnalysis {
+  /** Downbeat time (seconds) of the auto-1.1 anchor bar, or null when no clear drop transition was found. */
+  anchorTime: number | null;
+  /** Beat-map index of the anchor downbeat (may be negative when the anchor predates the map); -1 when none. */
+  anchorBeatIndex: number;
+  /** Bar-phase residue (0..3) implied by the anchor, or null when no anchor. */
+  barPhase: number | null;
+  /** 4 auto hotcue times in seconds (null where undetectable), already snapped to downbeats. */
+  autoHotcues: (number | null)[];
+}
+
+/**
+ * Find the track's structure from its energy, reusing the already-decoded
+ * audio (one linear downsample pass, no new decode, no per-frame work):
+ *
+ * - Per-beat kick-band (160 Hz lowpass, same one-pole as detectElectronic)
+ *   and full-band mean-square energies, in 1-beat windows from t=0.
+ * - AUTO 1.1: the first beat where kick energy sustains loud for 4+ bars
+ *   after a quieter intro (sustained mean >= 0.6x the robust peak, every
+ *   bar >= 0.4x peak, and the 8 beats before it under half the 16 beats
+ *   after it). That beat becomes the grid's bar-phase origin. No such
+ *   transition (loud from the start, no clear drop) => null anchor and
+ *   the caller keeps the detector's existing downbeat behavior.
+ * - AUTO HOTCUES, all snapped to downbeats of the anchor grid:
+ *   HC1 = anchor (or the detector downbeat when no anchor),
+ *   HC2 = first drop = first large sustained rise (>= 1.5x the previous
+ *   16 beats and >= 0.5x peak) at least 32 beats after HC1, else the
+ *   loudest bar after HC1,
+ *   HC3 = breakdown = largest sustained fall (next 16 beats under 0.6x
+ *   the previous 16, staying low) in the middle of the track, else a
+ *   second rise after HC2, else the mid-track downbeat,
+ *   HC4 = outro = last sustained fall in the final 40% after which
+ *   energy stays under 0.6x peak to the end, else the last downbeat
+ *   before the final 16 bars.
+ *   Slots are kept >= 8 bars apart; a slot that cannot be placed cleanly
+ *   stays null rather than duplicating another slot.
+ * Exported for tests / harness diagnostics.
+ */
+export function analyzeStructure(
+  channelData: Float32Array,
+  sampleRate: number,
+  bpm: number,
+  beats: number[],
+  downbeatOffset: number,
+  firstBeat: number,
+  duration: number,
+): StructureAnalysis | null {
+  if (!(bpm > 0) || !(duration > 0) || channelData.length === 0) return null;
+  const spb = 60 / bpm;
+  const barDur = 4 * spb;
+  const TARGET_RATE = 8000;
+  const ratio = Math.max(1, Math.floor(sampleRate / TARGET_RATE));
+  const dsRate = sampleRate / ratio;
+  const nBeats = Math.max(1, Math.ceil(duration / spb));
+  const kickSum = new Float64Array(nBeats);
+  const fullSum = new Float64Array(nBeats);
+  const cnt = new Float64Array(nBeats);
+  const la = 1 - Math.exp(-2 * Math.PI * 160 / dsRate);
+  let lpPrev = 0;
+  const totalDs = Math.floor(channelData.length / ratio);
+  for (let i = 0; i < totalDs; i++) {
+    const v = channelData[i * ratio];
+    lpPrev += la * (v - lpPrev);
+    const b = Math.floor((i / dsRate) / spb);
+    if (b < nBeats) {
+      kickSum[b] += lpPrev * lpPrev;
+      fullSum[b] += v * v;
+      cnt[b] += 1;
+    }
+  }
+  const kick = new Float64Array(nBeats);
+  for (let b = 0; b < nBeats; b++) kick[b] = cnt[b] > 0 ? kickSum[b] / cnt[b] : 0;
+  const mean = (arr: Float64Array, a: number, c: number): number => {
+    let s = 0;
+    let n = 0;
+    for (let i = Math.max(0, a); i < Math.min(arr.length, c); i++) { s += arr[i]; n++; }
+    return n > 0 ? s / n : 0;
+  };
+  // 4-beat (bar) kick means, one per beat offset.
+  const barKick = new Float64Array(nBeats);
+  for (let b = 0; b < nBeats; b++) barKick[b] = mean(kick, b, b + 4);
+  // Robust peak: 95th percentile of bar kick means.
+  const sorted = [...barKick].sort((a, c) => a - c);
+  const peak = sorted.length > 0 ? sorted[Math.floor(sorted.length * 0.95)] : 0;
+  if (!(peak > 0)) return null;
+
+  // AUTO 1.1: first sustained-loud bar after a quieter intro.
+  let anchorBeat = -1;
+  for (let i = 8; i + 16 < nBeats; i++) {
+    const nextMean = mean(barKick, i, i + 4);
+    let nextMin = Infinity;
+    for (let k = 0; k < 4; k++) nextMin = Math.min(nextMin, barKick[i + k] ?? 0);
+    const prevMean = mean(kick, i - 8, i);
+    const next16 = mean(kick, i, i + 16);
+    if (nextMean >= 0.6 * peak && nextMin >= 0.4 * peak && prevMean < 0.5 * next16) {
+      anchorBeat = i;
+      break;
+    }
+  }
+  // Refine to the beat with the biggest kick jump within +-2 beats of the
+  // sustained start, so the anchor lands on the drop's first kick.
+  if (anchorBeat >= 0) {
+    let bestB = anchorBeat;
+    let bestJump = -Infinity;
+    for (let b = Math.max(1, anchorBeat - 2); b <= Math.min(nBeats - 1, anchorBeat + 2); b++) {
+      const jump = kick[b] - kick[b - 1];
+      if (jump > bestJump) { bestJump = jump; bestB = b; }
+    }
+    if (bestJump > 0) anchorBeat = bestB;
+  }
+
+  // Convert the anchor beat to a beat-map index + time. Beat windows start
+  // at t=0, so the anchor time is anchorBeat * spb; the map beat nearest
+  // that time (or the flat extrapolation when the anchor predates the
+  // map, which starts at the loudest window) becomes the downbeat.
+  const beats0 = beats.length > 0 ? beats[0]
+    : downbeatOffset >= 0 ? downbeatOffset
+    : firstBeat >= 0 ? firstBeat : 0;
+  let anchorTime: number | null = null;
+  let anchorIndex = -1;
+  let anchorPhase: number | null = null;
+  if (anchorBeat >= 0) {
+    const t = anchorBeat * spb;
+    const j = Math.round((t - beats0) / spb);
+    anchorIndex = j;
+    anchorPhase = ((j % 4) + 4) % 4;
+    anchorTime = j >= 0 && j < beats.length ? beats[j] : beats0 + j * spb;
+  }
+
+  // Downbeat grid the hotcues snap to: the anchor when found, else the
+  // detector's downbeat (or first beat) — same origin the derived
+  // bar-phase default uses, so hotcues agree with the grid.
+  const origin = anchorTime ?? (downbeatOffset >= 0 ? downbeatOffset : firstBeat >= 0 ? firstBeat : 0);
+  const snapDown = (t: number): number => {
+    const k = Math.round((t - origin) / barDur);
+    return origin + k * barDur;
+  };
+
+  const riseAfter = (fromBeat: number): number | null => {
+    for (let i = fromBeat; i + 16 < nBeats; i++) {
+      const prev = mean(kick, i - 16, i);
+      const next = mean(kick, i, i + 16);
+      if (prev > 0 && next >= 1.5 * prev && next >= 0.5 * peak) return i;
+    }
+    return null;
+  };
+  const originBeat = Math.round(origin / spb);
+  const hc1 = origin;
+  let hc2: number | null = null;
+  const r2 = riseAfter(originBeat + 32);
+  if (r2 !== null) hc2 = r2 * spb;
+  else {
+    let best = -1;
+    let bestV = -1;
+    for (let i = originBeat + 32; i < nBeats; i++) {
+      if (barKick[i] > bestV) { bestV = barKick[i]; best = i; }
+    }
+    if (best >= 0 && bestV >= 0.5 * peak) hc2 = best * spb;
+  }
+  let hc3: number | null = null;
+  {
+    const hc2Beat = hc2 !== null ? Math.round(hc2 / spb) : originBeat;
+    let bestRatio = Infinity;
+    for (let i = hc2Beat + 32; i + 16 < Math.floor(nBeats * 0.85); i++) {
+      const prev = mean(kick, i - 16, i);
+      const next = mean(kick, i, i + 16);
+      if (prev > 0 && next < 0.6 * prev && mean(barKick, i, i + 4) < 0.7 * prev) {
+        const ratio = next / prev;
+        if (ratio < bestRatio) { bestRatio = ratio; hc3 = i * spb; }
+      }
+    }
+    if (hc3 === null) {
+      const r3 = riseAfter(hc2Beat + 32);
+      if (r3 !== null) hc3 = r3 * spb;
+      else hc3 = (Math.round((duration * 0.5) / spb)) * spb;
+    }
+  }
+  let hc4: number | null = null;
+  {
+    const fromB = Math.floor(nBeats * 0.6);
+    for (let i = nBeats - 16; i >= fromB; i--) {
+      const prev = mean(kick, i - 16, i);
+      const next = mean(kick, i, i + 16);
+      const tail = mean(kick, i, nBeats);
+      if (prev > 0 && next < 0.5 * prev && tail < 0.6 * peak) { hc4 = i * spb; break; }
+    }
+    if (hc4 === null) hc4 = duration - 16 * barDur;
+  }
+
+  // Snap to downbeats, enforce ordering + >= 8 bars separation.
+  const snapped: (number | null)[] = [hc1, hc2, hc3, hc4].map((t) => {
+    if (t === null || !(t >= 0)) return null;
+    let s = snapDown(t);
+    if (s >= duration - 1) s -= barDur;
+    if (s < 0) return null;
+    return s;
+  });
+  for (let i = 1; i < snapped.length; i++) {
+    if (snapped[i] === null || snapped[i - 1] === null) continue;
+    if (snapped[i]! < snapped[i - 1]! + 8 * barDur) {
+      let s = snapped[i - 1]! + 8 * barDur;
+      if (s >= duration - 1) snapped[i] = null;
+      else snapped[i] = s;
+    }
+  }
+  return { anchorTime, anchorBeatIndex: anchorIndex, barPhase: anchorPhase, autoHotcues: snapped };
+}
+
 // ─── Main entry ──────────────────────────────────────────────────────────────
 
 function yieldControl(): Promise<void> {
@@ -522,6 +739,31 @@ export async function analyzeTrack(
     beats,
     bpmCurve,
   };
+  // Smart grid: auto 1.1 anchor + auto hotcues from the track's energy.
+  // Best-effort — a structure failure must never break the grid itself.
+  // Reuses the decoded buffer (no new decode); the anchor, when found,
+  // becomes the grid's downbeat origin and bar-phase residue.
+  let structure: StructureAnalysis | null = null;
+  try {
+    structure = analyzeStructure(
+      buffer.getChannelData(0),
+      buffer.sampleRate,
+      partial.bpm,
+      beats,
+      partial.downbeatOffset,
+      partial.firstBeat,
+      buffer.duration,
+    );
+  } catch {
+    structure = null;
+  }
+  if (structure) {
+    grid.autoHotcues = structure.autoHotcues;
+    if (structure.anchorTime !== null && structure.barPhase !== null) {
+      grid.barPhase = structure.barPhase;
+      grid.downbeatOffset = structure.anchorTime;
+    }
+  }
   onProgress?.(0.95);
   debugLog('analysis', 'track analyzed', undefined, {
     bpm: grid.bpm,
@@ -529,6 +771,8 @@ export async function analyzeTrack(
     method: grid.method,
     beats: beats.length,
     stability: grid.tempoStability,
+    anchor: structure?.anchorTime ?? null,
+    autoHotcues: structure?.autoHotcues ?? null,
   });
   const spectralData = await analyzeSpectrum(buffer);
   onProgress?.(1);
