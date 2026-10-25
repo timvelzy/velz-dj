@@ -144,6 +144,12 @@ export interface PickArgs {
 export interface PickResult {
   track: TrackInfo;
   fromQueue: boolean;
+  /**
+   * Round 9 — true when this pick came from least-recently-played
+   * cycling (tempo window ignored): the set must keep progressing
+   * past an exhausted library instead of stalling in a hold loop.
+   */
+  cycled?: boolean;
 }
 
 /**
@@ -152,6 +158,20 @@ export interface PickResult {
  * loaded on a deck. Auto-pick scores Camelot compatibility first, then
  * tempo closeness, within a ±10% tempo window, skipping recently played
  * tracks and anything already on a deck. Returns null when nothing fits.
+ *
+ * Round 9 — least-recently-played cycling (Tim's bar: set it and forget
+ * it, continual music, never stall). When queue and auto-pick both find
+ * nothing — the 3-track case where the only unplayed track sits outside
+ * the tempo window, or every track has already played — repeat the
+ * library least-recent first instead of falling to a hold loop: the
+ * track whose last play is oldest (never-played first), skipping only
+ * the playing track, on-deck tracks, and failed loads. The tempo window
+ * is deliberately ignored here — sync carries the tempo jump, and a
+ * tempo-distant next track beats an endless outro loop. Ties among
+ * never-played tracks break on Camelot, then tempo closeness. A null
+ * return now means the library is genuinely empty of playable tracks
+ * (one track, all failed, or all on decks) — the only case where the
+ * hold loop is the correct steady state.
  */
 export function pickNextTrack(a: PickArgs): PickResult | null {
   const onDeck = new Set(a.onDeckIds);
@@ -185,7 +205,38 @@ export function pickNextTrack(a: PickArgs): PickResult | null {
       bestTempo = tempoScore;
     }
   }
-  return best ? { track: best, fromQueue: false } : null;
+  if (best) return { track: best, fromQueue: false };
+  // Cycling: last occurrence in recentIds wins the rank (recents are
+  // appended in play order, so a higher index played more recently);
+  // never-played (or evicted from the window) ranks -1, i.e. first.
+  const lastPlayed = new Map<string, number>();
+  a.recentIds.forEach((id, i) => lastPlayed.set(id, i));
+  let cycled: TrackInfo | null = null;
+  let cycledRank = Infinity;
+  let cycledKey = -1;
+  let cycledTempo = -1;
+  for (const t of a.tracks) {
+    if (!t.file || t.duration < 45) continue;
+    if (failed.has(t.id) || onDeck.has(t.id)) continue;
+    if (a.playing && t.id === a.playing.id) continue;
+    const rank = lastPlayed.has(t.id) ? lastPlayed.get(t.id)! : -1;
+    let tempoScore = 0.5;
+    if (playingBpm > 0 && t.bpm > 0) {
+      tempoScore = 1 - Math.min(1, Math.abs(t.bpm / playingBpm - 1));
+    }
+    const keyScore = camelotScore(a.playing?.key, t.key);
+    if (
+      rank < cycledRank ||
+      (rank === cycledRank &&
+        (keyScore > cycledKey || (keyScore === cycledKey && tempoScore > cycledTempo)))
+    ) {
+      cycled = t;
+      cycledRank = rank;
+      cycledKey = keyScore;
+      cycledTempo = tempoScore;
+    }
+  }
+  return cycled ? { track: cycled, fromQueue: false, cycled: true } : null;
 }
 
 // ─── Bass envelope ("read the track") ─────────────────────────────────────
