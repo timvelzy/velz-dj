@@ -821,6 +821,18 @@ export default function App() {
   // silence) and generating (AI bridge) as the no-candidate tiers.
   // Audio is never interrupted by the machine itself: takeover cancels
   // scheduled automation, restores EQ, and touches nothing else.
+  // ROUND 8 GOVERNING BAR (Tim's words: "set it and forget it"):
+  // continuity is non-negotiable. Every autopilot failure path must end
+  // in continuous musical playback — never silence, never a dead stop,
+  // never a paused hold loop with no deck playing. Transitions preserve
+  // sync lock and phase (quantized launches, PLL); a blend launched out
+  // of phase fails even if the music never stops. Nothing jarring: no
+  // sudden drops, no slams into a drop without a blend, no loop starting
+  // mid-phrase. When in doubt, a plain well-executed blend beats a
+  // clever mode executed badly — tease/extend/sustain are subordinate
+  // to this bar, and the confidence gate already enforces it. Judge any
+  // future change against an unattended run: autopilot on, transitions
+  // in a row, nobody touching anything.
   type ApMachinePhase = 'waiting' | 'preparing' | 'scheduled' | 'crossfading' | 'fallback' | 'generating' | 'teasing';
   interface ApMachine {
     phase: ApMachinePhase;
@@ -828,6 +840,8 @@ export default function App() {
     freeKey: 'A' | 'B';
     nextId: string | null;
     nextTitle: string | null;
+    /** Stable identity of the armed pick (fileKey survives fresh-load id minting; see apAdoptArmed). */
+    nextFileKey: string | null;
     nextIsBridge: boolean;
     synced: boolean;
     immediateBlend: boolean;
@@ -912,6 +926,7 @@ export default function App() {
     freeKey,
     nextId: null,
     nextTitle: null,
+    nextFileKey: null,
     nextIsBridge: false,
     synced: false,
     immediateBlend: false,
@@ -1046,10 +1061,19 @@ export default function App() {
     engine.setLoop(`deck${m.playingKey}`, loop.start, loop.end);
     setDeckState(m.playingKey, { ...pSt, loop: { start: loop.start, end: loop.end }, loopBars: null });
     m.fallbackLoop = { start: loop.start, end: loop.end };
-    if (loop.jump) engine.seek(`deck${m.playingKey}`, loop.start);
+    // Round 8 — the bar: a hold loop on a STOPPED deck is a dead stop,
+    // not a hold. Callers only reach here after a natural end (a user
+    // pause lets go earlier and never reaches fallback), so if the deck
+    // is not playing, resume it from the loop start: the music keeps
+    // going while the machine retries or waits. Never touches a playing
+    // deck. The loop start is a downbeat, so the resume is in phrase.
+    const wasPlaying = engine.isPlaying(`deck${m.playingKey}`);
+    if (loop.jump || !wasPlaying) engine.seek(`deck${m.playingKey}`, loop.start);
+    if (!wasPlaying) engine.play(`deck${m.playingKey}`);
     debugLog('transport', 'autopilot hold loop', `deck${m.playingKey}`, {
       start: loop.start, end: loop.end,
       bars: Math.round((loop.end - loop.start) / barSeconds(pSt.track.beatGrid)), jumped: loop.jump,
+      resumed: !wasPlaying,
     });
   };
 
@@ -1129,6 +1153,64 @@ export default function App() {
    * track the user loaded manually. Provisional auto-picks (queue was
    * empty at arm time) can still be swapped for a queue pick at finalize.
    */
+  /**
+   * Round 8 — armed-pick adoption. Fresh-file loads mint a NEW session id
+   * (loadTrack: `t${++trackSeq}`) and replace the library record, so the
+   * id recorded at arm time NEVER matches the deck track's id after a
+   * fresh load — and the re-pick then excludes the same track as
+   * on-deck, which is how a queued pick fell through to Lyria generation
+   * and the hold loop while sitting loaded on the free deck. fileKey is
+   * the stable identity (see resolvePlaylistTracks: session ids are not
+   * stable across reloads). If the free deck holds the armed pick under
+   * either identity, adopt the deck's session id so the rest of the
+   * machine (armed checks, role swap, recents) stays consistent.
+   */
+  const apAdoptArmed = (m: ApMachine): boolean => {
+    if (m.nextId == null && m.nextFileKey == null) return false;
+    const fSt = deckStateRef.current[m.freeKey];
+    const t = fSt.track;
+    if (!t || !fSt.buffer) return false;
+    const idMatch = m.nextId != null && t.id === m.nextId;
+    const keyMatch = m.nextFileKey != null && !!t.fileKey && t.fileKey === m.nextFileKey;
+    if (!idMatch && !keyMatch) return false;
+    if (t.id !== m.nextId) m.nextId = t.id;
+    m.nextTitle = t.title;
+    return true;
+  };
+
+  /**
+   * Round 8 — free-deck adoption. The free deck's content IS the next
+   * track by construction: if it holds a buffered track that is not the
+   * playing track, adopt it as the pick instead of re-picking (which
+   * would exclude it as on-deck) or generating. Covers manual loads of
+   * a queued track and loads that finished under a new session id.
+   * Never adopts the just-finished track still sitting on the free deck
+   * after a role swap (it is in recentIds) unless the user explicitly
+   * queued it again (queue wins over recents, as in apPick).
+   */
+  const apAdoptFreeDeck = (m: ApMachine): boolean => {
+    const fSt = deckStateRef.current[m.freeKey];
+    const pSt = deckStateRef.current[m.playingKey];
+    const t = fSt.track;
+    if (!t || !fSt.buffer) return false;
+    if (pSt.track && t.id === pSt.track.id) return false;
+    if (m.recentIds.includes(t.id)) {
+      const queueKeys = new Set(
+        apQueueRef.current
+          .map((id) => tracksRef.current.find((x) => x.id === id)?.fileKey)
+          .filter((k): k is string => !!k),
+      );
+      if (!t.fileKey || !queueKeys.has(t.fileKey)) return false;
+    }
+    m.nextId = t.id;
+    m.nextTitle = t.title;
+    m.nextFileKey = t.fileKey ?? null;
+    m.nextIsBridge = false;
+    m.provisional = false;
+    m.synced = false;
+    return true;
+  };
+
   const apArmNext = (m: ApMachine, expectFreeId: string | null) => {
     const pSt = deckStateRef.current[m.playingKey];
     const fSt = deckStateRef.current[m.freeKey];
@@ -1141,12 +1223,14 @@ export default function App() {
     if (pick.fromQueue) setApQueueIds((ids) => ids.filter((id) => id !== pick.track.id));
     m.nextId = pick.track.id;
     m.nextTitle = pick.track.title;
+    m.nextFileKey = pick.track.fileKey ?? null;
     m.nextIsBridge = false;
     m.provisional = !pick.fromQueue;
     m.synced = false;
     loadLibRef.current(pick.track.id, m.freeKey);
     debugLog('transport', 'autopilot armed next', `deck${m.freeKey}`, {
       track: pick.track.title, fromQueue: pick.fromQueue, provisional: m.provisional,
+      fileKey: pick.track.fileKey ?? null,
     });
   };
 
@@ -1159,13 +1243,14 @@ export default function App() {
     if (pick.fromQueue) setApQueueIds((ids) => ids.filter((id) => id !== pick.track.id));
     m.nextId = pick.track.id;
     m.nextTitle = pick.track.title;
+    m.nextFileKey = pick.track.fileKey ?? null;
     m.nextIsBridge = false;
     m.synced = false;
     m.immediateBlend = immediate;
     m.phase = 'preparing';
     m.loadStartWall = now;
     loadLibRef.current(pick.track.id, fk);
-    debugLog('transport', 'autopilot preparing', `deck${fk}`, { track: pick.track.title, fromQueue: pick.fromQueue });
+    debugLog('transport', 'autopilot preparing', `deck${fk}`, { track: pick.track.title, fromQueue: pick.fromQueue, fileKey: pick.track.fileKey ?? null });
   };
 
   const apEnterFallback = (m: ApMachine, note: string | null) => {
@@ -1513,7 +1598,7 @@ export default function App() {
         m.blendStartAt = blendStartAt;
         m.blendEndAt = blendStartAt + smartBlendSec;
         m.automated = true;
-        debugLog('transport', 'autopilot blend scheduled', undefined, { at: blendStartAt, blendSec: smartBlendSec, smart: plan.mode });
+        debugLog('transport', 'autopilot blend scheduled', undefined, { at: blendStartAt, blendSec: smartBlendSec, smart: plan.mode, to: m.nextTitle });
       } else {
         // Due now (late wakeup) or uncomputable — begin now, still
         // audio-scheduled from the current audio time.
@@ -1546,7 +1631,7 @@ export default function App() {
       m.blendStartAt = blendStartAt;
       m.blendEndAt = blendStartAt + blendSec;
       m.automated = true;
-      debugLog('transport', 'autopilot blend scheduled', undefined, { at: blendStartAt, blendSec });
+      debugLog('transport', 'autopilot blend scheduled', undefined, { at: blendStartAt, blendSec, to: m.nextTitle });
     } else {
       // Due now (late wakeup) or uncomputable — begin now, still
       // audio-scheduled from the current audio time.
@@ -1802,6 +1887,7 @@ export default function App() {
             if (pick.fromQueue) setApQueueIds((ids) => ids.filter((id) => id !== pick.track.id));
             m.nextId = pick.track.id;
             m.nextTitle = pick.track.title;
+            m.nextFileKey = pick.track.fileKey ?? null;
             m.nextIsBridge = false;
             m.phase = 'preparing';
             m.immediateBlend = true;
@@ -1839,7 +1925,9 @@ export default function App() {
       }
       const pos = engine.position(pId);
       const fSt = deckStateRef.current[m.freeKey];
-      const armed = m.nextId !== null && fSt.track?.id === m.nextId && !!fSt.buffer;
+      // Round 8: armed means the free deck holds the pick — resolved by
+      // adoption, not by raw id equality (fresh loads mint new ids).
+      const armed = apAdoptArmed(m);
       // A plan belongs to the armed pick: if the free deck no longer
       // holds that pick (manual load, failed load), drop it so the next
       // arm re-plans from the new track.
@@ -1850,11 +1938,12 @@ export default function App() {
       // instead (graceful, never silence).
       if (armed && m.provisional && apQueueRef.current.length > 0) {
         const q = apPick(m);
-        if (q && q.fromQueue && q.track.id !== m.nextId) {
+        if (q && q.fromQueue && q.track.id !== m.nextId && !(m.nextFileKey != null && q.track.fileKey === m.nextFileKey)) {
           if (fSt.loop) apClearLoop(m.freeKey);
           setApQueueIds((ids) => ids.filter((id) => id !== q.track.id));
           m.nextId = q.track.id;
           m.nextTitle = q.track.title;
+          m.nextFileKey = q.track.fileKey ?? null;
           m.nextIsBridge = false;
           m.provisional = false;
           m.synced = false;
@@ -1930,6 +2019,30 @@ export default function App() {
             pos, prepareAt: m.prepareAt, outroStart: m.outroStart,
           });
         }
+        // Round 8: an arm is already in flight (the lookahead load is
+        // still decoding) — do NOT re-pick and double-load the same
+        // track. Move to preparing so the load gets its timeout window
+        // and the armed check (with adoption) resolves it.
+        if ((m.nextId != null || m.nextFileKey != null) && fSt.analyzing) {
+          m.phase = 'preparing';
+          m.loadStartWall = now;
+          debugLog('transport', 'autopilot awaiting arm load', `deck${m.freeKey}`, {
+            track: m.nextTitle,
+          });
+          return;
+        }
+        // Round 8: the free deck may already hold the next track (a
+        // manual load, or a load that finished under a new session id)
+        // — adopt it instead of re-picking (which would exclude it as
+        // on-deck) or generating. Next tick's armed path proceeds.
+        // Generation below is therefore last resort only: it runs only
+        // when no queue pick, no auto-pick, and no deck-held pick exist.
+        if (apAdoptFreeDeck(m)) {
+          debugLog('transport', 'autopilot adopted free deck', `deck${m.freeKey}`, {
+            track: m.nextTitle,
+          });
+          return;
+        }
         const pick = apPick(m);
         if (pick) apBeginPrepare(m, pick, false, now);
         else if (!m.genAttempted) apStartGeneration(m);
@@ -1950,7 +2063,8 @@ export default function App() {
 
     if (m.phase === 'preparing') {
       const fSt = deckStateRef.current[m.freeKey];
-      const armed = fSt.track?.id === m.nextId && !!fSt.buffer;
+      // Round 8: armed via adoption (fresh loads mint new session ids).
+      const armed = apAdoptArmed(m);
       if (armed) {
         if (!m.synced) {
           engine.setMaster(pId);
@@ -1968,12 +2082,21 @@ export default function App() {
           });
         }
       } else if (now > m.loadStartWall + 20) {
-        // Load timed out — skip to the next candidate, never stall.
-        if (m.nextId) m.failedIds.push(m.nextId);
-        const pick = apPick(m);
-        if (pick) apBeginPrepare(m, pick, m.immediateBlend, now);
-        else if (!m.genAttempted) apStartGeneration(m);
-        else apEnterFallback(m, m.genError);
+        // Round 8: the deck may hold the pick under a new session id or
+        // a manual load — adopt it, never fail a pick sitting on the
+        // deck. Only a genuinely empty/failed load falls through.
+        if (apAdoptFreeDeck(m)) {
+          debugLog('transport', 'autopilot adopted free deck', `deck${m.freeKey}`, {
+            track: m.nextTitle,
+          });
+        } else {
+          // Load timed out — skip to the next candidate, never stall.
+          if (m.nextId) m.failedIds.push(m.nextId);
+          const pick = apPick(m);
+          if (pick) apBeginPrepare(m, pick, m.immediateBlend, now);
+          else if (!m.genAttempted) apStartGeneration(m);
+          else apEnterFallback(m, m.genError);
+        }
       } else {
         pushApStatus({
           on: true, phase: 'preparing', playingKey: m.playingKey,
@@ -2113,6 +2236,7 @@ export default function App() {
         const id = apLoadBridge(m.freeKey, bridge);
         m.nextId = id;
         m.nextTitle = '🤖 AI bridge (Lyria-generated loop)';
+        m.nextFileKey = null;
         m.nextIsBridge = true;
         m.synced = false;
         m.immediateBlend = false;
