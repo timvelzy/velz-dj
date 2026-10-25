@@ -19,6 +19,15 @@ import { computeBandPeaks, peaksKey } from './audio/peaks';
 import { computeBarLoop, doubleLoop, halveLoop } from './audio/loop';
 import { loadPeaks, savePeaks } from './audio/peaksStore';
 import {
+  barSeconds,
+  barsToOutro,
+  outroStartSeconds,
+  pickNextTrack,
+  swapReady,
+  trackBassEnvelope,
+} from './audio/autopilot';
+import { debugLog } from './audio/debugLog';
+import {
   clearLibraryRecords,
   deleteLibraryRecord,
   fileKeyFor,
@@ -26,7 +35,7 @@ import {
   requestLibraryPersistence,
   saveLibraryRecord,
 } from './audio/libraryStore';
-import type { BandPeaks, TrackInfo } from './types';
+import type { BandPeaks, BeatGrid, TrackInfo } from './types';
 import Deck, { type DeckState } from './components/Deck';
 import CenterPlayheadView, { type TopDeckView } from './components/CenterPlayheadView';
 import DebugPanel from './components/DebugPanel';
@@ -37,6 +46,7 @@ import Sampler from './components/Sampler';
 import Library from './components/Library';
 import GridEditorModal from './components/GridEditorModal';
 import MidiPanel from './components/MidiPanel';
+import AutoPilot, { AP_OFF_STATUS, type ApStatus } from './components/AutoPilot';
 
 const deckInit = (): DeckState => ({
   track: null,
@@ -679,6 +689,597 @@ export default function App() {
     setMasterDeck((m) => (m === deckId ? null : deckId));
   }, []);
 
+  // ─── AI DJ autopilot ──────────────────────────────────────────────────
+  // State machine (ref-held so the 250ms driver tick never goes stale):
+  // waiting → preparing (load + sync) → crossfading → waiting (roles
+  // swapped), with fallback (loop the outro, never silence) and generating
+  // (AI bridge) as the no-candidate tiers. Audio is never interrupted by
+  // the machine itself: takeover just stops the driver and restores EQ.
+  type ApMachinePhase = 'waiting' | 'preparing' | 'crossfading' | 'fallback' | 'generating';
+  interface ApMachine {
+    phase: ApMachinePhase;
+    playingKey: 'A' | 'B';
+    freeKey: 'A' | 'B';
+    nextId: string | null;
+    nextTitle: string | null;
+    nextIsBridge: boolean;
+    synced: boolean;
+    immediateBlend: boolean;
+    prepareAt: number;
+    outroStart: number;
+    blendStartWall: number;
+    blendSec: number;
+    fromV: number;
+    toV: number;
+    bassSwapped: boolean;
+    swapStartWall: number | null;
+    eqSnap: { outLow: number; inLow: number } | null;
+    loadStartWall: number;
+    failedIds: string[];
+    recentIds: string[];
+    fallbackLoop: { start: number; end: number } | null;
+    genAttempted: boolean;
+    genToken: number;
+    genBridge: { buffer: AudioBuffer; grid: BeatGrid; key: string } | null;
+    genError: string | null;
+  }
+  const [apOn, setApOn] = useState(false);
+  const [apQueueIds, setApQueueIds] = useState<string[]>([]);
+  const [apOutroBars, setApOutroBars] = useState(8);
+  const [apStatus, setApStatus] = useState<ApStatus>(AP_OFF_STATUS);
+  const apRef = useRef<ApMachine | null>(null);
+  const apOnRef = useRef(false);
+  apOnRef.current = apOn;
+  const apQueueRef = useRef<string[]>([]);
+  apQueueRef.current = apQueueIds;
+  const apOutroRef = useRef(8);
+  apOutroRef.current = apOutroBars;
+  const crossfaderRef = useRef(0);
+  crossfaderRef.current = crossfader;
+  const chRef = useRef({ A: chA, B: chB });
+  chRef.current = { A: chA, B: chB };
+  const masterBpmRef = useRef(0);
+  masterBpmRef.current = masterBpm;
+  const loadLibRef = useRef(loadLibraryTrack);
+  loadLibRef.current = loadLibraryTrack;
+  const aiQueueRef = useRef(queue);
+  aiQueueRef.current = queue;
+
+  const isBridgeTrack = (t: TrackInfo | null | undefined): boolean =>
+    !!t && t.id.startsWith('ai-bridge-');
+
+  const freshMachine = (playingKey: 'A' | 'B', freeKey: 'A' | 'B', recentIds: string[]): ApMachine => ({
+    phase: 'waiting',
+    playingKey,
+    freeKey,
+    nextId: null,
+    nextTitle: null,
+    nextIsBridge: false,
+    synced: false,
+    immediateBlend: false,
+    prepareAt: 0,
+    outroStart: 0,
+    blendStartWall: 0,
+    blendSec: 0,
+    fromV: 0,
+    toV: 0,
+    bassSwapped: false,
+    swapStartWall: null,
+    eqSnap: null,
+    loadStartWall: 0,
+    failedIds: [],
+    recentIds,
+    fallbackLoop: null,
+    genAttempted: false,
+    genToken: 0,
+    genBridge: null,
+    genError: null,
+  });
+
+  const pushApStatus = (s: ApStatus) => {
+    setApStatus((prev) =>
+      prev.on === s.on && prev.phase === s.phase && prev.playingKey === s.playingKey &&
+      prev.nextTitle === s.nextTitle && prev.barsToGo === s.barsToGo &&
+      prev.blendProgress === s.blendProgress && prev.bass === s.bass && prev.note === s.note
+        ? prev
+        : s,
+    );
+  };
+
+  /** Automated low-EQ move: quiet engine call + knob state kept in sync. */
+  const apSetEq = (key: 'A' | 'B', lowVal: number) => {
+    const cur = chRef.current[key].eqLow;
+    if (Math.abs(cur - lowVal) <= 0.01) return;
+    engine.setEqAuto(`deck${key}`, 'low', lowVal);
+    const next = { ...chRef.current[key], eqLow: lowVal };
+    (key === 'A' ? setChA : setChB)(next);
+  };
+
+  const apSetCrossfader = (v: number) => {
+    setCrossfader(v);
+    engine.setCrossfader(v);
+  };
+
+  /** Restore pre-transition low EQ on both decks (takeover / cycle end). */
+  const apRestoreEq = (m: ApMachine) => {
+    if (!m.eqSnap) return;
+    for (const k of ['A', 'B'] as const) {
+      const val = k === m.playingKey ? m.eqSnap.outLow : m.eqSnap.inLow;
+      engine.setEq(`deck${k}`, 'low', val, false);
+      const next = { ...chRef.current[k], eqLow: val };
+      (k === 'A' ? setChA : setChB)(next);
+    }
+  };
+
+  const apClearLoop = (key: 'A' | 'B') => {
+    const st = deckStateRef.current[key];
+    if (!st.loop) return;
+    engine.exitLoop(`deck${key}`);
+    setDeckState(key, { ...st, loop: null, loopBars: null, pendingLoopIn: null });
+  };
+
+  const apSetFallbackLoop = (m: ApMachine) => {
+    const pSt = deckStateRef.current[m.playingKey];
+    if (!pSt.track || m.fallbackLoop) return;
+    const start = m.outroStart;
+    const end = pSt.track.duration;
+    if (end <= start) return;
+    engine.setLoop(`deck${m.playingKey}`, start, end);
+    setDeckState(m.playingKey, { ...pSt, loop: { start, end }, loopBars: null });
+    m.fallbackLoop = { start, end };
+  };
+
+  const apLoadBridge = (key: 'A' | 'B', bridge: { buffer: AudioBuffer; grid: BeatGrid; key: string }): string => {
+    const deckId = `deck${key}`;
+    const d = engine.decks.get(deckId);
+    engine.pause(deckId);
+    if (d) {
+      d.buffer = bridge.buffer;
+      d.grid = bridge.grid;
+      d.userTempo = 1;
+      d.syncBaseTempo = 1;
+      d.syncCorr = 1;
+      d.nudge = 0;
+      d.posBase = 0;
+      d.posBaseTime = engine.ctx.currentTime;
+      d.loopStart = null;
+      d.loopEnd = null;
+    }
+    const id = `ai-bridge-${Date.now()}`;
+    const track: TrackInfo = {
+      id,
+      title: 'AI bridge (Lyria-generated loop)',
+      artist: 'AI — generated, not a real track',
+      duration: bridge.buffer.duration,
+      bpm: bridge.grid.bpm,
+      key: bridge.key,
+      beatGrid: bridge.grid,
+    };
+    setDeckState(key, { ...deckInit(), track, buffer: bridge.buffer });
+    // Peaks for the waveforms (deck-only: never added to the library).
+    void ensurePeaks(track, bridge.buffer);
+    return id;
+  };
+
+  const apPickArgs = (m: ApMachine) => {
+    const decks = deckStateRef.current;
+    return {
+      tracks: tracksRef.current,
+      playing: decks[m.playingKey].track,
+      queueIds: apQueueRef.current,
+      recentIds: m.recentIds,
+      onDeckIds: [decks.A.track?.id, decks.B.track?.id].filter((x): x is string => !!x),
+      failedIds: m.failedIds,
+    };
+  };
+
+  const apBeginPrepare = (m: ApMachine, pick: { track: TrackInfo; fromQueue: boolean }, immediate: boolean, now: number) => {
+    const fk = m.freeKey;
+    const fSt = deckStateRef.current[fk];
+    // Clear any stale loop on the free deck (incl. a previous bridge loop)
+    // so the incoming track never inherits it.
+    if (fSt.loop) apClearLoop(fk);
+    if (pick.fromQueue) setApQueueIds((ids) => ids.filter((id) => id !== pick.track.id));
+    m.nextId = pick.track.id;
+    m.nextTitle = pick.track.title;
+    m.nextIsBridge = false;
+    m.synced = false;
+    m.immediateBlend = immediate;
+    m.phase = 'preparing';
+    m.loadStartWall = now;
+    loadLibRef.current(pick.track.id, fk);
+    debugLog('transport', 'autopilot preparing', `deck${fk}`, { track: pick.track.title, fromQueue: pick.fromQueue });
+  };
+
+  const apEnterFallback = (m: ApMachine, note: string | null) => {
+    m.phase = 'fallback';
+    apSetFallbackLoop(m);
+    pushApStatus({
+      on: true, phase: 'fallback', playingKey: m.playingKey,
+      nextTitle: null, barsToGo: null, blendProgress: null, bass: null,
+      note: note ?? 'No queue or library pick — holding the outro loop.',
+    });
+  };
+
+  const apStartGeneration = (m: ApMachine) => {
+    const pSt = deckStateRef.current[m.playingKey];
+    const playingTrack = pSt.track;
+    if (!playingTrack) return;
+    m.genAttempted = true;
+    m.genToken += 1;
+    const token = m.genToken;
+    m.phase = 'generating';
+    // Hold the music while Lyria works: loop the outro, never silence.
+    apSetFallbackLoop(m);
+    const backend = aiQueueRef.current.backend;
+    if (backend.kind !== 'lyria' || !backend.isConfigured) {
+      m.phase = 'fallback';
+      m.genError = 'AI generation needs your Gemini key in the AI deck — holding the outro loop.';
+      pushApStatus({
+        on: true, phase: 'fallback', playingKey: m.playingKey,
+        nextTitle: null, barsToGo: null, blendProgress: null, bass: null, note: m.genError,
+      });
+      return;
+    }
+    pushApStatus({
+      on: true, phase: 'generating', playingKey: m.playingKey,
+      nextTitle: null, barsToGo: null, blendProgress: null, bass: null,
+      note: 'Generating next with AI… (Lyria) — holding the outro loop meanwhile.',
+    });
+    const spec = {
+      bpm: playingTrack.bpm > 0 ? playingTrack.bpm : (masterBpmRef.current || 124),
+      key: playingTrack.key ?? '',
+      bars: 4 as const,
+      style: 'house',
+    };
+    const timeout = new Promise<never>((_, rej) =>
+      setTimeout(() => rej(new Error('generation timed out')), 120000),
+    );
+    Promise.race([backend.generate(spec, engine.ctx), timeout])
+      .then(async (buf) => {
+        if (token !== m.genToken || apRef.current !== m) return; // superseded
+        try {
+          const { grid } = await analyzeTrack(buf);
+          const keyRes = detectKey(buf);
+          if (token !== m.genToken || apRef.current !== m) return;
+          m.genBridge = { buffer: buf, grid, key: keyRes.key };
+          debugLog('transport', 'autopilot AI bridge ready', undefined, { bars: 4, bpm: spec.bpm });
+        } catch {
+          if (apRef.current === m && token === m.genToken) {
+            m.phase = 'fallback';
+            m.genError = 'AI generation failed — holding the outro loop.';
+          }
+        }
+      })
+      .catch(() => {
+        if (token !== m.genToken || apRef.current !== m) return;
+        m.phase = 'fallback';
+        m.genError = 'AI generation failed — holding the outro loop.';
+      });
+  };
+
+  const apBeginCrossfade = (m: ApMachine, now: number) => {
+    const pSt = deckStateRef.current[m.playingKey];
+    const fSt = deckStateRef.current[m.freeKey];
+    const pId = `deck${m.playingKey}`;
+    const fId = `deck${m.freeKey}`;
+    if (!pSt.track) return;
+    // Start the incoming deck if it is not already rolling, synced to the
+    // playing deck with bar-phase alignment (existing sync facilities).
+    if (!engine.isPlaying(fId)) {
+      engine.setMaster(pId);
+      setMasterDeck(pId as 'deckA' | 'deckB');
+      engine.setSync(fId, true);
+      setDeckState(m.freeKey, { ...fSt, syncActive: true });
+      engine.play(fId, { offset: 0, alignToMaster: true });
+    }
+    // A silent incoming channel would blend into nothing — nudge it up.
+    const fCh = chRef.current[m.freeKey];
+    if (fCh.fader < 0.05) {
+      engine.setFader(fId, 0.8);
+      (m.freeKey === 'A' ? setChA : setChB)({ ...fCh, fader: 0.8 });
+    }
+    const tempoRatio =
+      masterBpmRef.current > 0 && pSt.track.bpm > 0 ? masterBpmRef.current / pSt.track.bpm : 1;
+    m.phase = 'crossfading';
+    m.blendStartWall = now;
+    m.blendSec = m.immediateBlend
+      ? Math.max(4, (16 * 60) / (masterBpmRef.current || 124))
+      : Math.max(2, (pSt.track.duration - m.outroStart) / tempoRatio);
+    m.fromV = crossfaderRef.current;
+    m.toV = m.playingKey === 'A' ? 1 : -1;
+    m.eqSnap = {
+      outLow: chRef.current[m.playingKey].eqLow,
+      inLow: chRef.current[m.freeKey].eqLow,
+    };
+    m.bassSwapped = false;
+    m.swapStartWall = null;
+    // ONE-BASS RULE, blend start: the incoming track enters with its bass
+    // cut. The outgoing track keeps the bass until the swap point.
+    apSetEq(m.freeKey, -1);
+    debugLog('transport', 'autopilot blending', undefined, {
+      from: pSt.track.title, to: m.nextTitle, blendSec: m.blendSec,
+    });
+  };
+
+  const apFinishTransition = (m: ApMachine) => {
+    const pSt = deckStateRef.current[m.playingKey];
+    const fSt = deckStateRef.current[m.freeKey];
+    const pId = `deck${m.playingKey}`;
+    const fId = `deck${m.freeKey}`;
+    apSetCrossfader(m.toV);
+    // If the bass never swapped (no readable envelope moment), swap at the
+    // handover: outgoing bass cut, incoming bass to its pre-blend value.
+    if (m.eqSnap) {
+      if (!m.bassSwapped) {
+        apSetEq(m.playingKey, -1);
+        apSetEq(m.freeKey, m.eqSnap.inLow);
+      }
+      // Outgoing deck is paused now — restore its EQ snapshot so the next
+      // cycle starts from a sane state.
+      apSetEq(m.playingKey, m.eqSnap.outLow);
+    }
+    engine.pause(pId);
+    const nextDeckState = { ...fSt, syncActive: false };
+    if (m.nextIsBridge && fSt.buffer) {
+      // A generated bridge loops on its deck until a real track is picked.
+      engine.setLoop(fId, 0, fSt.buffer.duration);
+      nextDeckState.loop = { start: 0, end: fSt.buffer.duration };
+      nextDeckState.loopBars = null;
+    }
+    engine.setMaster(fId);
+    setMasterDeck(fId as 'deckA' | 'deckB');
+    engine.setSync(fId, false);
+    setDeckState(m.freeKey, nextDeckState);
+    const recent = [...m.recentIds, pSt.track?.id].filter((x): x is string => !!x).slice(-50);
+    apRef.current = freshMachine(m.freeKey, m.playingKey, recent);
+    debugLog('transport', 'autopilot transition done', undefined, { nowPlaying: m.nextTitle });
+  };
+
+  const apTick = useCallback(() => {
+    const now = Date.now() / 1000;
+    let m = apRef.current;
+    const decks = deckStateRef.current;
+    if (!m) {
+      // Acquire a playing deck to watch.
+      const playing = (['A', 'B'] as const).filter(
+        (k) => engine.isPlaying(`deck${k}`) && decks[k].track && decks[k].buffer,
+      );
+      if (playing.length === 0) {
+        pushApStatus({
+          on: true, phase: 'idle', playingKey: null, nextTitle: null,
+          barsToGo: null, blendProgress: null, bass: null, note: null,
+        });
+        return;
+      }
+      const pk = playing.length === 1 ? playing[0] : crossfaderRef.current <= 0 ? 'A' : 'B';
+      const fk = pk === 'A' ? 'B' : 'A';
+      const st = decks[pk];
+      const outro = outroStartSeconds(st.track!.beatGrid, st.track!.duration, apOutroRef.current);
+      const barSec = barSeconds(st.track!.beatGrid);
+      m = freshMachine(pk, fk, []);
+      m.outroStart = outro;
+      m.prepareAt = outro - 4 * barSec;
+      apRef.current = m;
+    }
+    const pId = `deck${m.playingKey}`;
+    const fId = `deck${m.freeKey}`;
+    const pSt = deckStateRef.current[m.playingKey];
+
+    // Playing deck stopped unexpectedly (user pause, manual stop). The
+    // machine lets go and re-acquires on the next tick; audio untouched.
+    if (!engine.isPlaying(pId) && m.phase !== 'crossfading') {
+      apRef.current = null;
+      return;
+    }
+
+    if (m.phase === 'waiting') {
+      if (!pSt.track || !pSt.buffer) {
+        apRef.current = null;
+        return;
+      }
+      if (isBridgeTrack(pSt.track)) {
+        // A generated bridge loops forever: hunt for a real track.
+        const pick = pickNextTrack(apPickArgs(m));
+        if (pick) apBeginPrepare(m, pick, true, now);
+        else {
+          pushApStatus({
+            on: true, phase: 'waiting', playingKey: m.playingKey,
+            nextTitle: '🤖 AI bridge looping (generated, not a real track)',
+            barsToGo: null, blendProgress: null, bass: null,
+            note: 'AI-generated bridge looping — add a real track to the queue to move on.',
+          });
+        }
+        return;
+      }
+      const pos = engine.position(pId);
+      if (pos >= m.prepareAt) {
+        const pick = pickNextTrack(apPickArgs(m));
+        if (pick) apBeginPrepare(m, pick, false, now);
+        else if (!m.genAttempted) apStartGeneration(m);
+        else apEnterFallback(m, m.genError);
+      } else {
+        pushApStatus({
+          on: true, phase: 'waiting', playingKey: m.playingKey,
+          nextTitle: null, barsToGo: barsToOutro(pSt.track.beatGrid, pSt.track.duration, pos, apOutroRef.current),
+          blendProgress: null, bass: null, note: null,
+        });
+      }
+      return;
+    }
+
+    if (m.phase === 'preparing') {
+      const fSt = deckStateRef.current[m.freeKey];
+      const armed = fSt.track?.id === m.nextId && !!fSt.buffer;
+      if (armed) {
+        if (!m.synced) {
+          engine.setMaster(pId);
+          setMasterDeck(pId as 'deckA' | 'deckB');
+          engine.setSync(fId, true);
+          setDeckState(m.freeKey, { ...fSt, syncActive: true });
+          m.synced = true;
+        }
+        const pos = engine.position(pId);
+        if (m.immediateBlend || pos >= m.outroStart) apBeginCrossfade(m, now);
+        else {
+          pushApStatus({
+            on: true, phase: 'preparing', playingKey: m.playingKey,
+            nextTitle: m.nextTitle, barsToGo: null, blendProgress: null, bass: null, note: null,
+          });
+        }
+      } else if (now > m.loadStartWall + 20) {
+        // Load timed out — skip to the next candidate, never stall.
+        if (m.nextId) m.failedIds.push(m.nextId);
+        const pick = pickNextTrack(apPickArgs(m));
+        if (pick) apBeginPrepare(m, pick, m.immediateBlend, now);
+        else if (!m.genAttempted) apStartGeneration(m);
+        else apEnterFallback(m, m.genError);
+      } else {
+        pushApStatus({
+          on: true, phase: 'preparing', playingKey: m.playingKey,
+          nextTitle: m.nextTitle, barsToGo: null, blendProgress: null, bass: null, note: null,
+        });
+      }
+      return;
+    }
+
+    if (m.phase === 'generating') {
+      // A real track may have appeared while Lyria works — it wins.
+      const pick = pickNextTrack(apPickArgs(m));
+      if (pick) {
+        m.genToken += 1; // invalidate the in-flight generation result
+        m.genAttempted = true;
+        apClearLoop(m.playingKey);
+        m.fallbackLoop = null;
+        apBeginPrepare(m, pick, true, now);
+        return;
+      }
+      if (m.genBridge) {
+        const bridge = m.genBridge;
+        m.genBridge = null;
+        const id = apLoadBridge(m.freeKey, bridge);
+        m.nextId = id;
+        m.nextTitle = '🤖 AI bridge (Lyria-generated loop)';
+        m.nextIsBridge = true;
+        m.synced = false;
+        m.immediateBlend = false;
+        m.phase = 'preparing';
+        m.loadStartWall = now;
+        return;
+      }
+      pushApStatus({
+        on: true, phase: 'generating', playingKey: m.playingKey,
+        nextTitle: null, barsToGo: null, blendProgress: null, bass: null,
+        note: 'Generating next with AI… (Lyria) — holding the outro loop meanwhile.',
+      });
+      return;
+    }
+
+    if (m.phase === 'fallback') {
+      const pick = pickNextTrack(apPickArgs(m));
+      if (pick) {
+        apClearLoop(m.playingKey);
+        m.fallbackLoop = null;
+        apBeginPrepare(m, pick, true, now);
+        return;
+      }
+      pushApStatus({
+        on: true, phase: 'fallback', playingKey: m.playingKey,
+        nextTitle: null, barsToGo: null, blendProgress: null, bass: null,
+        note: m.genError ?? 'No queue or library pick — holding the outro loop.',
+      });
+      return;
+    }
+
+    // ── crossfading ──
+    const fSt = deckStateRef.current[m.freeKey];
+    if (!engine.isPlaying(fId)) {
+      // Incoming deck died mid-blend: snap back, restore EQ, let go.
+      apSetCrossfader(m.fromV);
+      if (m.eqSnap) apRestoreEq(m);
+      apRef.current = null;
+      return;
+    }
+    const prog = Math.min(1, Math.max(0, (now - m.blendStartWall) / Math.max(0.1, m.blendSec)));
+    apSetCrossfader(m.fromV + (m.toV - m.fromV) * prog);
+    // EQ-aware handover: read both tracks' bass envelopes live and swap
+    // the bass at the first musical moment (outgoing bass out, incoming
+    // bass in), never before 2 bars into the blend.
+    if (!m.bassSwapped && m.eqSnap) {
+      const minBlendSec = 2 * barSeconds(pSt.track!.beatGrid);
+      if (now - m.blendStartWall >= minBlendSec) {
+        const outPos = engine.position(pId);
+        const inPos = engine.position(fId);
+        if (swapReady(trackBassEnvelope(pSt.track), outPos, trackBassEnvelope(fSt.track), inPos)) {
+          m.bassSwapped = true;
+          m.swapStartWall = now;
+        }
+      }
+    }
+    if (m.bassSwapped && m.swapStartWall !== null && m.eqSnap) {
+      // Simultaneous 1-beat cross-ramp: at no point are both basses full.
+      const beatSec = barSeconds(pSt.track!.beatGrid) / 4;
+      const sp = Math.min(1, Math.max(0, (now - m.swapStartWall) / Math.max(0.1, beatSec)));
+      apSetEq(m.playingKey, m.eqSnap.outLow + (-1 - m.eqSnap.outLow) * sp);
+      apSetEq(m.freeKey, -1 + (m.eqSnap.inLow - -1) * sp);
+      if (sp >= 1) m.swapStartWall = null;
+    }
+    const oldEnded = !engine.isPlaying(pId);
+    if (prog >= 1 || oldEnded) {
+      apFinishTransition(m);
+      return;
+    }
+    pushApStatus({
+      on: true, phase: 'crossfading', playingKey: m.playingKey,
+      nextTitle: m.nextTitle, barsToGo: null,
+      blendProgress: Math.round(prog * 100) / 100,
+      bass: m.bassSwapped ? 'swapped' : 'cut', note: null,
+    });
+  }, []);
+
+  useEffect(() => {
+    if (!apOn) return;
+    const id = window.setInterval(() => apTick(), 250);
+    return () => window.clearInterval(id);
+  }, [apOn, apTick]);
+
+  /** Takeover: stop driving NOW, restore automated EQ, touch nothing else. */
+  const toggleAp = useCallback(() => {
+    if (apOnRef.current) {
+      const m = apRef.current;
+      if (m?.eqSnap) apRestoreEq(m);
+      apRef.current = null;
+      setApOn(false);
+      setApStatus(AP_OFF_STATUS);
+      debugLog('transport', 'autopilot off (takeover)');
+    } else {
+      setApOn(true);
+      setApStatus({
+        on: true, phase: 'idle', playingKey: null, nextTitle: null,
+        barsToGo: null, blendProgress: null, bass: null, note: null,
+      });
+      debugLog('transport', 'autopilot on');
+    }
+  }, []);
+
+  const apQueueAdd = (id: string) => setApQueueIds((ids) => (ids.includes(id) ? ids : [...ids, id]));
+  const apQueueRemove = (id: string) => setApQueueIds((ids) => ids.filter((x) => x !== id));
+  const apQueueMove = (id: string, dir: -1 | 1) =>
+    setApQueueIds((ids) => {
+      const i = ids.indexOf(id);
+      const j = i + dir;
+      if (i < 0 || j < 0 || j >= ids.length) return ids;
+      const next = [...ids];
+      const tmp = next[i];
+      next[i] = next[j];
+      next[j] = tmp;
+      return next;
+    });
+  const apQueueClear = () => setApQueueIds([]);
+  const apQueueTracks = apQueueIds
+    .map((id) => tracks.find((t) => t.id === id))
+    .filter((t): t is TrackInfo => !!t);
+
   // ─── AI deck ──────────────────────────────────────────────────────────────
   const dropAiLoop = useCallback((loop: GeneratedLoop) => {
     const deckId = 'deckC';
@@ -890,6 +1491,15 @@ export default function App() {
             )}
           </span>
         </div>
+        <button
+          onClick={toggleAp}
+          className={`rounded px-4 py-1.5 text-sm font-black tracking-wide ${
+            apOn ? 'bg-red-600 text-white hover:bg-red-500' : 'bg-zinc-800 text-zinc-200 hover:bg-zinc-700'
+          }`}
+          title={apOn ? 'Tap to take back manual control instantly — audio keeps playing' : 'Let the mixer blend the next track automatically'}
+        >
+          {apOn ? '⏹ AUTOPILOT ON — TAP TO TAKE OVER' : '🤖 AUTOPILOT'}
+        </button>
         <div className="ml-auto flex items-center gap-2">
           <details className="relative">
             <summary className="cursor-pointer rounded bg-zinc-800 px-3 py-1.5 text-xs text-zinc-300 hover:bg-zinc-700">
@@ -992,6 +1602,20 @@ export default function App() {
         </div>
       </header>
 
+      {apOn && (
+        <AutoPilot
+          status={apStatus}
+          outroBars={apOutroBars}
+          onToggle={toggleAp}
+          onOutroBars={setApOutroBars}
+          queue={apQueueTracks}
+          library={tracks}
+          onQueueAdd={apQueueAdd}
+          onQueueRemove={apQueueRemove}
+          onQueueMove={apQueueMove}
+          onQueueClear={apQueueClear}
+        />
+      )}
       {debugOpen && <div className="pt-3"><DebugPanel /></div>}
 
       {/* Sync view — ported top waveforms, center playhead (item 1) */}

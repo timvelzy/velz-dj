@@ -1178,6 +1178,20 @@ export class DJEngine {
     debugLog('param', `eq ${band}`, id, { knob: v, db, kill });
   }
 
+  /**
+   * Same EQ move as setEq but without the debug-log line — for autopilot
+   * automation ticks, which would otherwise flood the log several times a
+   * second for the whole blend. The parameter smoothing (tau 0.05) is what
+   * keeps automated moves click-free.
+   */
+  setEqAuto(id: string, band: 'low' | 'mid' | 'high', v: number): void {
+    const d = this.decks.get(id);
+    if (!d) return;
+    const t = this.ctx.currentTime;
+    const node = band === 'low' ? d.eqLow : band === 'mid' ? d.eqMid : d.eqHigh;
+    node.gain.setTargetAtTime(clamp(v, -1, 1) * 26, t, 0.05);
+  }
+
   setFilter(id: string, v: number): void {
     const d = this.decks.get(id);
     if (!d) return;
