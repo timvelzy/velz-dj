@@ -11,9 +11,65 @@
  */
 
 import type { BeatGrid, SpectralData } from '../types';
+import { debugLog } from './debugLog';
 
 const MIN_BPM = 60;
 const MAX_BPM = 200;
+
+/**
+ * Median-interval BPM from an onset list in seconds. Returns the folded BPM,
+ * the fraction of intervals that agreed with the median (consistency), and
+ * a stability score (1 - std/mean over all intervals, as before).
+ * Exported for tests / grid-editor diagnostics.
+ */
+export function medianBpmFromOnsets(onsets: number[]): { bpm: number; consistency: number; count: number; stability: number } {
+  const intervals: number[] = [];
+  for (let i = 1; i < onsets.length; i++) {
+    const bpm = 60 / (onsets[i] - onsets[i - 1]);
+    if (bpm >= MIN_BPM / 2 && bpm <= MAX_BPM * 2) intervals.push(onsets[i] - onsets[i - 1]);
+  }
+  if (intervals.length < 2) return { bpm: 0, consistency: 0, count: 0, stability: 0 };
+  intervals.sort((a, b) => a - b);
+  const median = intervals[Math.floor(intervals.length / 2)];
+  const tol = median * 0.05;
+  const consistent = intervals.filter((v) => Math.abs(v - median) <= tol);
+  const avg = consistent.reduce((s, v) => s + v, 0) / consistent.length;
+  const variance = intervals.reduce((s, v) => s + (v - avg) ** 2, 0) / intervals.length;
+  return {
+    bpm: foldBpm(60 / avg),
+    consistency: consistent.length / intervals.length,
+    count: intervals.length,
+    stability: Math.max(0.1, 1 - Math.sqrt(variance) / avg),
+  };
+}
+
+/**
+ * Onset picker shared by the full-band and kick-band streams: adaptive
+ * threshold + local-maximum check + refractory window, all in dsRate units.
+ * Exported for tests / grid-editor diagnostics.
+ */
+export function pickOnsets(sig: Float32Array, dsRate: number, mult: number): number[] {
+  let sum = 0;
+  for (let i = 0; i < sig.length; i++) sum += sig[i];
+  const threshold = (sum / sig.length) * mult;
+  const minInterval = Math.floor(dsRate * 60 / MAX_BPM);
+  const win = Math.floor(dsRate * 0.05);
+  const onsets: number[] = [];
+  let last = -minInterval;
+  for (let i = 0; i < sig.length; i++) {
+    if (sig[i] > threshold && i - last >= minInterval) {
+      let isMax = true;
+      for (let j = Math.max(0, i - win); j < Math.min(sig.length, i + win); j++) {
+        if (sig[j] > sig[i]) { isMax = false; break; }
+      }
+      if (isMax) {
+        onsets.push(i / dsRate);
+        last = i;
+      }
+    }
+  }
+  return onsets;
+}
 
 export interface AnalysisResult {
   grid: BeatGrid;
@@ -52,8 +108,14 @@ async function buildBeatMap(
 ): Promise<{ beats: number[]; bpmCurve: number[]; stability: number }> {
   const SECTION_SEC = 8;
   const HOP_SEC = 4;
-  const DOWNSAMPLE = 8000;
-  const ratio = Math.max(1, Math.floor(sampleRate / DOWNSAMPLE));
+  const TARGET_RATE = 8000;
+  const ratio = Math.max(1, Math.floor(sampleRate / TARGET_RATE));
+  // The true downsampled rate is sampleRate/ratio, NOT 8000, unless the
+  // sample rate is an exact multiple of 8000. The old code divided sample
+  // indices by 8000 unconditionally, which stretched all times by
+  // sampleRate/ratio/8000 (×1.1025 at 44.1 kHz) and read every 44.1 kHz
+  // track ~9% slow. All time conversions below use dsRate.
+  const dsRate = sampleRate / ratio;
 
   // Full-track onset detection (downsampled)
   const totalLen = Math.floor((channelData.length / ratio));
@@ -72,19 +134,19 @@ async function buildBeatMap(
 
   // Per-section BPM via onset interval histogram
   const sections: { start: number; bpm: number; weight: number }[] = [];
-  const secLen = Math.floor(SECTION_SEC * DOWNSAMPLE);
-  const hopLen = Math.floor(HOP_SEC * DOWNSAMPLE);
+  const secLen = Math.floor(SECTION_SEC * dsRate);
+  const hopLen = Math.floor(HOP_SEC * dsRate);
   let sIdx = 0;
   for (let s = 0; s + secLen <= totalLen; s += hopLen, sIdx++) {
     const onsets: number[] = [];
     let sum = 0;
     for (let i = s; i < s + secLen; i++) sum += tr[i];
     const thr = (sum / secLen) * 3.5;
-    const minInt = Math.floor(DOWNSAMPLE * 60 / MAX_BPM);
+    const minInt = Math.floor(dsRate * 60 / MAX_BPM);
     let last = -minInt;
     for (let i = s; i < s + secLen; i++) {
       if (tr[i] > thr && i - last >= minInt) {
-        onsets.push((i - s) / DOWNSAMPLE);
+        onsets.push((i - s) / dsRate);
         last = i;
       }
     }
@@ -109,7 +171,7 @@ async function buildBeatMap(
             const cand = baseBpm * mult;
             if (Math.abs(localBpm - cand) / cand < 0.06) { snapped = cand; break; }
           }
-          sections.push({ start: s / DOWNSAMPLE, bpm: snapped, weight: ok.length / ivals.length });
+          sections.push({ start: s / dsRate, bpm: snapped, weight: ok.length / ivals.length });
         }
       }
     }
@@ -131,16 +193,16 @@ async function buildBeatMap(
   const bpmCurve: number[] = [];
   let t = firstBeat;
   let secIdx = 0;
-  const snapWindow = Math.floor(DOWNSAMPLE * 0.06); // ±60ms snap
+  const snapWindow = Math.floor(dsRate * 0.06); // ±60ms snap
 
   const snapToTransient = (time: number): number => {
-    const center = Math.floor(time * DOWNSAMPLE);
+    const center = Math.floor(time * dsRate);
     let best = center;
     let bestV = -1;
     for (let i = Math.max(0, center - snapWindow); i < Math.min(totalLen, center + snapWindow); i++) {
       if (tr[i] > bestV) { bestV = tr[i]; best = i; }
     }
-    return bestV > 0.01 ? best / DOWNSAMPLE : time;
+    return bestV > 0.01 ? best / dsRate : time;
   };
 
   let guard = 0;
@@ -200,84 +262,83 @@ async function detectElectronic(
   buffer: AudioBuffer,
   onProgress?: (p: number) => void,
 ): Promise<Omit<BeatGrid, 'method' | 'beats' | 'bpmCurve'>> {
-  const DOWNSAMPLE = 8000;
+  const TARGET_RATE = 8000;
   const ANALYZE_SEC = 15;
   const ch = buffer.getChannelData(0);
   const sr = buffer.sampleRate;
   const analyzeLen = Math.min(ANALYZE_SEC * sr, ch.length);
-  const ratio = Math.max(1, Math.floor(sr / DOWNSAMPLE));
+  const ratio = Math.max(1, Math.floor(sr / TARGET_RATE));
+  const dsRate = sr / ratio; // true downsampled rate (see buildBeatMap note)
   const dsLen = Math.floor(analyzeLen / ratio);
   const ds = new Float32Array(dsLen);
   for (let i = 0; i < dsLen; i++) ds[i] = ch[i * ratio];
 
-  // Kick emphasis: high-pass-ish transient extraction
-  const kick = new Float32Array(dsLen);
+  // Broadband transient extraction (high-pass-ish, as before)
+  const transient = new Float32Array(dsLen);
   let prev = 0;
   const alpha = 0.8;
   for (let i = 0; i < dsLen; i++) {
     const hp = ds[i] - prev;
     prev = ds[i] * (1 - alpha) + prev * alpha;
-    kick[i] = Math.abs(hp) * 2;
+    transient[i] = Math.abs(hp) * 2;
     if ((i & 4095) === 0) {
       onProgress?.(0.1 + 0.3 * (i / dsLen));
       await yieldControl();
     }
   }
 
-  // Adaptive threshold onset detection
-  let sum = 0;
-  for (let i = 0; i < dsLen; i++) sum += kick[i];
-  const threshold = (sum / dsLen) * 4;
-  const minInterval = Math.floor(DOWNSAMPLE * 60 / MAX_BPM);
-  const onsets: number[] = [];
-  let last = -minInterval;
-  const win = Math.floor(DOWNSAMPLE * 0.05);
+  // Full-band onsets
+  const onsets = pickOnsets(transient, dsRate, 4);
+
+  // Kick-band onsets: a one-pole lowpass (fc ~160 Hz) isolates kick energy,
+  // then the ENERGY ENVELOPE of that band is tracked (squared + smoothed)
+  // and its positive flux marks kick onsets. The kick defines the beat in
+  // dance music; the full-band stream is easily hijacked by a dominant
+  // dotted-eighth arp or syncopated layer. That hijack is the reported
+  // 120 -> 160 error: the median interval locks onto the 0.375 s dotted
+  // grid (120 x 4/3) instead of the 0.5 s kick grid.
+  // NOTE: a high-pass transient filter does NOT work on the lowpassed
+  // signal — it kills the kick fundamental itself (55 Hz passes straight
+  // through the tracker), leaving only high-frequency bleed. The envelope
+  // flux is what actually sees the kick.
+  const lp = new Float32Array(dsLen);
+  const la = 1 - Math.exp(-2 * Math.PI * 160 / dsRate);
+  let lpPrev = 0;
   for (let i = 0; i < dsLen; i++) {
-    if (kick[i] > threshold && i - last >= minInterval) {
-      let isMax = true;
-      for (let j = Math.max(0, i - win); j < Math.min(dsLen, i + win); j++) {
-        if (kick[j] > kick[i]) { isMax = false; break; }
-      }
-      if (isMax) {
-        onsets.push(i / DOWNSAMPLE);
-        last = i;
-      }
-    }
-    if ((i & 8191) === 0) {
-      onProgress?.(0.4 + 0.3 * (i / dsLen));
-      await yieldControl();
-    }
+    lpPrev += la * (ds[i] - lpPrev);
+    lp[i] = lpPrev;
+  }
+  const env = new Float32Array(dsLen);
+  const ea = 1 - Math.exp(-2 * Math.PI * 50 / dsRate);
+  let ePrev = 0;
+  for (let i = 0; i < dsLen; i++) {
+    const sq = lp[i] * lp[i];
+    ePrev += ea * (sq - ePrev);
+    env[i] = ePrev;
+  }
+  const flux = new Float32Array(dsLen);
+  for (let i = 1; i < dsLen; i++) flux[i] = Math.max(0, env[i] - env[i - 1]);
+  const kickOnsets = pickOnsets(flux, dsRate, 4);
+
+  const full = medianBpmFromOnsets(onsets);
+  const kickRes = medianBpmFromOnsets(kickOnsets);
+  // Prefer the kick stream when it is well-defined; otherwise full-band.
+  const useKick = kickOnsets.length >= 4 && kickRes.bpm > 0 && kickRes.consistency >= 0.5;
+  const chosen = useKick ? kickRes : full;
+  const anchorOnsets = useKick ? kickOnsets : onsets;
+
+  if (chosen.bpm <= 0 || anchorOnsets.length < 4) {
+    return { bpm: 0, confidence: 0, downbeatOffset: -1, firstBeat: anchorOnsets[0] ?? onsets[0] ?? 0, tempoStability: 0 };
   }
 
-  if (onsets.length < 4) {
-    return { bpm: 0, confidence: 0, downbeatOffset: -1, firstBeat: 0, tempoStability: 0 };
-  }
+  const bpm = chosen.bpm;
+  const confidence = Math.min(0.95, chosen.consistency * 0.9);
 
-  const intervals: number[] = [];
-  for (let i = 1; i < onsets.length; i++) {
-    const bpm = 60 / (onsets[i] - onsets[i - 1]);
-    if (bpm >= MIN_BPM / 2 && bpm <= MAX_BPM * 2) intervals.push(onsets[i] - onsets[i - 1]);
-  }
-  if (intervals.length < 2) {
-    return { bpm: 0, confidence: 0, downbeatOffset: -1, firstBeat: onsets[0] ?? 0, tempoStability: 0 };
-  }
-
-  intervals.sort((a, b) => a - b);
-  const median = intervals[Math.floor(intervals.length / 2)];
-  const tol = median * 0.05;
-  const consistent = intervals.filter((v) => Math.abs(v - median) <= tol);
-  const avg = consistent.reduce((s, v) => s + v, 0) / consistent.length;
-  const bpm = foldBpm(60 / avg);
-
-  const variance = intervals.reduce((s, v) => s + (v - avg) ** 2, 0) / intervals.length;
-  const stability = Math.max(0.1, 1 - Math.sqrt(variance) / avg);
-  const confidence = Math.min(0.95, (consistent.length / intervals.length) * 0.9);
-
-  const firstBeat = onsets[0];
+  const firstBeat = anchorOnsets[0];
   const beats = generateBeats(bpm, buffer.duration, firstBeat);
   const downbeatOffset = detectDownbeat(ch, sr, beats);
   onProgress?.(0.9);
-  return { bpm: Math.round(bpm * 10) / 10, confidence, downbeatOffset, firstBeat, tempoStability: stability };
+  return { bpm: Math.round(bpm * 10) / 10, confidence, downbeatOffset, firstBeat, tempoStability: chosen.stability };
 }
 
 // ─── General (lowpass peak) detector — fallback path ─────────────────────────
@@ -435,6 +496,13 @@ export async function analyzeTrack(
     bpmCurve,
   };
   onProgress?.(0.95);
+  debugLog('analysis', 'track analyzed', undefined, {
+    bpm: grid.bpm,
+    confidence: grid.confidence,
+    method: grid.method,
+    beats: beats.length,
+    stability: grid.tempoStability,
+  });
   const spectralData = await analyzeSpectrum(buffer);
   onProgress?.(1);
   return { grid, spectralData };
