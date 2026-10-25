@@ -66,6 +66,12 @@ export interface TrackInfo {
   peaks?: BandPeaks;
   /** Original file — kept so tracks can be (re)loaded to decks */
   file?: File;
+  /** Stable library identity (name + size + last modified) — the
+      IndexedDB key for this track's saved record, when it has one. */
+  fileKey?: string;
+  /** True for tracks restored from the saved library (stored beat grid +
+      peaks, so loading one to a deck skips re-analysis). */
+  restored?: boolean;
   /** True while background analysis is still running */
   analyzing?: boolean;
   /** 0..1 analysis progress (meaningful while analyzing) */
