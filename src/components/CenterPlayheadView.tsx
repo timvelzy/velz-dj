@@ -16,10 +16,35 @@
  *  - DetailedScrollingWaveform.tsx: band-colored scrolling waveform (bass /
  *    mid / high get different colors).
  *
+ * Reconciled against Tim's screenshot (2026-10-24): the screenshot's top
+ * card is groove's DualOverviewWaveform — verified identical in the Lovable
+ * project 9d079ecf-4090-4d38-97b5-945d8cc7e96b (commit 974548c, read through
+ * the Lovable connector) and the local copy. Its row content is a left
+ * overlay with deck dot + label, SYNC/LEAD badge, title, BPM badge, play /
+ * CUE buttons, and time readout. This view keeps that row CONTENT (plus a
+ * track-info line: artist, file size, format, tempo stability) but NOT
+ * groove's renderer: the previous commit's DualDeckWaveform /
+ * ProfessionalWaveform patterns are superseded here. One coherent path per
+ * element, never groove's duplicates: groove's rewrite era left ten
+ * waveform components and ~3 audio engines in that project, and none of
+ * that duplication is replicated here. Waveform rendering is this file's
+ * single canvas renderer (band colors + beatgrid + fixed center playhead),
+ * deck panels stay velz-dj's Deck.tsx, the mixer stays velz-dj's
+ * Mixer.tsx, the AI panel stays AIDeck.tsx, and BPM detection stays
+ * velz-dj's fixed detector (not groove's).
+ *
  * What is NEW here (no groove version has it): the playhead is FIXED at the
  * center of each row while both waveforms scroll past it, driven by the
  * velz-dj engine's tempo-integrated position — so beat alignment between
  * the decks reads at a glance. The side waveforms in Deck.tsx are untouched.
+ *
+ * Performance (live-DJ requirement): the canvas loop is driven by refs,
+ * not React state. The draw effect depends only on zoom/height; deck
+ * props and peaks are read through refs, so App re-renders never tear
+ * down and restart the loop, and nothing per-frame touches React state.
+ * The time readout is an isolated component with its own 250 ms tick, so
+ * it re-renders one span, not the row. Peak data is memoized. Scrubbing,
+ * cueing, and the scrolling playhead therefore never jank on React churn.
  *
  * What was deliberately NOT ported: groove's sync/tempo logic (its sync was
  * not great either — velz-dj keeps its continuous-PLL sync), groove's audio
@@ -52,6 +77,15 @@ export interface TopDeckView {
   grid: BeatGrid | null;
   peaks: BandPeaks | null;
   bpm: number;
+  /** Groove DualOverviewWaveform logic: SYNC when the deck follows the
+   *  master tempo, LEAD when it leads. Omitted for the AI row. */
+  syncActive?: boolean;
+  /** Track-card info (screenshot deck panels). Omitted for the AI row. */
+  artist?: string;
+  fileSize?: number;
+  format?: string;
+  /** Tempo stability 0..1, from the beat grid. */
+  stability?: number;
   isPlaying: boolean;
   onPlayPause: () => void;
   onCueDown: () => void;
@@ -92,28 +126,53 @@ function fmtTime(t: number): string {
   return `${m}:${s.toString().padStart(2, '0')}`;
 }
 
+function fmtSize(bytes: number): string {
+  if (bytes >= 1048576) return `${(bytes / 1048576).toFixed(1)} MB`;
+  if (bytes >= 1024) return `${Math.round(bytes / 1024)} KB`;
+  return `${bytes} B`;
+}
+
+/** Isolated time readout: its own 250 ms tick re-renders only this span,
+ *  never the waveform row or its canvas loop. */
+function TimeReadout({ deckId, duration, isPlaying }: { deckId: TopDeckView['deckId']; duration: number; isPlaying: boolean }) {
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    if (!isPlaying) return;
+    const id = window.setInterval(() => setTick((t) => t + 1), 250);
+    return () => window.clearInterval(id);
+  }, [isPlaying]);
+  return (
+    <span className="font-mono text-[11px] text-zinc-500">
+      {fmtTime(engine.position(deckId))} / {fmtTime(duration)}
+    </span>
+  );
+}
+
 function TopWaveformRow({ deck, pxPerSec, height }: RowProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
   const dragRef = useRef(false);
-  const [, setTick] = useState(0);
 
   const mono = useMemo(
     () => (deck.buffer && !deck.peaks ? computePeaks(deck.buffer, Math.max(512, Math.floor(deck.buffer.duration * 40))) : null),
     [deck.buffer, deck.peaks],
   );
 
-  // Re-render the time readout ~4x/sec while playing (cheap; canvas is rAF).
-  useEffect(() => {
-    if (!deck.isPlaying) return;
-    const id = window.setInterval(() => setTick((t) => t + 1), 250);
-    return () => window.clearInterval(id);
-  }, [deck.isPlaying]);
+  // Performance: the draw loop reads deck props through refs, so its
+  // effect depends only on zoom/height. App re-renders never tear down
+  // and restart the canvas loop. (The loop is persistent: when a track
+  // loads later, the next frame picks up the new canvas/buffer.)
+  const deckRef = useRef(deck);
+  deckRef.current = deck;
+  const monoRef = useRef(mono);
+  monoRef.current = mono;
 
   useEffect(() => {
     let raf = 0;
     const draw = () => {
       raf = requestAnimationFrame(draw);
+      const deck = deckRef.current;
+      const mono = monoRef.current;
       const canvas = canvasRef.current;
       const wrap = wrapRef.current;
       if (!canvas || !wrap || !deck.buffer) return;
@@ -239,7 +298,7 @@ function TopWaveformRow({ deck, pxPerSec, height }: RowProps) {
     };
     raf = requestAnimationFrame(draw);
     return () => cancelAnimationFrame(raf);
-  }, [deck, mono, pxPerSec, height]);
+  }, [pxPerSec, height]);
 
   const seekFromEvent = (e: React.PointerEvent) => {
     if (!deck.buffer || !wrapRef.current) return;
@@ -250,15 +309,18 @@ function TopWaveformRow({ deck, pxPerSec, height }: RowProps) {
     deck.onSeek(Math.max(0, Math.min(deck.buffer.duration, viewStart + x / pxPerSec)));
   };
 
-  const pos = deck.buffer ? engine.position(deck.deckId) : 0;
-  const dur = deck.buffer?.duration ?? 0;
-
   return (
     <div>
-      {/* Per-deck header + second transport set (groove ProfessionalWaveform pattern) */}
+      {/* Per-deck header + second transport set (groove DualOverviewWaveform
+          row content: dot + label + SYNC/LEAD badge + BPM badge + title) */}
       <div className="flex flex-wrap items-center gap-2 px-2 py-1.5">
         <span className="h-2.5 w-2.5 rounded-full" style={{ background: deck.color }} />
         <span className="text-xs font-bold text-zinc-200">DECK {deck.label}</span>
+        {deck.syncActive !== undefined && (
+          <span className={`rounded px-1.5 py-0.5 text-[10px] font-bold ${deck.syncActive ? 'bg-cyan-500/20 text-cyan-300' : 'bg-orange-500/20 text-orange-300'}`}>
+            {deck.syncActive ? 'SYNC' : 'LEAD'}
+          </span>
+        )}
         {deck.bpm > 0 && (
           <span className="rounded border border-zinc-700 px-1.5 py-0.5 font-mono text-[10px] text-zinc-300">
             {deck.bpm.toFixed(1)} BPM
@@ -298,11 +360,20 @@ function TopWaveformRow({ deck, pxPerSec, height }: RowProps) {
           >
             Set cue
           </button>
-          <span className="font-mono text-[11px] text-zinc-500">
-            {fmtTime(pos)} / {fmtTime(dur)}
-          </span>
+          <TimeReadout deckId={deck.deckId} duration={deck.buffer?.duration ?? 0} isPlaying={deck.isPlaying} />
         </span>
       </div>
+      {/* Track-card info line (screenshot deck panels) */}
+      {deck.artist !== undefined && (
+        <div className="flex flex-wrap items-center gap-2 px-2 pb-1 text-[11px] text-zinc-500">
+          <span>{deck.artist.trim() ? deck.artist : 'Unknown Artist'}</span>
+          {deck.fileSize !== undefined && <span>{fmtSize(deck.fileSize)}</span>}
+          {deck.format && (
+            <span className="rounded border border-zinc-700 px-1 py-px font-mono text-[10px] text-zinc-400">{deck.format}</span>
+          )}
+          {deck.stability !== undefined && <span>STABILITY: {Math.round(deck.stability * 100)}%</span>}
+        </div>
+      )}
       {/* Scrolling waveform, center playhead */}
       <div
         ref={wrapRef}

@@ -9,10 +9,14 @@
  *    pretends to generate with a setTimeout. The included DemoSynthBackend is
  *    a real (if simple) synthesized loop generator, clearly labeled DEMO.
  *
- * Plugging in a real backend (e.g. Vertex Lyria via a server endpoint, or
- * Stable Audio's API): implement the AIGenerationBackend interface — the queue
- * calls generate() with the target BPM, key, bars and a prompt/style, and
- * expects an AudioBuffer back. See README for the full walkthrough.
+ * Real backend (2026-10-24): LyriaLoopBackend implements the
+ * AIGenerationBackend interface against the Gemini API Interactions API
+ * (ai.google.dev/gemini-api/docs/music-generation) with model
+ * 'lyria-3-clip-preview' — real AI-generated 30 s MP3 clips, sliced to the
+ * requested bar length. The queue calls generate() with the target BPM,
+ * key, bars and a prompt/style, and expects an AudioBuffer back.
+ * Lyria RealTime (models/lyria-realtime-exp, steerable live session) is
+ * NOT built here — a future steering option only.
  */
 
 import type { BeatGrid } from '../types';
@@ -35,6 +39,9 @@ export interface GeneratedLoop {
 
 export interface AIGenerationBackend {
   readonly name: string;
+  /** 'demo-synth' = procedural in-engine synth (honest DEMO label);
+   *  'lyria' = real Gemini AI generation. The UI badges on this, never on prose. */
+  readonly kind: 'demo-synth' | 'lyria';
   readonly isConfigured: boolean;
   readonly statusHint: string; // shown in the UI when not configured
   /**
@@ -76,6 +83,7 @@ function camelotToRootFreq(camelot: string): number {
 
 export class DemoSynthBackend implements AIGenerationBackend {
   readonly name = 'Built-in Synth (procedural)';
+  readonly kind = 'demo-synth' as const;
   readonly isConfigured = true;
   readonly knownExactBpm = true;
   readonly statusHint = 'Procedurally synthesized loops — real audio generated in-engine, no network needed.';
@@ -223,35 +231,152 @@ export class DemoSynthBackend implements AIGenerationBackend {
   }
 }
 
-// ─── API backend slot (Phase 7) ─────────────────────────────────────────────
-// Typed, DISABLED-BY-DEFAULT stub for an external generation API
-// (Stable Audio, Lyria, a self-hosted endpoint, …). To enable: construct
-// with a real endpoint (+ key) and pass it to LoopQueue in App.tsx instead
-// of DemoSynthBackend. knownExactBpm stays false, so anything it returns
-// is re-measured by the beat detector before it can be dropped.
+// ─── Gemini Lyria backend (real AI generation) ──────────────────────────────
+// Verified against Google's own docs (ai.google.dev/gemini-api/docs/music-generation):
+//   import { GoogleGenAI } from '@google/genai';
+//   const client = new GoogleGenAI({ apiKey });
+//   const interaction = await client.interactions.create({
+//     model: 'lyria-3-clip-preview', input: prompt,
+//   });
+//   interaction.output_audio.data  → base64 MP3, 44.1 kHz stereo, 30 s fixed.
+// REST equivalent: POST https://generativelanguage.googleapis.com/v1beta/interactions
+// with header x-goog-api-key and body { model, input }.
+//
+// The API key is NEVER hardcoded or committed. Resolution order:
+//   1. localStorage 'velz-dj:gemini-api-key' — set in the AI deck's key field.
+//      This works on the deployed Azure site with no rebuild: it is the
+//      recommended route for Tim.
+//   2. VITE_GEMINI_API_KEY at build time (dev builds / .env).
+// Get a key at Google AI Studio. Without a key, App.tsx selects the
+// clearly-labeled DemoSynthBackend — nothing ever pretends to be AI audio.
+// knownExactBpm stays false, so Lyria output is re-measured by the beat
+// detector before it can be dropped.
 
-export interface ApiLoopConfig {
-  endpoint?: string;
-  apiKey?: string;
+export const GEMINI_KEY_STORAGE = 'velz-dj:gemini-api-key';
+
+export function resolveGeminiApiKey(): string {
+  try {
+    const stored = window.localStorage.getItem(GEMINI_KEY_STORAGE);
+    if (stored && stored.trim()) return stored.trim();
+  } catch { /* private mode etc. — fall through to build-time env */ }
+  const env = (import.meta as unknown as { env?: Record<string, string | undefined> }).env;
+  return env?.VITE_GEMINI_API_KEY?.trim() ?? '';
 }
 
-export class ApiLoopBackend implements AIGenerationBackend {
-  readonly name = 'API backend (not configured)';
+/** Camelot ("8A") → musical key name ("A minor") for the Lyria prompt. */
+export function camelotToKeyName(camelot: string): string {
+  const m = /^(\d{1,2})([AB])$/i.exec(camelot.trim());
+  if (!m) return '';
+  const minor = m[2].toUpperCase() === 'A';
+  const num = parseInt(m[1], 10);
+  const minorNumToName: Record<number, string> = { 5: 'C', 12: 'C#', 7: 'D', 2: 'D#', 9: 'E', 4: 'F', 11: 'F#', 6: 'G', 1: 'G#', 8: 'A', 3: 'A#', 10: 'B' };
+  const majorNumToName: Record<number, string> = { 8: 'C', 3: 'C#', 10: 'D', 5: 'D#', 12: 'E', 7: 'F', 2: 'F#', 9: 'G', 4: 'G#', 11: 'A', 6: 'A#', 1: 'B' };
+  const name = minor ? minorNumToName[num] : majorNumToName[num];
+  if (!name) return '';
+  return `${name} ${minor ? 'minor' : 'major'}`;
+}
+
+/** Map a loop spec to the Lyria text prompt. Exported for testing. */
+export function buildLyriaPrompt(spec: LoopSpec): string {
+  const style = spec.style.trim() || 'house';
+  const keyName = camelotToKeyName(spec.key);
+  const keyPart = keyName ? ` in ${keyName}` : '';
+  return `An instrumental ${style} DJ loop at ${spec.bpm.toFixed(1)} BPM${keyPart}, ${spec.bars} bars, loopable, steady dance groove, no vocals.`;
+}
+
+export interface LyriaInteraction {
+  output_audio?: { data?: string } | null;
+  output_text?: string | null;
+}
+
+export type LyriaClient = {
+  interactions: {
+    create: (params: { model: string; input: string }) => Promise<LyriaInteraction>;
+  };
+};
+
+export interface LyriaLoopConfig {
+  apiKey: string;
+  model?: 'lyria-3-clip-preview' | 'lyria-3.5';
+  /** Injectable client factory — the plumbing test passes a stub. */
+  clientFactory?: (apiKey: string) => Promise<LyriaClient>;
+}
+
+/** Lyria 3 Clip always returns a fixed 30-second clip (per Google's docs). */
+const LYRIA_CLIP_SECONDS = 30;
+
+export class LyriaLoopBackend implements AIGenerationBackend {
+  readonly kind = 'lyria' as const;
+  readonly name = 'Gemini Lyria (lyria-3-clip-preview)';
   readonly knownExactBpm = false;
   readonly statusHint =
-    'No API endpoint configured. The built-in procedural synth is the working generator; ' +
-    'to use an external model, construct ApiLoopBackend with an endpoint in src/audio/ai.ts.';
+    'Real AI generation via the Gemini API (Lyria 3 Clip). Needs a Gemini API key — paste one in the AI deck key field.';
+  readonly model: string;
 
-  constructor(private config: ApiLoopConfig = {}) {}
-
-  get isConfigured(): boolean {
-    return typeof this.config.endpoint === 'string' && this.config.endpoint.length > 0;
+  constructor(private config: LyriaLoopConfig) {
+    this.model = config.model ?? 'lyria-3-clip-preview';
   }
 
-  async generate(_spec: LoopSpec, _ctx: BaseAudioContext): Promise<AudioBuffer> {
-    // Intentionally unimplemented until an endpoint is configured —
-    // no fake generation path.
-    throw new Error(this.statusHint);
+  get isConfigured(): boolean {
+    return this.config.apiKey.trim().length > 0;
+  }
+
+  private async defaultClient(apiKey: string): Promise<LyriaClient> {
+    // Dynamic import: the @google/genai SDK only loads when Lyria is
+    // actually used, keeping it out of the initial bundle for live DJing.
+    const { GoogleGenAI } = await import('@google/genai');
+    const client = new GoogleGenAI({ apiKey });
+    return {
+      interactions: {
+        create: async (params) =>
+          (await client.interactions.create(params)) as unknown as LyriaInteraction,
+      },
+    };
+  }
+
+  async generate(spec: LoopSpec, ctx: BaseAudioContext): Promise<AudioBuffer> {
+    if (!this.isConfigured) {
+      throw new Error(
+        'No Gemini API key configured. Paste a Gemini API key in the AI deck key field ' +
+        '(stored only in this browser) or set VITE_GEMINI_API_KEY at build time.',
+      );
+    }
+    const prompt = buildLyriaPrompt(spec);
+    const factory = this.config.clientFactory ?? ((key: string) => this.defaultClient(key));
+    const client = await factory(this.config.apiKey);
+    const interaction = await client.interactions.create({ model: this.model, input: prompt });
+    const b64 = interaction.output_audio?.data;
+    if (!b64) {
+      throw new Error(
+        'Lyria returned no audio. The request may have been filtered or the model returned text only — try a different style prompt.',
+      );
+    }
+    // base64 → bytes (browser-safe, no Node Buffer).
+    const bin = atob(b64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    const clip = await ctx.decodeAudioData(
+      bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength),
+    );
+    // Slice the fixed-length clip to the requested bar length at target BPM.
+    const targetDur = spec.bars * 4 * (60 / spec.bpm);
+    if (targetDur > clip.duration + 0.05) {
+      throw new Error(
+        `Requested loop (${spec.bars} bars at ${spec.bpm.toFixed(1)} BPM = ${targetDur.toFixed(1)}s) ` +
+        `is longer than Lyria's fixed ${LYRIA_CLIP_SECONDS}s clip. Use fewer bars or a faster tempo.`,
+      );
+    }
+    const targetLen = Math.round(targetDur * clip.sampleRate);
+    if (Math.abs(clip.length - targetLen) <= 2) return clip;
+    const sliced = new AudioBuffer({
+      length: targetLen,
+      sampleRate: clip.sampleRate,
+      numberOfChannels: clip.numberOfChannels,
+    });
+    for (let c = 0; c < clip.numberOfChannels; c++) {
+      sliced.copyToChannel(clip.getChannelData(c).subarray(0, targetLen), c);
+    }
+    return sliced;
   }
 }
 
@@ -372,6 +497,15 @@ export class LoopQueue {
         this.emit();
       }
     }
+  }
+
+  /** Swap the generation backend (e.g. when a Gemini key is saved/cleared
+   *  in the AI deck). Drops the queued loops: they belong to the old backend. */
+  setBackend(backend: AIGenerationBackend): void {
+    this.backend = backend;
+    this.invalidate();
+    this.error = null;
+    this.emit();
   }
 
   /** Take the oldest queued loop (for drop-in). */

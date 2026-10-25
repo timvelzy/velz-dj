@@ -13,7 +13,7 @@ import {
   loadTraktorCollection,
   clearTraktorCollection,
 } from './audio/traktorStore';
-import { DemoSynthBackend, LoopQueue, type GeneratedLoop } from './audio/ai';
+import { DemoSynthBackend, GEMINI_KEY_STORAGE, LoopQueue, LyriaLoopBackend, resolveGeminiApiKey, type GeneratedLoop } from './audio/ai';
 import { SetRecorder, downloadBlob, formatElapsed, type TracklistEntry } from './audio/recorder';
 import { computeBandPeaks, peaksKey } from './audio/peaks';
 import { loadPeaks, savePeaks } from './audio/peaksStore';
@@ -45,6 +45,13 @@ const deckInit = (): DeckState => ({
 });
 
 let trackSeq = 0;
+
+/** File extension for the top-view track card (WAV, MP3, …). */
+const fileExt = (f?: File): string | undefined => {
+  if (!f) return undefined;
+  const i = f.name.lastIndexOf('.');
+  return i > 0 ? f.name.slice(i + 1).toUpperCase() : undefined;
+};
 
 export default function App() {
   const [ready, setReady] = useState(false);
@@ -101,7 +108,25 @@ export default function App() {
     };
   }, []);
 
-  const queue = useMemo(() => new LoopQueue(new DemoSynthBackend()), []);
+  // AI backend: real Gemini Lyria when a key is configured (localStorage
+  // key field in the AI deck, or VITE_GEMINI_API_KEY at build time),
+  // otherwise the clearly-labeled demo synth. The key is never committed.
+  const [lyriaKey, setLyriaKey] = useState(() => resolveGeminiApiKey());
+  const queue = useMemo(
+    () => new LoopQueue(lyriaKey ? new LyriaLoopBackend({ apiKey: lyriaKey }) : new DemoSynthBackend()),
+    // Initial backend only — later key changes go through applyLyriaKey.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [],
+  );
+  const applyLyriaKey = (key: string) => {
+    const trimmed = key.trim();
+    setLyriaKey(trimmed);
+    try {
+      if (trimmed) window.localStorage.setItem(GEMINI_KEY_STORAGE, trimmed);
+      else window.localStorage.removeItem(GEMINI_KEY_STORAGE);
+    } catch { /* private mode etc. */ }
+    queue.setBackend(trimmed ? new LyriaLoopBackend({ apiKey: trimmed }) : new DemoSynthBackend());
+  };
   const deckState = useCallback((k: 'A' | 'B') => (k === 'A' ? deckA : deckB), [deckA, deckB]);
   const setDeckState = useCallback((k: 'A' | 'B', s: DeckState) => {
     (k === 'A' ? setDeckA : setDeckB)(s);
@@ -747,7 +772,12 @@ export default function App() {
         decks={[
           {
             label: 'A', deckId: 'deckA', color: '#38bdf8',
-            title: deckA.track ? `${deckA.track.artist} — ${deckA.track.title}` : 'No track',
+            title: deckA.track?.title ?? 'No track',
+            syncActive: deckA.syncActive,
+            artist: deckA.track?.artist,
+            fileSize: deckA.track?.file?.size,
+            format: fileExt(deckA.track?.file),
+            stability: deckA.track?.beatGrid.tempoStability,
             buffer: deckA.buffer, grid: deckA.track?.beatGrid ?? null, peaks: deckA.track?.peaks ?? null,
             bpm: deckA.track?.bpm ?? 0, isPlaying: engine.isPlaying('deckA'),
             onPlayPause: () => togglePlay('A'),
@@ -759,7 +789,12 @@ export default function App() {
           },
           {
             label: 'B', deckId: 'deckB', color: '#fb923c',
-            title: deckB.track ? `${deckB.track.artist} — ${deckB.track.title}` : 'No track',
+            title: deckB.track?.title ?? 'No track',
+            syncActive: deckB.syncActive,
+            artist: deckB.track?.artist,
+            fileSize: deckB.track?.file?.size,
+            format: fileExt(deckB.track?.file),
+            stability: deckB.track?.beatGrid.tempoStability,
             buffer: deckB.buffer, grid: deckB.track?.beatGrid ?? null, peaks: deckB.track?.peaks ?? null,
             bpm: deckB.track?.bpm ?? 0, isPlaying: engine.isPlaying('deckB'),
             onPlayPause: () => togglePlay('B'),
@@ -796,6 +831,10 @@ export default function App() {
         >
           <Deck {...deckProps('A')} />
         </div>
+        {/* Center column: mixer on top, AI controls below — the
+            traditional three-channel arrangement (deck A | center | deck B),
+            with the top center-playhead view above. */}
+        <div className="flex min-w-0 flex-col gap-3">
         <Mixer
           chA={chA} chB={chB} chC={chC}
           setChA={setChA} setChB={setChB} setChC={setChC}
@@ -808,25 +847,6 @@ export default function App() {
           phonesLevel={phonesLevel}
           setPhonesLevel={(v) => { setPhonesLevel(v); engine.setPhonesLevel(v); }}
         />
-        <div
-          onDragOver={(e) => e.preventDefault()}
-          onDrop={(e) => {
-            e.preventDefault();
-            const id = e.dataTransfer.getData('text/track-id');
-            if (id) loadLibraryTrack(id, 'B');
-          }}
-        >
-          <Deck {...deckProps('B')} />
-        </div>
-      </main>
-
-      {/* FX unit — beat-synced send/return */}
-      <div className="px-3 pb-3">
-        <FxUnit />
-      </div>
-
-      {/* AI deck — full width */}
-      <div className="px-3 pb-3">
         <AIDeck
           queue={queue}
           masterBpm={masterBpm}
@@ -843,7 +863,25 @@ export default function App() {
           currentLoop={aiLoop}
           buffer={aiBuffer}
           peaks={aiPeaks}
+          lyriaKey={lyriaKey}
+          onLyriaKeyChange={applyLyriaKey}
         />
+        </div>
+        <div
+          onDragOver={(e) => e.preventDefault()}
+          onDrop={(e) => {
+            e.preventDefault();
+            const id = e.dataTransfer.getData('text/track-id');
+            if (id) loadLibraryTrack(id, 'B');
+          }}
+        >
+          <Deck {...deckProps('B')} />
+        </div>
+      </main>
+
+      {/* FX unit — beat-synced send/return */}
+      <div className="px-3 pb-3">
+        <FxUnit />
       </div>
 
       {/* Library */}

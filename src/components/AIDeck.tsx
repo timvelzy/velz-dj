@@ -21,11 +21,15 @@ interface AIDeckProps {
   currentLoop: GeneratedLoop | null;
   buffer: AudioBuffer | null;
   peaks: BandPeaks | null;
+  /** Current Gemini key ('' = demo synth). Saved via onLyriaKeyChange. */
+  lyriaKey: string;
+  onLyriaKeyChange: (key: string) => void;
 }
 
-export default function AIDeck({ queue, masterBpm, masterKey, onDropLoop, isPlaying, onStop, onPlay, onPause, onCueDown, onCueUp, onSetCue, aiCue, currentLoop, buffer, peaks }: AIDeckProps) {
+export default function AIDeck({ queue, masterBpm, masterKey, onDropLoop, isPlaying, onStop, onPlay, onPause, onCueDown, onCueUp, onSetCue, aiCue, currentLoop, buffer, peaks, lyriaKey, onLyriaKeyChange }: AIDeckProps) {
   const [qs, setQs] = useState<QueueState>(queue.state);
   const [style, setStyle] = useState('deep house drums');
+  const [keyInput, setKeyInput] = useState(lyriaKey);
   const [bars, setBars] = useState<4 | 8>(4);
   const [autoQueue, setAutoQueue] = useState(true);
 
@@ -61,7 +65,7 @@ export default function AIDeck({ queue, masterBpm, masterKey, onDropLoop, isPlay
       void queue.ensure(targetBpm, masterKey, bars, style, engine.ctx, 3);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [targetBpm, bars, autoQueue]);
+  }, [targetBpm, bars, autoQueue, backend.name]);
 
   return (
     <div className="rounded-xl border border-violet-900/60 bg-zinc-950 p-3">
@@ -69,15 +73,22 @@ export default function AIDeck({ queue, masterBpm, masterKey, onDropLoop, isPlay
         <span className="flex h-7 w-7 items-center justify-center rounded bg-violet-500 font-black text-black">AI</span>
         <span className="text-sm font-bold text-violet-200">AI Channel</span>
 
-        {!backend.isConfigured ? (
+        {backend.kind === 'lyria' ? (
+          <span className="rounded bg-emerald-900/40 px-2 py-1 text-xs font-bold text-emerald-300">
+            Gemini Lyria — real AI audio
+          </span>
+        ) : backend.isConfigured ? (
+          <span className="rounded bg-amber-900/40 px-2 py-1 text-xs font-bold text-amber-300">
+            DEMO synth — procedural, not AI generation
+          </span>
+        ) : (
           <span className="rounded bg-red-900/40 px-2 py-1 text-xs text-red-300">
             No generation backend configured — {backend.statusHint}
           </span>
-        ) : (
-          <span className="rounded bg-zinc-800 px-2 py-1 text-xs text-zinc-400">
-            Backend: <span className="text-violet-300">{backend.name}</span>
-          </span>
         )}
+        <span className="rounded bg-zinc-800 px-2 py-1 text-xs text-zinc-400">
+          Backend: <span className="text-violet-300">{backend.name}</span>
+        </span>
 
         <span className="text-xs text-zinc-500">
           Target: <span className="font-mono text-zinc-300">{targetBpm.toFixed(1)} BPM</span>
@@ -117,6 +128,50 @@ export default function AIDeck({ queue, masterBpm, masterKey, onDropLoop, isPlay
             </button>
           )}
         </div>
+      </div>
+
+      {/* Gemini API key — stored only in this browser (localStorage), or
+          set VITE_GEMINI_API_KEY at build time. Without a key, the DEMO
+          synth plays and the badge above says so. Get a key at Google
+          AI Studio. */}
+      <div className="mb-2 flex flex-wrap items-center gap-2 text-xs">
+        <span className="text-zinc-500">Gemini API key (Lyria):</span>
+        <input
+          type="password"
+          value={keyInput}
+          onChange={(e) => setKeyInput(e.target.value)}
+          placeholder="Paste key from Google AI Studio"
+          className="w-64 rounded bg-zinc-800 px-2 py-1 text-zinc-200"
+        />
+        <button
+          onClick={() => onLyriaKeyChange(keyInput)}
+          disabled={!keyInput.trim()}
+          className="rounded bg-emerald-700 px-2 py-1 font-bold text-white hover:bg-emerald-600 disabled:opacity-40"
+        >
+          Save key
+        </button>
+        {lyriaKey && (
+          <button
+            onClick={() => { setKeyInput(''); onLyriaKeyChange(''); }}
+            className="rounded bg-zinc-800 px-2 py-1 text-zinc-400 hover:bg-zinc-700"
+          >
+            Clear key (back to DEMO)
+          </button>
+        )}
+        <span className="text-zinc-600">Key never leaves this browser except to Google's API.</span>
+      </div>
+
+      {/* Prompt suggestion chips (groove Gemini panel pattern) */}
+      <div className="mb-2 flex flex-wrap gap-1.5">
+        {['Add kick', 'Generate hi-hats', 'Add snare', 'Create bassline'].map((chip) => (
+          <button
+            key={chip}
+            onClick={() => setStyle(chip)}
+            className="rounded-full border border-violet-800 bg-violet-950/40 px-2 py-0.5 text-[11px] text-violet-300 hover:border-violet-500"
+          >
+            {chip}
+          </button>
+        ))}
       </div>
 
       {qs.error && (
@@ -199,7 +254,7 @@ export default function AIDeck({ queue, masterBpm, masterKey, onDropLoop, isPlay
         {masterKey && <span className="font-mono text-amber-300"> · {masterKey}</span>}
         <span className="text-zinc-600"> · drops land on the next master bar</span>
       </div>
-      <div className="flex gap-2">
+      <div className="flex flex-wrap gap-2">
         {qs.loops.length === 0 && !qs.generating && (
           <span className="text-xs text-zinc-600">
             {backend.isConfigured
@@ -211,7 +266,7 @@ export default function AIDeck({ queue, masterBpm, masterKey, onDropLoop, isPlay
           <button
             key={loop.generatedAt + i}
             onClick={() => onDropLoop(loop)}
-            className="group flex-1 rounded-lg border border-violet-800/60 bg-violet-950/30 p-2 text-left hover:border-violet-500"
+            className="group min-w-40 flex-1 rounded-lg border border-violet-800/60 bg-violet-950/30 p-2 text-left hover:border-violet-500"
             title="Drop on the next master bar boundary (1-beat fade-in)"
           >
             <div className="text-xs font-bold text-violet-200">
