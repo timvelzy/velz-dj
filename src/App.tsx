@@ -775,14 +775,14 @@ export default function App() {
       onLoopHalve: () => {
         const cur = deckState(deckKey);
         if (!cur.loop) return;
-        const r = halveLoop(cur.loop);
+        const r = halveLoop(cur.loop, cur.track?.beatGrid ?? null);
         engine.setLoop(deckId, r.start, r.end);
         setDeckState(deckKey, { ...cur, loop: r, loopBars: cur.loopBars !== null ? cur.loopBars / 2 : null });
       },
       onLoopDouble: () => {
         const cur = deckState(deckKey);
         if (!cur.loop || !cur.buffer) return;
-        const r = doubleLoop(cur.loop, cur.buffer.duration);
+        const r = doubleLoop(cur.loop, cur.buffer.duration, cur.track?.beatGrid ?? null);
         engine.setLoop(deckId, r.start, r.end);
         const doubled = cur.loopBars !== null ? cur.loopBars * 2 : null;
         setDeckState(deckKey, { ...cur, loop: r, loopBars: doubled !== null && doubled <= 32 ? doubled : null });
