@@ -1221,6 +1221,11 @@ export default function App() {
     const pick = apPick(m);
     if (!pick) return;
     if (pick.fromQueue) setApQueueIds((ids) => ids.filter((id) => id !== pick.track.id));
+    // Round 9: name a cycled pick in the log — the set progressing past
+    // an exhausted library must be visible, not silent.
+    if (pick.cycled) {
+      debugLog('transport', 'autopilot cycled pick', `deck${m.freeKey}`, { track: pick.track.title });
+    }
     m.nextId = pick.track.id;
     m.nextTitle = pick.track.title;
     m.nextFileKey = pick.track.fileKey ?? null;
@@ -1234,13 +1239,17 @@ export default function App() {
     });
   };
 
-  const apBeginPrepare = (m: ApMachine, pick: { track: TrackInfo; fromQueue: boolean }, immediate: boolean, now: number) => {
+  const apBeginPrepare = (m: ApMachine, pick: { track: TrackInfo; fromQueue: boolean; cycled?: boolean }, immediate: boolean, now: number) => {
     const fk = m.freeKey;
     const fSt = deckStateRef.current[fk];
     // Clear any stale loop on the free deck (incl. a previous bridge loop)
     // so the incoming track never inherits it.
     if (fSt.loop) apClearLoop(fk);
     if (pick.fromQueue) setApQueueIds((ids) => ids.filter((id) => id !== pick.track.id));
+    // Round 9: name a cycled pick in the log (see apArmNext).
+    if (pick.cycled) {
+      debugLog('transport', 'autopilot cycled pick', `deck${fk}`, { track: pick.track.title });
+    }
     m.nextId = pick.track.id;
     m.nextTitle = pick.track.title;
     m.nextFileKey = pick.track.fileKey ?? null;
@@ -1817,6 +1826,30 @@ export default function App() {
     const recent = [...m.recentIds, pSt.track?.id].filter((x): x is string => !!x).slice(-50);
     const next = freshMachine(m.freeKey, m.playingKey, recent);
     apRef.current = next;
+    // Round 9 — post-transition cycle initialization. This machine IS the
+    // next cycle's machine, so it needs the new track's REAL trigger
+    // points now: freshMachine leaves prepareAt/outroStart at 0, and a
+    // zero-trigger machine fires "trigger missed" on its very first tick
+    // (the playhead is always >= 0) and falls straight to hold +
+    // generation — the stall after every transition in the round-8
+    // retest. The acquisition path in apTick computes these for a fresh
+    // machine; do exactly the same here, plus the same watching line so
+    // every cycle is visible in the log with real triggers.
+    const newSt = deckStateRef.current[next.playingKey];
+    if (newSt.track && newSt.buffer) {
+      const outro = outroStartSeconds(newSt.track.beatGrid, newSt.track.duration, apOutroRef.current);
+      const barSec = barSeconds(newSt.track.beatGrid);
+      next.outroStart = outro;
+      next.prepareAt = outro - 4 * barSec;
+      const pos0 = engine.position(`deck${next.playingKey}`);
+      debugLog('transport', 'autopilot watching', `deck${next.playingKey}`, {
+        track: newSt.track.title, outroStart: outro, prepareAt: next.prepareAt,
+        freeDeck: deckStateRef.current[next.freeKey].track
+          ? deckStateRef.current[next.freeKey].track!.title
+          : null,
+        late: pos0 >= next.prepareAt,
+      });
+    }
     // Lookahead arm for the next cycle (only when the new free deck still
     // holds the just-finished track — never clobber a manual load).
     if (!deckStateRef.current[next.freeKey].track || deckStateRef.current[next.freeKey].track?.id === pSt.track?.id) {
@@ -1885,6 +1918,10 @@ export default function App() {
           const pick = apPick(m);
           if (pick) {
             if (pick.fromQueue) setApQueueIds((ids) => ids.filter((id) => id !== pick.track.id));
+            // Round 9: name a cycled pick in the log (see apArmNext).
+            if (pick.cycled) {
+              debugLog('transport', 'autopilot cycled pick', `deck${m.freeKey}`, { track: pick.track.title });
+            }
             m.nextId = pick.track.id;
             m.nextTitle = pick.track.title;
             m.nextFileKey = pick.track.fileKey ?? null;
