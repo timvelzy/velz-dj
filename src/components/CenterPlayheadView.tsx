@@ -93,6 +93,11 @@ export interface TopDeckView {
   onStop: () => void;
   onSetCue: () => void;
   onSeek: (t: number) => void;
+  /** Traktor loop controls (decks A/B only; omitted for the AI row). */
+  loopActive?: boolean;
+  loopBars?: number | null;
+  onLoopBars?: (bars: number) => void;
+  onLoopExit?: () => void;
 }
 
 interface RowProps {
@@ -144,6 +149,47 @@ function TimeReadout({ deckId, duration, isPlaying }: { deckId: TopDeckView['dec
   return (
     <span className="font-mono text-[11px] text-zinc-500">
       {fmtTime(engine.position(deckId))} / {fmtTime(duration)}
+    </span>
+  );
+}
+
+/** Compact Traktor loop control for a top-view row header: pick a size,
+ *  set the loop, exit it (loop-out keeps playing from here). */
+function LoopSizeControl({ deck }: { deck: TopDeckView }) {
+  const [size, setSize] = useState(4);
+  if (!deck.onLoopBars || !deck.onLoopExit) return null;
+  return (
+    <span className="flex items-center gap-1">
+      <select
+        value={size}
+        disabled={!deck.buffer}
+        onChange={(e) => setSize(Number(e.target.value))}
+        title="Loop size in bars"
+        className="h-7 rounded border border-zinc-700 bg-zinc-900 px-1 text-[11px] text-zinc-200 disabled:opacity-40"
+      >
+        {[0.5, 1, 2, 4, 8, 16, 32].map((b) => (
+          <option key={b} value={b}>{b === 0.5 ? '1/2' : `${b}`} bar</option>
+        ))}
+      </select>
+      <button
+        onClick={() => deck.onLoopBars!(size)}
+        disabled={!deck.buffer}
+        title="Set a loop of the selected size from the current bar"
+        className={`h-7 rounded px-2 text-[11px] font-bold disabled:opacity-40 ${
+          deck.loopActive ? 'bg-sky-600 text-white' : 'bg-zinc-800 text-zinc-300 hover:bg-zinc-700'
+        }`}
+      >
+        ↻ Loop{deck.loopBars ? ` ${deck.loopBars === 0.5 ? '1/2' : deck.loopBars}` : ''}
+      </button>
+      {deck.loopActive && (
+        <button
+          onClick={deck.onLoopExit}
+          title="Loop out: exit the loop and keep playing forward from here"
+          className="h-7 rounded bg-sky-600 px-2 text-[11px] font-bold text-white hover:bg-sky-500"
+        >
+          Exit
+        </button>
+      )}
     </span>
   );
 }
@@ -347,6 +393,7 @@ function TopWaveformRow({ deck, pxPerSec, height }: RowProps) {
         )}
         <span className="max-w-72 truncate text-xs text-zinc-400" title={deck.title}>{deck.title}</span>
         <span className="ml-auto flex items-center gap-1.5">
+          <LoopSizeControl deck={deck} />
           <button
             onClick={deck.onPlayPause}
             disabled={!deck.buffer}

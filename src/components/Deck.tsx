@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { engine } from '../audio/engine';
+import { LOOP_SIZES, formatLoopSize } from '../audio/loop';
 import { midi } from '../midi';
 import type { BeatGrid, TrackInfo } from '../types';
 import Waveform, { OverviewWaveform } from './Waveform';
@@ -16,8 +17,11 @@ export interface DeckState {
   quantize: boolean;
   hotcues: (number | null)[];
   loop: { start: number; end: number } | null;
+  /** Active Traktor-style loop size in bars (null for manual IN/OUT loops). */
+  loopBars: number | null;
   pendingLoopIn: number | null;
-  cuePoint: number;
+  /** Explicit cue point, or null = no cue set (CUE then targets track start). */
+  cuePoint: number | null;
 }
 
 interface DeckProps {
@@ -29,6 +33,8 @@ interface DeckProps {
   onPlayPause: () => void;
   onCueDown: () => void;
   onCueUp: () => void;
+  onSetCue: () => void;
+  onStop: () => void;
   onTempo: (v: number) => void;
   onSync: () => void;
   onMaster: () => void;
@@ -38,6 +44,9 @@ interface DeckProps {
   onLoopIn: () => void;
   onLoopOut: () => void;
   onLoopExit: () => void;
+  onLoopBars: (bars: number) => void;
+  onLoopHalve: () => void;
+  onLoopDouble: () => void;
   onToggleQuantize: () => void;
   onDropFiles: (files: FileList) => void;
   onEditGrid: () => void;
@@ -138,6 +147,7 @@ export default function Deck(props: DeckProps) {
       midi.registerControl(`${deckId}.keyLock`, { kind: 'button', onButton: (p) => { if (p) props.onKeyLock(); } }),
       midi.registerControl(`${deckId}.loopIn`, { kind: 'button', onButton: (p) => { if (p) props.onLoopIn(); } }),
       midi.registerControl(`${deckId}.loopOut`, { kind: 'button', onButton: (p) => { if (p) props.onLoopOut(); } }),
+      midi.registerControl(`${deckId}.loopExit`, { kind: 'button', onButton: (p) => { if (p) props.onLoopExit(); } }),
     ];
     return () => regs.forEach((u) => u());
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -310,6 +320,24 @@ export default function Deck(props: DeckProps) {
               </button>
             ))}
           </div>
+          <div className="flex gap-1.5">
+            <button
+              onClick={props.onSetCue}
+              disabled={!state.buffer}
+              title="Set cue point to current position (CUE returns here; unset = track start)"
+              className="h-8 flex-1 rounded bg-zinc-800 text-xs font-bold text-amber-300 hover:bg-zinc-700 disabled:opacity-40"
+            >
+              SET CUE
+            </button>
+            <button
+              onClick={props.onStop}
+              disabled={!state.buffer}
+              title="Stop and return to cue point (track start if none set)"
+              className="h-8 flex-1 rounded bg-zinc-800 text-xs font-bold text-zinc-300 hover:bg-zinc-700 disabled:opacity-40"
+            >
+              ■ STOP
+            </button>
+          </div>
         </div>
         {/* Tempo fader */}
         <div className="flex flex-col items-center gap-1">
@@ -354,13 +382,53 @@ export default function Deck(props: DeckProps) {
         <div className="mx-1 h-8 w-px bg-zinc-800" />
         <button onClick={props.onLoopIn} className="h-8 rounded bg-zinc-800 px-2 text-xs font-bold text-zinc-300 hover:bg-zinc-700">IN</button>
         <button onClick={props.onLoopOut} className="h-8 rounded bg-zinc-800 px-2 text-xs font-bold text-zinc-300 hover:bg-zinc-700">OUT</button>
-        <button onClick={props.onLoopExit} className={`h-8 rounded px-2 text-xs font-bold ${state.loop ? 'bg-sky-600 text-white' : 'bg-zinc-800 text-zinc-500'}`}>LOOP</button>
+        <button
+          onClick={props.onLoopExit}
+          title="Loop out: exit the loop and keep playing forward from here"
+          className={`h-8 rounded px-2 text-xs font-bold ${state.loop ? 'bg-sky-600 text-white' : 'bg-zinc-800 text-zinc-500'}`}
+        >
+          LOOP
+        </button>
         <button
           onClick={props.onToggleQuantize}
           className={`h-8 rounded px-2 text-xs font-bold ${state.quantize ? 'bg-violet-600 text-white' : 'bg-zinc-800 text-zinc-500'}`}
           title="Quantize: hotcue jumps and loop points snap to the beat grid"
         >
           Q
+        </button>
+      </div>
+
+      {/* Traktor-style loop sizes: set a bar loop from the current barline */}
+      <div className="flex items-center gap-1">
+        <span className="mr-1 text-[10px] font-bold uppercase tracking-wide text-zinc-500">Loop</span>
+        {LOOP_SIZES.map((bars) => (
+          <button
+            key={bars}
+            onClick={() => props.onLoopBars(bars)}
+            disabled={!state.buffer}
+            title={`Set a ${formatLoopSize(bars)}-bar loop from the current bar`}
+            className={`h-8 flex-1 rounded text-xs font-bold disabled:opacity-40 ${
+              state.loopBars === bars ? 'bg-sky-600 text-white' : 'bg-zinc-800 text-zinc-300 hover:bg-zinc-700'
+            }`}
+          >
+            {formatLoopSize(bars)}
+          </button>
+        ))}
+        <button
+          onClick={props.onLoopHalve}
+          disabled={!state.loop}
+          title="Halve the active loop (keeps its start)"
+          className="h-8 rounded bg-zinc-800 px-2 text-xs font-bold text-zinc-300 hover:bg-zinc-700 disabled:opacity-40"
+        >
+          −
+        </button>
+        <button
+          onClick={props.onLoopDouble}
+          disabled={!state.loop}
+          title="Double the active loop (keeps its start)"
+          className="h-8 rounded bg-zinc-800 px-2 text-xs font-bold text-zinc-300 hover:bg-zinc-700 disabled:opacity-40"
+        >
+          +
         </button>
       </div>
     </div>

@@ -16,6 +16,7 @@ import {
 import { DemoSynthBackend, GEMINI_KEY_STORAGE, LoopQueue, LyriaLoopBackend, resolveGeminiApiKey, type GeneratedLoop } from './audio/ai';
 import { SetRecorder, downloadBlob, formatElapsed, type TracklistEntry } from './audio/recorder';
 import { computeBandPeaks, peaksKey } from './audio/peaks';
+import { computeBarLoop, doubleLoop, halveLoop } from './audio/loop';
 import { loadPeaks, savePeaks } from './audio/peaksStore';
 import type { BandPeaks, TrackInfo } from './types';
 import Deck, { type DeckState } from './components/Deck';
@@ -40,9 +41,13 @@ const deckInit = (): DeckState => ({
   quantize: true,
   hotcues: [null, null, null, null],
   loop: null,
+  loopBars: null,
   pendingLoopIn: null,
-  cuePoint: 0,
+  cuePoint: null,
 });
+
+/** CUE target: the explicit cue point, or the track start when none is set. */
+const resolveCue = (st: DeckState): number => st.cuePoint ?? 0;
 
 let trackSeq = 0;
 
@@ -425,29 +430,30 @@ export default function App() {
   const togglePlay = useCallback((deckKey: 'A' | 'B') => {
     const deckId = `deck${deckKey}` as 'deckA' | 'deckB';
     if (engine.isPlaying(deckId)) {
-      const pos = engine.position(deckId);
+      // Pausing must NOT move the cue point (that was the cue bug: CUE
+      // kept returning to wherever the track was last paused instead of
+      // the cue point / track start). The cue point only moves on an
+      // explicit Set Cue.
       engine.pause(deckId);
-      const st = deckState(deckKey);
-      setDeckState(deckKey, { ...st, cuePoint: pos });
     } else {
       const st = deckState(deckKey);
       const align = st.syncActive && masterDeck !== null && masterDeck !== deckId;
       engine.play(deckId, { alignToMaster: align });
     }
-  }, [deckState, setDeckState, masterDeck]);
+  }, [deckState, masterDeck]);
 
   const cueDown = useCallback((deckKey: 'A' | 'B') => {
     const deckId = `deck${deckKey}` as 'deckA' | 'deckB';
     const st = deckState(deckKey);
+    const cue = resolveCue(st);
     if (engine.isPlaying(deckId)) {
       // While playing: jump back to cue point and pause (CDJ behavior)
       engine.pause(deckId);
-      engine.seek(deckId, st.cuePoint);
-      setDeckState(deckKey, { ...st, cuePoint: st.cuePoint });
+      engine.seek(deckId, cue);
     } else {
-      engine.play(deckId, { offset: st.cuePoint });
+      engine.play(deckId, { offset: cue });
     }
-  }, [deckState, setDeckState]);
+  }, [deckState]);
 
   const cueUp = useCallback((deckKey: 'A' | 'B') => {
     const deckId = `deck${deckKey}` as 'deckA' | 'deckB';
@@ -455,7 +461,7 @@ export default function App() {
     if (engine.isPlaying(deckId)) {
       engine.pause(deckId);
       const st = deckState(deckKey);
-      engine.seek(deckId, st.cuePoint);
+      engine.seek(deckId, resolveCue(st));
     }
   }, [deckState]);
 
@@ -566,7 +572,7 @@ export default function App() {
       },
       onStop: () => {
         engine.pause(deckId);
-        engine.seek(deckId, deckState(deckKey).cuePoint);
+        engine.seek(deckId, resolveCue(deckState(deckKey)));
       },
       onHotcue: (i: number, set: boolean) => {
         const hcs = [...st.hotcues];
@@ -592,13 +598,39 @@ export default function App() {
           }
           if (out > st.pendingLoopIn + 0.05) {
             engine.setLoop(deckId, st.pendingLoopIn, out);
-            setDeckState(deckKey, { ...st, loop: { start: st.pendingLoopIn, end: out }, pendingLoopIn: null });
+            setDeckState(deckKey, { ...st, loop: { start: st.pendingLoopIn, end: out }, loopBars: null, pendingLoopIn: null });
           }
         }
       },
       onLoopExit: () => {
-        engine.setLoop(deckId, null, null);
-        setDeckState(deckKey, { ...st, loop: null, pendingLoopIn: null });
+        // Loop-out: release the loop and keep playing forward from the
+        // current position (engine.exitLoop restarts at that position
+        // with no loop region — never a jump to start or loop end).
+        engine.exitLoop(deckId);
+        setDeckState(deckKey, { ...st, loop: null, loopBars: null, pendingLoopIn: null });
+      },
+      onLoopBars: (bars: number) => {
+        const cur = deckState(deckKey);
+        if (!cur.track || !cur.buffer) return;
+        const r = computeBarLoop(cur.track.beatGrid, cur.buffer.duration, engine.position(deckId), bars);
+        if (!r) return;
+        engine.setLoop(deckId, r.start, r.end);
+        setDeckState(deckKey, { ...cur, loop: r, loopBars: bars, pendingLoopIn: null });
+      },
+      onLoopHalve: () => {
+        const cur = deckState(deckKey);
+        if (!cur.loop) return;
+        const r = halveLoop(cur.loop);
+        engine.setLoop(deckId, r.start, r.end);
+        setDeckState(deckKey, { ...cur, loop: r, loopBars: cur.loopBars !== null ? cur.loopBars / 2 : null });
+      },
+      onLoopDouble: () => {
+        const cur = deckState(deckKey);
+        if (!cur.loop || !cur.buffer) return;
+        const r = doubleLoop(cur.loop, cur.buffer.duration);
+        engine.setLoop(deckId, r.start, r.end);
+        const doubled = cur.loopBars !== null ? cur.loopBars * 2 : null;
+        setDeckState(deckKey, { ...cur, loop: r, loopBars: doubled !== null && doubled <= 32 ? doubled : null });
       },
       onToggleQuantize: () => setDeckState(deckKey, { ...st, quantize: !st.quantize }),
       onDropFiles: (files: FileList) => {
@@ -783,9 +815,13 @@ export default function App() {
             onPlayPause: () => togglePlay('A'),
             onCueDown: () => cueDown('A'),
             onCueUp: () => cueUp('A'),
-            onStop: () => { engine.pause('deckA'); engine.seek('deckA', deckA.cuePoint); },
+            onStop: () => { engine.pause('deckA'); engine.seek('deckA', deckA.cuePoint ?? 0); },
             onSetCue: () => setDeckState('A', { ...deckA, cuePoint: engine.position('deckA') }),
             onSeek: (t) => engine.seek('deckA', t),
+            loopActive: deckA.loop !== null,
+            loopBars: deckA.loopBars,
+            onLoopBars: deckProps('A').onLoopBars,
+            onLoopExit: deckProps('A').onLoopExit,
           },
           {
             label: 'B', deckId: 'deckB', color: '#fb923c',
@@ -800,9 +836,13 @@ export default function App() {
             onPlayPause: () => togglePlay('B'),
             onCueDown: () => cueDown('B'),
             onCueUp: () => cueUp('B'),
-            onStop: () => { engine.pause('deckB'); engine.seek('deckB', deckB.cuePoint); },
+            onStop: () => { engine.pause('deckB'); engine.seek('deckB', deckB.cuePoint ?? 0); },
             onSetCue: () => setDeckState('B', { ...deckB, cuePoint: engine.position('deckB') }),
             onSeek: (t) => engine.seek('deckB', t),
+            loopActive: deckB.loop !== null,
+            loopBars: deckB.loopBars,
+            onLoopBars: deckProps('B').onLoopBars,
+            onLoopExit: deckProps('B').onLoopExit,
           },
         ]}
         ai={aiBuffer ? {
