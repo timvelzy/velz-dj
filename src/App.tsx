@@ -330,7 +330,14 @@ export default function App() {
           types: [{ description: 'WAV audio', accept: { 'audio/wav': ['.wav'] } }],
         });
       } catch {
-        return; // user cancelled the picker — don't start half a flow
+        // Round 10: a dismissed picker used to abort recording silently
+        // (REC looked dead — no timer, no file). Fall through to the
+        // memory path instead: rec.start with no handle records to
+        // memory and the WAV downloads on stop, same as browsers
+        // without a file picker. (A native dialog left open, never
+        // resolved, still blocks here — that case needs the dialog
+        // itself dismissed.)
+        handle = null;
       }
     }
     const seed: Omit<TracklistEntry, 'elapsed'>[] = [];
@@ -863,6 +870,8 @@ export default function App() {
     recovering: boolean;
     eqSnap: { outLow: number; inLow: number } | null;
     loadStartWall: number;
+    /** Round 10: wall time the current load's wait began (preparing entry) — bounds the analyzing extension below. */
+    loadWaitSince: number;
     failedIds: string[];
     recentIds: string[];
     fallbackLoop: { start: number; end: number } | null;
@@ -943,6 +952,7 @@ export default function App() {
     recovering: false,
     eqSnap: null,
     loadStartWall: 0,
+    loadWaitSince: 0,
     failedIds: [],
     recentIds,
     fallbackLoop: null,
@@ -1258,6 +1268,7 @@ export default function App() {
     m.immediateBlend = immediate;
     m.phase = 'preparing';
     m.loadStartWall = now;
+    m.loadWaitSince = now;
     loadLibRef.current(pick.track.id, fk);
     debugLog('transport', 'autopilot preparing', `deck${fk}`, { track: pick.track.title, fromQueue: pick.fromQueue, fileKey: pick.track.fileKey ?? null });
   };
@@ -1914,6 +1925,12 @@ export default function App() {
           // when it arms instead of starting a second load (race).
           m.recovering = true;
           m.immediateBlend = true;
+          // Round 10: the playing deck is dead — hold the outro loop so
+          // the set never sits in silence while the load finishes (the
+          // round-9 stall left 30s+ of dead air here). The loop clears
+          // at the next role swap; the incoming blend pauses this deck
+          // at the finish.
+          apSetFallbackLoop(m);
         } else {
           const pick = apPick(m);
           if (pick) {
@@ -1930,7 +1947,14 @@ export default function App() {
             m.immediateBlend = true;
             m.recovering = true;
             m.loadStartWall = now;
+            m.loadWaitSince = now;
             loadLibRef.current(pick.track.id, m.freeKey);
+            // Round 10: the playing deck is dead — hold the outro loop
+            // so the set never sits in silence while the load finishes
+            // (the round-9 stall left 30s+ of dead air here). The loop
+            // clears at the next role swap; the incoming blend pauses
+            // this deck at the finish.
+            apSetFallbackLoop(m);
           } else {
             apRef.current = null;
           }
@@ -2063,6 +2087,7 @@ export default function App() {
         if ((m.nextId != null || m.nextFileKey != null) && fSt.analyzing) {
           m.phase = 'preparing';
           m.loadStartWall = now;
+          m.loadWaitSince = now;
           debugLog('transport', 'autopilot awaiting arm load', `deck${m.freeKey}`, {
             track: m.nextTitle,
           });
@@ -2126,8 +2151,24 @@ export default function App() {
           debugLog('transport', 'autopilot adopted free deck', `deck${m.freeKey}`, {
             track: m.nextTitle,
           });
+        } else if (fSt.analyzing && now < m.loadWaitSince + 120) {
+          // Round 10: the deck is still decoding — a load in flight, not
+          // a failed load. Failing the pick here is how the round-9
+          // stall cascaded: the arm load was still analyzing at the
+          // timeout, so the machine abandoned it for a second stalled
+          // load, then fell to generation. Extend the window in 20s
+          // steps while the deck reports analyzing, bounded at 120s
+          // from preparing entry so a truly wedged decode still fails
+          // eventually instead of holding the set forever.
+          m.loadStartWall = now;
+          debugLog('transport', 'autopilot load still analyzing, window extended', `deck${m.freeKey}`, {
+            track: m.nextTitle,
+          });
         } else {
           // Load timed out — skip to the next candidate, never stall.
+          debugLog('transport', 'autopilot load timed out', `deck${m.freeKey}`, {
+            track: m.nextTitle, analyzing: fSt.analyzing,
+          });
           if (m.nextId) m.failedIds.push(m.nextId);
           const pick = apPick(m);
           if (pick) apBeginPrepare(m, pick, m.immediateBlend, now);
