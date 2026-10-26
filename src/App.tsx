@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { engine } from './audio/engine';
+import type { FxType } from './audio/engine';
 import { midi } from './midi';
 import { analyzeTrack } from './audio/analysis';
 import { detectKey } from './audio/keydetect';
@@ -20,18 +21,29 @@ import { computeBandPeaks, peaksKey } from './audio/peaks';
 import { computeBarLoop, doubleLoop, halveLoop } from './audio/loop';
 import { loadPeaks, savePeaks } from './audio/peaksStore';
 import {
+  autoGainDb,
   barSeconds,
   barsToOutro,
   bassState,
+  decideContingency,
   downbeatAtOrBefore,
+  downbeatBarsAfter,
+  evaluateGuardrails,
+  firstSoundSec,
   holdLoopFor,
   outroStartSeconds,
   pickNextTrack,
   planTransition,
   resolvePlaylistTracks,
+  selectTransitionType,
   swapReady,
   trackBassEnvelope,
+  transitionLabel,
+  vocalDensity,
+  VOCAL_DENSE_RATIO,
+  type Guardrail,
   type SmartPlan,
+  type TransitionType,
 } from './audio/autopilot';
 import { debugLog } from './audio/debugLog';
 import {
@@ -1135,7 +1147,7 @@ export default function App() {
     provisional: boolean;
     /** True while recovering from a natural track end that JS slept through (do not treat the dead deck as a user pause). */
     recovering: boolean;
-    eqSnap: { outLow: number; inLow: number } | null;
+    eqSnap: { outLow: number; inLow: number; outMid: number; outHigh: number } | null;
     loadStartWall: number;
     /** Round 10: wall time the current load's wait began (preparing entry) — bounds the analyzing extension below. */
     loadWaitSince: number;
@@ -1148,6 +1160,34 @@ export default function App() {
     genError: string | null;
     /** Round 6 smart mix-in plan for this cycle (null until the next track arms). */
     plan: SmartPlan | null;
+    /** Ranked fixes 5+6: transition type + strip line for this pair (null until the plan/guards run). */
+    transType: TransitionType | null;
+    transNote: string | null;
+    /** Fix 3 auto-gain: dB applied to the incoming deck's trim this cycle (null when peaks were missing). */
+    autoGainDb: number | null;
+    /** Fix 3: incoming deck trim before auto-gain (restored on takeover, NEVER at finish — the match persists). */
+    trimSnap: number | null;
+    /** Fix 8: contingency branch fired this transition (once only) + its strip line. */
+    contingencyFired: string | null;
+    contingencyNote: string | null;
+    /** Fix 8: consecutive blend ticks with the PLL unlocked past half a beat (echo-finish at 3). */
+    pllBadTicks: number;
+    /** Fix 6 echo-out: audio time of the outgoing cut + end of the delay tail. */
+    echoCutAt: number | null;
+    echoTailUntil: number | null;
+    /** Fix 6: saved global FX state while an echo tail rings (restored at finish). */
+    fxSaved: { type: FxType; params: [number, number, number]; wet: number; enabled: boolean } | null;
+    /** Fix 6: outgoing deck's FX send before the echo (restored at finish). */
+    fxSendSaved: number | null;
+    /** Fix 6: true when this transition swept filters (restored at finish). */
+    filterUsed: boolean;
+    /** Fix 2: outgoing mid/high ease window around the swap (UI mirror replays it). */
+    easeStartAt: number | null;
+    easeEndAt: number | null;
+    easeFromMid: number;
+    easeFromHigh: number;
+    easeToMid: number;
+    easeToHigh: number;
     /** Tease: release armed once the outgoing track reaches the blend start. */
     teaseArmed: boolean;
     /** Tease: loop released (crossfade running). */
@@ -1228,6 +1268,24 @@ export default function App() {
     genBridge: null,
     genError: null,
     plan: null,
+    transType: null,
+    transNote: null,
+    autoGainDb: null,
+    trimSnap: null,
+    contingencyFired: null,
+    contingencyNote: null,
+    pllBadTicks: 0,
+    echoCutAt: null,
+    echoTailUntil: null,
+    fxSaved: null,
+    fxSendSaved: null,
+    filterUsed: false,
+    easeStartAt: null,
+    easeEndAt: null,
+    easeFromMid: 0,
+    easeFromHigh: 0,
+    easeToMid: 0,
+    easeToHigh: 0,
     teaseArmed: false,
     teaseReleased: false,
     teasePrevIn: 0,
@@ -1258,6 +1316,133 @@ export default function App() {
     (key === 'A' ? setChA : setChB)(next);
   };
 
+  /** Automated mid/high-EQ move (fix 2 ease-out): same mirror pattern as apSetEq. */
+  const apSetEqBand = (key: 'A' | 'B', band: 'mid' | 'high', val: number) => {
+    const field = band === 'mid' ? 'eqMid' : 'eqHigh';
+    const cur = chRef.current[key][field];
+    if (Math.abs(cur - val) <= 0.01) return;
+    engine.setEqAuto(`deck${key}`, band, val);
+    const next = { ...chRef.current[key], [field]: val };
+    (key === 'A' ? setChA : setChB)(next);
+  };
+
+  /** Automated trim move (fix 3 auto-gain): engine call + knob state kept in sync. */
+  const apSetTrim = (key: 'A' | 'B', val: number) => {
+    const cur = chRef.current[key].trim;
+    if (Math.abs(cur - val) <= 0.01) return;
+    engine.setTrim(`deck${key}`, val);
+    const next = { ...chRef.current[key], trim: val };
+    (key === 'A' ? setChA : setChB)(next);
+  };
+
+  /**
+   * Fix 3 auto-gain: match the incoming deck's loudness to the outgoing
+   * deck's before any launch path runs. Snapshots the incoming trim so
+   * takeover/pause paths can undo it; the finish path deliberately does
+   * NOT restore it (the matched level must persist for the now-playing
+   * track). No-op when either track lacks peaks (loudness unknown).
+   */
+  const apApplyAutoGain = (m: ApMachine) => {
+    // Idempotent per cycle: apScheduleBlend routes to the tease/sustain
+    // launchers after calling this, and those launchers call it too
+    // (they are also entered directly from the waiting tick). A fresh
+    // machine per cycle resets trimSnap, so this never skips a new pair.
+    if (m.trimSnap != null) return;
+    const pSt = deckStateRef.current[m.playingKey];
+    const fSt = deckStateRef.current[m.freeKey];
+    if (!pSt.track || !fSt.track) return;
+    const g = autoGainDb(pSt.track, fSt.track);
+    if (!g) return;
+    const cur = chRef.current[m.freeKey].trim;
+    m.trimSnap = cur;
+    m.autoGainDb = g.gainDb;
+    const next = Math.min(2, Math.max(0, cur * Math.pow(10, g.gainDb / 20)));
+    apSetTrim(m.freeKey, next);
+    debugLog('transport', 'autopilot auto-gain', undefined, {
+      to: m.nextTitle, gainDb: g.gainDb, limited: g.limited,
+    });
+  };
+
+  /** Takeover/pause only: undo auto-gain on the free deck. Never called at finish. */
+  const apRestoreTrim = (m: ApMachine) => {
+    if (m.trimSnap == null) return;
+    apSetTrim(m.freeKey, m.trimSnap);
+    m.trimSnap = null;
+    m.autoGainDb = null;
+  };
+
+  /**
+   * Fix 6 echo-out arm: save the global FX state, switch to a beat delay
+   * with a long-ish feedback tail, and raise the OUTGOING deck's send.
+   * The incoming deck's send is untouched (normally 0, so it stays dry).
+   * Returns the tail end; the tick pauses the outgoing deck at cutAt
+   * and the finish restores the saved FX state.
+   */
+  const apArmEcho = (m: ApMachine, cutAt: number): number => {
+    const pId = `deck${m.playingKey}`;
+    m.fxSaved = {
+      type: engine.fx.type,
+      params: [...engine.fx.params] as [number, number, number],
+      wet: engine.fx.wet,
+      enabled: engine.fx.enabled,
+    };
+    const savedSend = chRef.current[m.playingKey].fxSend;
+    m.fxSendSaved = savedSend;
+    engine.selectFx('delay');
+    engine.setFxParam(0, 0.55); // feedback: tail rings ~2.5s, does not run away
+    engine.setFxParam(1, 0.5);
+    engine.setFxParam(2, 0.4);
+    engine.setFxWet(0.7);
+    engine.setFxEnabled(true);
+    engine.setFxSend(pId, 0.8);
+    const next = { ...chRef.current[m.playingKey], fxSend: 0.8 };
+    (m.playingKey === 'A' ? setChA : setChB)(next);
+    m.echoCutAt = cutAt;
+    m.echoTailUntil = cutAt + 2.5;
+    return m.echoTailUntil;
+  };
+
+  /** Fix 6 filter fade: lowpass sweep out on the outgoing deck, open on the incoming deck. */
+  const apScheduleFilterPair = (m: ApMachine, startAt: number, durSec: number) => {
+    engine.scheduleFilterCurve(`deck${m.playingKey}`, 0, -1, startAt, durSec);
+    engine.scheduleFilterCurve(`deck${m.freeKey}`, -1, 0, startAt, durSec);
+    m.filterUsed = true;
+  };
+
+  /**
+   * Fix 2 ease-out: after (before=false) or before (before=true) the
+   * bass swap, ease the outgoing mids/highs down over one phrase so the
+   * outgoing track thins instead of fighting the incoming one. Targets
+   * only ever move DOWN from the snapshot (a DJ-cut band is never
+   * raised back by automation). The window is clipped to the blend so a
+   * late live swap still gets a partial ease instead of none. No-op
+   * when the snapshot is already below the targets.
+   */
+  const apScheduleEaseForSwap = (
+    m: ApMachine,
+    swapStartAt: number,
+    opts: { before: boolean; phraseSec: number },
+  ) => {
+    if (!m.eqSnap) return;
+    const toMid = Math.min(m.eqSnap.outMid, -0.3);
+    const toHigh = Math.min(m.eqSnap.outHigh, -0.5);
+    if (toMid === m.eqSnap.outMid && toHigh === m.eqSnap.outHigh) return;
+    const nowAudio = engine.ctx.currentTime;
+    const start = opts.before
+      ? Math.max(nowAudio, swapStartAt - opts.phraseSec)
+      : swapStartAt;
+    const end = opts.before ? swapStartAt : Math.min(m.blendEndAt, swapStartAt + opts.phraseSec);
+    if (end <= start) return;
+    engine.scheduleEqCurve(`deck${m.playingKey}`, 'mid', m.eqSnap.outMid, toMid, start, end - start);
+    engine.scheduleEqCurve(`deck${m.playingKey}`, 'high', m.eqSnap.outHigh, toHigh, start, end - start);
+    m.easeStartAt = start;
+    m.easeEndAt = end;
+    m.easeFromMid = m.eqSnap.outMid;
+    m.easeFromHigh = m.eqSnap.outHigh;
+    m.easeToMid = toMid;
+    m.easeToHigh = toHigh;
+  };
+
   const apSetCrossfader = (v: number) => {
     setCrossfader(v);
     engine.setCrossfader(v);
@@ -1282,6 +1467,9 @@ export default function App() {
     const v = m.fromV + (m.toV - m.fromV) * p;
     if (Math.abs(v - crossfaderRef.current) > 0.005) setCrossfader(v);
     if (!m.eqSnap) return;
+    // Cut/echo transitions never move the low EQ (no hold, no swap), so
+    // the mirror must not replay a phantom swap window for them.
+    if (!(m.bassSwapped && m.swapStartAt == null)) {
     const pSt = deckStateRef.current[m.playingKey];
     const barSec = pSt.track ? barSeconds(pSt.track.beatGrid) : 0.5;
     const beatSec = barSec / 4;
@@ -1301,16 +1489,75 @@ export default function App() {
     if (Math.abs(inLow - curIn) > 0.01) {
       (m.freeKey === 'A' ? setChA : setChB)({ ...chRef.current[m.freeKey], eqLow: inLow });
     }
+    }
+    // Fix 2 ease window: outgoing mids/highs replay snapshot → target.
+    if (m.easeStartAt != null && m.easeEndAt != null && nowAudio >= m.easeStartAt) {
+      const f = Math.min(1, Math.max(0, (nowAudio - m.easeStartAt) / Math.max(0.05, m.easeEndAt - m.easeStartAt)));
+      const mid = m.easeFromMid + (m.easeToMid - m.easeFromMid) * f;
+      const high = m.easeFromHigh + (m.easeToHigh - m.easeFromHigh) * f;
+      const cur = chRef.current[m.playingKey];
+      if (Math.abs(mid - cur.eqMid) > 0.01 || Math.abs(high - cur.eqHigh) > 0.01) {
+        (m.playingKey === 'A' ? setChA : setChB)({ ...cur, eqMid: mid, eqHigh: high });
+      }
+    }
+    // Fix 6 filter sweep: outgoing closes, incoming opens over the blend.
+    if (m.filterUsed) {
+      const outF = -p;
+      const inF = -1 + p;
+      const curP = chRef.current[m.playingKey];
+      const curF = chRef.current[m.freeKey];
+      if (Math.abs(outF - curP.filter) > 0.01) {
+        (m.playingKey === 'A' ? setChA : setChB)({ ...curP, filter: outF });
+      }
+      if (Math.abs(inF - curF.filter) > 0.01) {
+        (m.freeKey === 'A' ? setChA : setChB)({ ...curF, filter: inF });
+      }
+    }
   };
 
-  /** Restore pre-transition low EQ on both decks (takeover / cycle end). */
+  /**
+   * Restore pre-transition EQ on both decks (takeover / cycle end):
+   * low on both, mid/high on the outgoing deck only (the incoming deck's
+   * mids/highs were never automated). Also undoes a filter sweep and an
+   * echo-out FX arm when this transition used them.
+   */
   const apRestoreEq = (m: ApMachine) => {
-    if (!m.eqSnap) return;
-    for (const k of ['A', 'B'] as const) {
-      const val = k === m.playingKey ? m.eqSnap.outLow : m.eqSnap.inLow;
-      engine.setEq(`deck${k}`, 'low', val, false);
-      const next = { ...chRef.current[k], eqLow: val };
-      (k === 'A' ? setChA : setChB)(next);
+    if (m.eqSnap) {
+      for (const k of ['A', 'B'] as const) {
+        const val = k === m.playingKey ? m.eqSnap.outLow : m.eqSnap.inLow;
+        engine.setEq(`deck${k}`, 'low', val, false);
+        const next = { ...chRef.current[k], eqLow: val };
+        (k === 'A' ? setChA : setChB)(next);
+      }
+      engine.setEq(`deck${m.playingKey}`, 'mid', m.eqSnap.outMid, false);
+      engine.setEq(`deck${m.playingKey}`, 'high', m.eqSnap.outHigh, false);
+      const nextOut = { ...chRef.current[m.playingKey], eqMid: m.eqSnap.outMid, eqHigh: m.eqSnap.outHigh };
+      (m.playingKey === 'A' ? setChA : setChB)(nextOut);
+    }
+    if (m.filterUsed) {
+      for (const k of ['A', 'B'] as const) {
+        engine.setFilter(`deck${k}`, 0);
+        const next = { ...chRef.current[k], filter: 0 };
+        (k === 'A' ? setChA : setChB)(next);
+      }
+      m.filterUsed = false;
+    }
+    if (m.fxSaved) {
+      const s = m.fxSaved;
+      engine.selectFx(s.type);
+      engine.setFxParam(0, s.params[0]);
+      engine.setFxParam(1, s.params[1]);
+      engine.setFxParam(2, s.params[2]);
+      engine.setFxWet(s.wet);
+      engine.setFxEnabled(s.enabled);
+      const send = m.fxSendSaved ?? 0;
+      engine.setFxSend(`deck${m.playingKey}`, send);
+      const next = { ...chRef.current[m.playingKey], fxSend: send };
+      (m.playingKey === 'A' ? setChA : setChB)(next);
+      m.fxSaved = null;
+      m.fxSendSaved = null;
+      m.echoCutAt = null;
+      m.echoTailUntil = null;
     }
   };
 
@@ -1686,6 +1933,9 @@ export default function App() {
       engine.setFader(fId, 0.8);
       (m.freeKey === 'A' ? setChA : setChB)({ ...fCh, fader: 0.8 });
     }
+    // Fix 3 auto-gain for the tease release (entered from the waiting
+    // tick directly, bypassing apScheduleBlend's call).
+    apApplyAutoGain(m);
     const tempoRatio =
       masterBpmRef.current > 0 && pSt.track.bpm > 0 ? masterBpmRef.current / pSt.track.bpm : 1;
     const outBarSec = barSeconds(pSt.track.beatGrid);
@@ -1696,6 +1946,8 @@ export default function App() {
     m.eqSnap = {
       outLow: chRef.current[m.playingKey].eqLow,
       inLow: m.teaseEqSnap ?? chRef.current[m.freeKey].eqLow,
+      outMid: chRef.current[m.playingKey].eqMid,
+      outHigh: chRef.current[m.playingKey].eqHigh,
     };
     m.bassSwapped = false;
     m.teaseReleased = true;
@@ -1752,6 +2004,9 @@ export default function App() {
       engine.setFader(fId, 0.8);
       (m.freeKey === 'A' ? setChA : setChB)({ ...fCh, fader: 0.8 });
     }
+    // Fix 3 auto-gain for the sustain launch (entered from the waiting
+    // tick directly, bypassing apScheduleBlend's call).
+    apApplyAutoGain(m);
     const startAt = engine.playQuantized(fId, { offset: plan.launchPos }) ?? engine.ctx.currentTime;
     const tempoRatio =
       masterBpmRef.current > 0 && pSt.track.bpm > 0 ? masterBpmRef.current / pSt.track.bpm : 1;
@@ -1763,6 +2018,8 @@ export default function App() {
     m.eqSnap = {
       outLow: chRef.current[m.playingKey].eqLow,
       inLow: chRef.current[m.freeKey].eqLow,
+      outMid: chRef.current[m.playingKey].eqMid,
+      outHigh: chRef.current[m.playingKey].eqHigh,
     };
     m.bassSwapped = false;
     engine.cancelDeckAutomation(pId);
@@ -1808,6 +2065,76 @@ export default function App() {
   };
 
   /**
+   * Ranked fix 6: schedule the curve set for a blend's transition type.
+   * The caller sets phase/blendStartAt/blendSec/blendEndAt/automated and
+   * eqSnap first; this helper may shorten the blend (cut/echo) or
+   * re-time it (breakdown) and updates blendSec/blendEndAt to match.
+   *   blend (default): low hold + crossfader + fallback swap + mid/high
+   *     ease-out before the swap (fix 2).
+   *   filter: blend curves + a lowpass sweep pair (fix 6).
+   *   breakdown: 4-bar swap into the hole — no bass hold (the incoming
+   *     bass opens at once), outgoing bass cut at the join, ease over
+   *     the blend. swapStartAt is recorded so the UI mirror replays it.
+   *   cut: 0.1s crossfader step, no hold, no swap — bassSwapped is set
+   *     so the live swap check and the mirror both stay out of the way.
+   *   echo: 1-beat crossfader move + delay tail arm; the tick pauses
+   *     the outgoing deck at the cut and the finish restores the FX.
+   */
+  const apScheduleTypeCurves = (
+    m: ApMachine,
+    startAt: number,
+    blendSec: number,
+    beatSec: number,
+    phraseSec: number,
+    tempoRatio: number,
+  ) => {
+    const pId = `deck${m.playingKey}`;
+    const fId = `deck${m.freeKey}`;
+    const snap = m.eqSnap;
+    if (!snap) return;
+    const tType = m.transType ?? 'blend';
+    if (tType === 'cut') {
+      engine.scheduleCrossfaderCurve(m.fromV, m.toV, startAt, 0.1);
+      m.bassSwapped = true;
+      m.blendSec = 0.1;
+      m.blendEndAt = startAt + 0.1;
+      return;
+    }
+    if (tType === 'echo') {
+      engine.scheduleCrossfaderCurve(m.fromV, m.toV, startAt, beatSec);
+      const tailUntil = apArmEcho(m, startAt + beatSec);
+      m.bassSwapped = true;
+      m.blendSec = tailUntil - startAt;
+      m.blendEndAt = tailUntil;
+      return;
+    }
+    let effBlendSec = blendSec;
+    if (tType === 'breakdown') {
+      effBlendSec = Math.max(2, (4 * phraseSec) / tempoRatio);
+      m.bassSwapped = true;
+    }
+    m.blendSec = effBlendSec;
+    m.blendEndAt = startAt + effBlendSec;
+    if (tType !== 'breakdown') engine.scheduleEqLowHold(fId, -1, startAt);
+    engine.scheduleCrossfaderCurve(m.fromV, m.toV, startAt, effBlendSec);
+    if (tType === 'filter') apScheduleFilterPair(m, startAt, effBlendSec);
+    if (tType === 'breakdown') {
+      engine.scheduleEqLowCurve(pId, snap.outLow, -1, startAt, beatSec);
+      m.swapStartAt = startAt;
+      m.swapDur = beatSec;
+      m.swapFromOut = snap.outLow;
+      m.swapFromIn = snap.inLow;
+      apScheduleEaseForSwap(m, startAt, { before: false, phraseSec });
+    } else {
+      const swapDur = Math.min(beatSec, effBlendSec);
+      const swapStart = startAt + effBlendSec - swapDur;
+      engine.scheduleEqLowCurve(pId, snap.outLow, -1, swapStart, swapDur);
+      engine.scheduleEqLowCurve(fId, -1, snap.inLow, swapStart, swapDur);
+      apScheduleEaseForSwap(m, swapStart, { before: true, phraseSec });
+    }
+  };
+
+  /**
    * Schedule a blend on the audio clock: the incoming deck starts at the
    * outro-start audio time (existing play(startAt) queued-launch path),
    * the crossfader curve and the fallback bass swap are AudioParam
@@ -1833,6 +2160,10 @@ export default function App() {
       engine.setFader(fId, 0.8);
       (m.freeKey === 'A' ? setChA : setChB)({ ...fCh, fader: 0.8 });
     }
+    // Fix 3 auto-gain runs here for the schedule/immediate paths below.
+    // Tease and sustain launchers call it themselves (they are also
+    // entered directly from the waiting tick, bypassing this function).
+    apApplyAutoGain(m);
     const tempoRatio =
       masterBpmRef.current > 0 && pSt.track.bpm > 0 ? masterBpmRef.current / pSt.track.bpm : 1;
     // Round 6 — tease/sustain never schedule here (they launch from the
@@ -1848,6 +2179,8 @@ export default function App() {
       m.eqSnap = {
         outLow: chRef.current[m.playingKey].eqLow,
         inLow: chRef.current[m.freeKey].eqLow,
+        outMid: chRef.current[m.playingKey].eqMid,
+        outHigh: chRef.current[m.playingKey].eqHigh,
       };
       m.bassSwapped = false;
       m.blendSec = smartBlendSec;
@@ -1874,18 +2207,12 @@ export default function App() {
         // would shift launchPos by up to a bar and break the whole-bar
         // distance the plan was built on.
         engine.play(fId, { offset: plan.launchPos, alignToMaster: false, startAt: blendStartAt });
-        engine.scheduleEqLowHold(fId, -1, blendStartAt); // incoming bass cut at blend start
-        engine.scheduleCrossfaderCurve(m.fromV, m.toV, blendStartAt, smartBlendSec);
-        const beatSec = outBarSec / 4;
-        const swapDur = Math.min(beatSec, smartBlendSec);
-        const swapStart = blendStartAt + smartBlendSec - swapDur;
-        engine.scheduleEqLowCurve(pId, m.eqSnap.outLow, -1, swapStart, swapDur);
-        engine.scheduleEqLowCurve(fId, -1, m.eqSnap.inLow, swapStart, swapDur);
         m.phase = 'scheduled';
         m.blendStartAt = blendStartAt;
         m.blendEndAt = blendStartAt + smartBlendSec;
         m.automated = true;
-        debugLog('transport', 'autopilot blend scheduled', undefined, { at: blendStartAt, blendSec: smartBlendSec, smart: plan.mode, to: m.nextTitle });
+        apScheduleTypeCurves(m, blendStartAt, smartBlendSec, outBarSec / 4, outBarSec, tempoRatio);
+        debugLog('transport', 'autopilot blend scheduled', undefined, { at: blendStartAt, blendSec: m.blendSec, smart: plan.mode, type: m.transType, to: m.nextTitle });
       } else {
         // Due now (late wakeup) or uncomputable — begin now, still
         // audio-scheduled from the current audio time.
@@ -1893,12 +2220,21 @@ export default function App() {
       }
       return;
     }
-    const blendSec = Math.max(2, (pSt.track.duration - m.outroStart) / tempoRatio);
+    // Fix 1 (fallback path): the legacy blend length was track-time
+    // remainder, which could end mid-phrase. Round it to whole outgoing
+    // bars (at least 4) so the fallback blend ends on a bar line too.
+    // Fix 4: launch from the first audible sound, not from file start.
+    const outBarSec = barSeconds(pSt.track.beatGrid);
+    const rawBlendSec = Math.max(2, (pSt.track.duration - m.outroStart) / tempoRatio);
+    const blendSecBars = Math.max(4, Math.round((rawBlendSec * tempoRatio) / outBarSec));
+    const blendSec = (blendSecBars * outBarSec) / tempoRatio;
     const nowAudio = engine.ctx.currentTime;
     const blendStartAt = engine.audioTimeAtTrackPos(pId, m.outroStart);
     m.eqSnap = {
       outLow: chRef.current[m.playingKey].eqLow,
       inLow: chRef.current[m.freeKey].eqLow,
+      outMid: chRef.current[m.playingKey].eqMid,
+      outHigh: chRef.current[m.playingKey].eqHigh,
     };
     m.bassSwapped = false;
     m.blendSec = blendSec;
@@ -1906,19 +2242,14 @@ export default function App() {
     m.toV = m.playingKey === 'A' ? 1 : -1;
     if (blendStartAt !== null && blendStartAt > nowAudio + 0.05) {
       // Audio-scheduled path.
-      engine.play(fId, { offset: 0, alignToMaster: true, startAt: blendStartAt });
-      engine.scheduleEqLowHold(fId, -1, blendStartAt); // incoming bass cut at blend start
-      engine.scheduleCrossfaderCurve(m.fromV, m.toV, blendStartAt, blendSec);
-      const beatSec = barSeconds(pSt.track.beatGrid) / 4;
-      const swapDur = Math.min(beatSec, blendSec);
-      const swapStart = blendStartAt + blendSec - swapDur;
-      engine.scheduleEqLowCurve(pId, m.eqSnap.outLow, -1, swapStart, swapDur);
-      engine.scheduleEqLowCurve(fId, -1, m.eqSnap.inLow, swapStart, swapDur);
+      const launchOffset = fSt.track ? (firstSoundSec(fSt.track) ?? 0) : 0;
+      engine.play(fId, { offset: launchOffset, alignToMaster: true, startAt: blendStartAt });
       m.phase = 'scheduled';
       m.blendStartAt = blendStartAt;
       m.blendEndAt = blendStartAt + blendSec;
       m.automated = true;
-      debugLog('transport', 'autopilot blend scheduled', undefined, { at: blendStartAt, blendSec, to: m.nextTitle });
+      apScheduleTypeCurves(m, blendStartAt, blendSec, outBarSec / 4, outBarSec, tempoRatio);
+      debugLog('transport', 'autopilot blend scheduled', undefined, { at: blendStartAt, blendSec: m.blendSec, type: m.transType, to: m.nextTitle });
     } else {
       // Due now (late wakeup) or uncomputable — begin now, still
       // audio-scheduled from the current audio time.
@@ -1957,6 +2288,8 @@ export default function App() {
       engine.cancelEqAutomation(`deck${m.freeKey}`);
       engine.scheduleEqLowCurve(`deck${m.playingKey}`, outNow, -1, nowAudio, swapDur);
       engine.scheduleEqLowCurve(`deck${m.freeKey}`, inNow, m.eqSnap!.inLow, nowAudio, swapDur);
+      // Fix 2: the outgoing track thins over the next phrase after the swap.
+      apScheduleEaseForSwap(m, nowAudio, { before: false, phraseSec: barSec });
       m.bassSwapped = true;
       // Round 7: the UI mirror replays this exact swap window, and the
       // log makes the swap diagnosable (previously it was silent).
@@ -1985,6 +2318,118 @@ export default function App() {
     if (nowAudio - m.blendStartAt < 2 * barSec) return;
     if (!swapReady(trackBassEnvelope(pSt.track), outPos, trackBassEnvelope(fSt.track), inPos)) return;
     doSwap();
+  };
+
+  /**
+   * Fix 8: live contingency monitor, run once per blend tick from the
+   * scheduled/crossfading phases. Fires at most once per transition
+   * (contingencyFired), only for blend/filter/breakdown types — cut and
+   * echo already ARE the fallback, and tease/sustain joins are
+   * structural. Every branch re-times AudioParam automation; the tick
+   * never steps audio itself. Extend-loop stays plan-time only
+   * (extend/sustain modes); a running crossfader curve is stretched,
+   * never re-planned.
+   */
+  const apContingencyCheck = (m: ApMachine, nowAudio: number) => {
+    if (m.contingencyFired || !m.eqSnap) return;
+    const tType = m.transType ?? 'blend';
+    if (tType === 'cut' || tType === 'echo') return;
+    // Tease/sustain joins are structural (the kick IS the switch) — a
+    // contingency re-time would fight the plan, so they opt out here.
+    if (m.plan?.mode === 'tease' || m.plan?.mode === 'sustain') return;
+    const pSt = deckStateRef.current[m.playingKey];
+    const fSt = deckStateRef.current[m.freeKey];
+    if (!pSt.track || !fSt.track) return;
+    const outBarSec = barSeconds(pSt.track.beatGrid);
+    const inBarSec = barSeconds(fSt.track.beatGrid);
+    const tempoRatio =
+      masterBpmRef.current > 0 && pSt.track.bpm > 0 ? masterBpmRef.current / pSt.track.bpm : 1;
+    // PLL health: syncStatus is null while a launch is queued or the
+    // deck is master, so only real unlocked readings count (a null
+    // reading neither counts nor resets the streak).
+    const pll = engine.syncStatus(`deck${m.freeKey}`);
+    if (pll && !pll.locked && Math.abs(pll.errBeats) > 0.5) m.pllBadTicks += 1;
+    else if (pll) m.pllBadTicks = 0;
+    const outPos = engine.position(`deck${m.playingKey}`);
+    const inPos = engine.position(`deck${m.freeKey}`);
+    const blendRemainingBars = Math.max(0, (m.blendEndAt - nowAudio) * tempoRatio / outBarSec);
+    const kickOverdueBars = m.plan?.firstKick != null && inPos > m.plan.firstKick
+      ? (inPos - m.plan.firstKick) / inBarSec
+      : 0;
+    const outBass = bassState(trackBassEnvelope(pSt.track), outPos);
+    const action = decideContingency({
+      bassSwapped: m.bassSwapped,
+      blendRemainingBars,
+      pllBadTicks: m.pllBadTicks,
+      kickOverdueBars,
+      outBass,
+    });
+    if (action === 'none') return;
+    const pId = `deck${m.playingKey}`;
+    const fId = `deck${m.freeKey}`;
+    const beatSec = outBarSec / 4;
+    const progress = Math.min(1, Math.max(0, (nowAudio - m.blendStartAt) / Math.max(0.1, m.blendSec)));
+    const v = m.fromV + (m.toV - m.fromV) * progress;
+    if (action === 'delay-swap') {
+      // Next phrase downbeat on the outgoing track (4 bars out), or 4
+      // bars from now if the grid cannot place one. The crossfader
+      // curve stretches to the new end so the delay is audible, not
+      // just bookkeeping; the swap re-times from the CURRENT low values
+      // (the frozen fallback-window interpolation), never from the
+      // snapshot, so there is no EQ jump at the new swap.
+      const swapOutPos = downbeatBarsAfter(pSt.track.beatGrid, outPos, 4);
+      let swapAt = swapOutPos != null ? engine.audioTimeAtTrackPos(pId, swapOutPos) : null;
+      if (swapAt == null || swapAt <= nowAudio) swapAt = nowAudio + 4 * outBarSec / tempoRatio;
+      const newEnd = Math.max(m.blendEndAt, swapAt + beatSec);
+      const fbStart = m.blendEndAt - Math.min(beatSec, m.blendSec);
+      const span = Math.max(0.1, m.blendEndAt - fbStart);
+      const f = nowAudio < fbStart ? 0 : Math.min(1, (nowAudio - fbStart) / span);
+      const outNow = m.eqSnap.outLow + (-1 - m.eqSnap.outLow) * f;
+      const inNow = -1 + (m.eqSnap.inLow - -1) * f;
+      engine.cancelEqAllBands(pId);
+      engine.cancelEqAllBands(fId);
+      engine.scheduleCrossfaderCurve(v, m.toV, nowAudio, Math.max(0.1, newEnd - nowAudio));
+      engine.scheduleEqLowCurve(pId, outNow, -1, swapAt, beatSec);
+      engine.scheduleEqLowCurve(fId, inNow, m.eqSnap.inLow, swapAt, beatSec);
+      // Ease: if one is already mid-window, cancelling it froze the
+      // outgoing track part-thinned — leave it (re-scheduling from the
+      // snapshot would jump the mids/highs back up). Otherwise schedule
+      // a fresh ease ending at the delayed swap.
+      const easeActive = m.easeStartAt != null && m.easeEndAt != null &&
+        nowAudio >= m.easeStartAt && nowAudio < m.easeEndAt;
+      if (easeActive) {
+        m.easeStartAt = null;
+        m.easeEndAt = null;
+      } else {
+        apScheduleEaseForSwap(m, swapAt, { before: true, phraseSec: outBarSec });
+      }
+      m.swapStartAt = swapAt;
+      m.swapDur = beatSec;
+      m.swapFromOut = outNow;
+      m.swapFromIn = inNow;
+      m.bassSwapped = true;
+      m.blendEndAt = newEnd;
+      m.blendSec = Math.max(m.blendSec, newEnd - m.blendStartAt);
+      m.contingencyFired = 'delay-swap';
+      m.contingencyNote = 'Contingency: bass swap delayed a phrase';
+    } else if (action === 'shorten-cut') {
+      engine.cancelEqAllBands(pId);
+      engine.cancelEqAllBands(fId);
+      engine.scheduleCrossfaderCurve(v, m.toV, nowAudio, 0.1);
+      m.bassSwapped = true;
+      m.blendEndAt = nowAudio + 0.2;
+      m.contingencyFired = 'shorten-cut';
+      m.contingencyNote = 'Contingency: blend shortened to a cut';
+    } else {
+      const tailUntil = apArmEcho(m, nowAudio + beatSec);
+      engine.scheduleCrossfaderCurve(v, m.toV, nowAudio, beatSec);
+      m.bassSwapped = true;
+      m.blendEndAt = tailUntil;
+      m.blendSec = Math.max(m.blendSec, tailUntil - m.blendStartAt);
+      m.contingencyFired = 'echo-finish';
+      m.contingencyNote = 'Contingency: grids diverged — echo finish';
+    }
+    debugLog('transport', 'autopilot contingency', undefined, { action, to: m.nextTitle });
   };
 
   const apBeginCrossfade = (m: ApMachine, now: number) => {
@@ -2019,7 +2464,9 @@ export default function App() {
         }
         smartStartAt = engine.playQuantized(fId, { offset: smart.launchPos });
       } else {
-        engine.play(fId, { offset: 0, alignToMaster: true });
+        // Fix 4: skip leading silence on the legacy immediate launch.
+        const launchOffset = fSt.track ? (firstSoundSec(fSt.track) ?? 0) : 0;
+        engine.play(fId, { offset: launchOffset, alignToMaster: true });
       }
     }
     // A silent incoming channel would blend into nothing — nudge it up.
@@ -2028,6 +2475,8 @@ export default function App() {
       engine.setFader(fId, 0.8);
       (m.freeKey === 'A' ? setChA : setChB)({ ...fCh, fader: 0.8 });
     }
+    // Fix 3 auto-gain for the immediate path.
+    apApplyAutoGain(m);
     const tempoRatio =
       masterBpmRef.current > 0 && pSt.track.bpm > 0 ? masterBpmRef.current / pSt.track.bpm : 1;
     m.phase = 'crossfading';
@@ -2041,6 +2490,8 @@ export default function App() {
     m.eqSnap = {
       outLow: chRef.current[m.playingKey].eqLow,
       inLow: chRef.current[m.freeKey].eqLow,
+      outMid: chRef.current[m.playingKey].eqMid,
+      outHigh: chRef.current[m.playingKey].eqHigh,
     };
     m.bassSwapped = false;
     // Audio-scheduled from now (catch-up path): the crossfader curve and
@@ -2053,15 +2504,9 @@ export default function App() {
     m.blendStartAt = startAt;
     m.blendEndAt = startAt + m.blendSec;
     m.automated = true;
-    engine.scheduleEqLowHold(fId, -1, startAt); // ONE-BASS RULE at blend start
-    engine.scheduleCrossfaderCurve(m.fromV, m.toV, startAt, m.blendSec);
-    const beatSec = barSeconds(pSt.track.beatGrid) / 4;
-    const swapDur = Math.min(beatSec, m.blendSec);
-    const swapStart = m.blendEndAt - swapDur;
-    engine.scheduleEqLowCurve(pId, m.eqSnap.outLow, -1, swapStart, swapDur);
-    engine.scheduleEqLowCurve(fId, -1, m.eqSnap.inLow, swapStart, swapDur);
+    apScheduleTypeCurves(m, startAt, m.blendSec, barSeconds(pSt.track.beatGrid) / 4, barSeconds(pSt.track.beatGrid), tempoRatio);
     debugLog('transport', 'autopilot blending', undefined, {
-      from: pSt.track.title, to: m.nextTitle, blendSec: m.blendSec,
+      from: pSt.track.title, to: m.nextTitle, blendSec: m.blendSec, type: m.transType,
     });
   };
 
@@ -2076,17 +2521,13 @@ export default function App() {
     engine.cancelDeckAutomation(pId);
     engine.cancelDeckAutomation(fId);
     apSetCrossfader(m.toV);
-    // If the bass never swapped (no readable envelope moment), swap at the
-    // handover: outgoing bass cut, incoming bass to its pre-blend value.
-    if (m.eqSnap) {
-      if (!m.bassSwapped) {
-        apSetEq(m.playingKey, -1);
-        apSetEq(m.freeKey, m.eqSnap.inLow);
-      }
-      // Outgoing deck is paused now — restore its EQ snapshot so the next
-      // cycle starts from a sane state.
-      apSetEq(m.playingKey, m.eqSnap.outLow);
-    }
+    // Restore pre-transition EQ on both decks (the outgoing deck is
+    // paused now, so its snapshot is the sane state for the next cycle),
+    // plus any filter sweep or echo-out FX arm this transition used.
+    // Trim is deliberately NOT restored here: the auto-gain match
+    // persists for the now-playing track (takeover/pause paths restore
+    // it via apRestoreTrim).
+    apRestoreEq(m);
     engine.pause(pId);
     const nextDeckState = { ...fSt, syncActive: false };
     if (m.nextIsBridge && fSt.buffer) {
@@ -2259,7 +2700,14 @@ export default function App() {
       // A plan belongs to the armed pick: if the free deck no longer
       // holds that pick (manual load, failed load), drop it so the next
       // arm re-plans from the new track.
-      if (!armed && m.plan && fSt.track?.id !== m.nextId) m.plan = null;
+      if (!armed && m.plan && fSt.track?.id !== m.nextId) {
+        m.plan = null;
+        m.transType = null;
+        m.transNote = null;
+        m.contingencyFired = null;
+        m.contingencyNote = null;
+        m.pllBadTicks = 0;
+      }
       // Finalize: a queue pick arrived after the provisional auto-pick arm
       // — swap to it (reload the free deck). In a visible tab this always
       // lands; in a throttled tab it may not, and the armed pick plays
@@ -2276,6 +2724,8 @@ export default function App() {
           m.provisional = false;
           m.synced = false;
           m.plan = null;
+          m.transType = null;
+          m.transNote = null;
           m.loadStartWall = now;
           loadLibRef.current(q.track.id, m.freeKey);
           pushApStatus({
@@ -2299,6 +2749,52 @@ export default function App() {
           outroBars: apOutroRef.current,
         });
         m.plan = plan;
+        // Ranked fixes 5+6: guardrails + transition type for this pair,
+        // computed once per cycle alongside the plan. Tease/sustain
+        // plans already encode a structural join, so they always keep
+        // the blend type (a guardrail note is still shown); straight,
+        // extend, and fallback blends get the downgraded type when the
+        // pairing fails (key clash, big BPM gap) or a breakdown/cut when
+        // the sections demand it. Queue picks are never skipped by this
+        // — only the transition type changes.
+        {
+          const guards: Guardrail = evaluateGuardrails(pSt.track, fSt.track);
+          const outBarSec = barSeconds(pSt.track.beatGrid);
+          const inBarSec = barSeconds(fSt.track.beatGrid);
+          const joinPos = plan.mode !== 'fallback' && plan.blendStartOut != null
+            ? plan.blendStartOut
+            : m.outroStart;
+          const breakdownAtJoin =
+            bassState(trackBassEnvelope(pSt.track), joinPos + 2 * outBarSec) === 'absent';
+          const outVd = vocalDensity(
+            pSt.track,
+            Math.max(0, pSt.track.duration - 16 * outBarSec),
+            pSt.track.duration,
+          );
+          const inVd = vocalDensity(
+            fSt.track,
+            0,
+            Math.min(fSt.track.duration, 16 * inBarSec),
+          );
+          const vocalClash =
+            outVd != null && inVd != null &&
+            outVd >= VOCAL_DENSE_RATIO && inVd >= VOCAL_DENSE_RATIO;
+          let transType = selectTransitionType({
+            severity: guards.severity,
+            bpmGapPct: guards.bpmGapPct,
+            breakdownAtJoin,
+            vocalClash,
+          });
+          if (plan.mode === 'tease' || plan.mode === 'sustain') transType = 'blend';
+          m.transType = transType;
+          m.transNote = transitionLabel(transType) +
+            (guards.severity === 'ok' ? '' : ` · guardrail: ${guards.reasons.join(', ')}`) +
+            (vocalClash && transType !== 'cut' ? ' · vocal clash noted' : '');
+          debugLog('transport', 'autopilot transition type', undefined, {
+            type: transType, severity: guards.severity, reasons: guards.reasons,
+            breakdownAtJoin, vocalClash, mode: plan.mode,
+          });
+        }
         if (plan.mode !== 'fallback') {
           const outBarSec = barSeconds(pSt.track.beatGrid);
           if (plan.mode === 'tease' && plan.teaseStart != null) {
@@ -2385,7 +2881,7 @@ export default function App() {
           ? Math.max(0, Math.ceil((m.plan.triggerPos - pos) / barSeconds(pSt.track.beatGrid)))
           : barsToOutro(pSt.track.beatGrid, pSt.track.duration, pos, apOutroRef.current),
         blendProgress: null, bass: null,
-        note: armed ? (m.plan?.note ?? null) : null,
+        note: armed ? (m.transNote ?? m.plan?.note ?? null) : null,
       });
       return;
     }
@@ -2462,7 +2958,11 @@ export default function App() {
       const fSt = deckStateRef.current[m.freeKey];
       const oldAlive = engine.isPlaying(pId);
       const inStarted = nowAudio >= m.blendStartAt;
-      if (!oldAlive) {
+      // Fix 6 echo-out: the outgoing deck is paused BY the echo at the
+      // cut — that is not a user pause and must not cancel the program
+      // (the tail rings until blendEndAt, where the finish restores FX).
+      const echoPaused = m.echoCutAt != null && nowAudio >= m.echoCutAt;
+      if (!oldAlive && !echoPaused) {
         // Old deck stopped before/during the scheduled blend.
         const endedNaturally = !!pSt.track && engine.position(pId) >= pSt.track.duration - 0.5;
         if (endedNaturally && inStarted && engine.isPlaying(fId)) {
@@ -2471,11 +2971,12 @@ export default function App() {
           apFinishWithExtendRelease(m);
         } else if (!endedNaturally) {
           // User paused mid-blend: cancel the program, cancel a
-          // not-yet-started incoming launch, restore EQ, let go.
+          // not-yet-started incoming launch, restore EQ + trim, let go.
           engine.cancelDeckAutomation(pId);
           engine.cancelDeckAutomation(fId);
           if (nowAudio < m.blendStartAt) engine.pause(fId);
           if (m.eqSnap) apRestoreEq(m);
+          apRestoreTrim(m);
           apRef.current = null;
         }
         // Natural end before the incoming started (should not happen —
@@ -2484,15 +2985,22 @@ export default function App() {
         if (apRef.current !== m) return;
       }
       if (inStarted && !engine.isPlaying(fId) && nowAudio > m.blendStartAt + 1) {
-        // Incoming deck died mid-blend: snap back, restore EQ, let go.
+        // Incoming deck died mid-blend: snap back, restore EQ + trim, let go.
         engine.cancelDeckAutomation(pId);
         engine.cancelDeckAutomation(fId);
         apSetCrossfader(m.fromV);
         if (m.eqSnap) apRestoreEq(m);
+        apRestoreTrim(m);
         apRef.current = null;
         return;
       }
       if (inStarted) apLiveSwapCheck(m, nowAudio);
+      // Fix 6 echo-out: pause the outgoing deck at the cut (the delay
+      // tail rings on); the finish at the tail end restores the FX.
+      if (m.echoCutAt != null && nowAudio >= m.echoCutAt && engine.isPlaying(pId)) {
+        engine.pause(pId);
+      }
+      if (inStarted) apContingencyCheck(m, nowAudio);
       apMirrorUi(m, nowAudio);
       if (nowAudio >= m.blendEndAt - 0.05) {
         apFinishWithExtendRelease(m);
@@ -2505,7 +3013,8 @@ export default function App() {
           ? null
           : Math.round(Math.min(1, Math.max(0, (nowAudio - m.blendStartAt) / Math.max(0.1, m.blendSec))) * 100) / 100,
         bass: m.bassSwapped ? 'swapped' : 'cut',
-        note: inStarted ? null : 'Blend programmed — starts on the audio clock at the outro.',
+        note: m.contingencyNote ??
+          (inStarted ? m.transNote : 'Blend programmed — starts on the audio clock at the outro.'),
       });
       return;
     }
@@ -2620,20 +3129,30 @@ export default function App() {
     // end passes on the audio clock.
     const fSt = deckStateRef.current[m.freeKey];
     if (!engine.isPlaying(fId)) {
-      // Incoming deck died mid-blend: snap back, restore EQ, let go.
+      // Incoming deck died mid-blend: snap back, restore EQ + trim, let go.
       engine.cancelDeckAutomation(pId);
       engine.cancelDeckAutomation(fId);
       apSetCrossfader(m.fromV);
       if (m.eqSnap) apRestoreEq(m);
+      apRestoreTrim(m);
       apRef.current = null;
       return;
     }
     const nowAudio = engine.ctx.currentTime;
     apLiveSwapCheck(m, nowAudio);
+    // Fix 6 echo-out: pause the outgoing deck at the cut (the delay
+    // tail rings on); the finish at the tail end restores the FX.
+    if (m.echoCutAt != null && nowAudio >= m.echoCutAt && engine.isPlaying(pId)) {
+      engine.pause(pId);
+    }
+    apContingencyCheck(m, nowAudio);
     apMirrorUi(m, nowAudio);
     // A recovering blend (old deck already dead) finishes on time only
-    // — never on old-deck death, which is already true.
-    if (nowAudio >= m.blendEndAt - 0.05 || (!m.recovering && !engine.isPlaying(pId))) {
+    // — never on old-deck death, which is already true. An echo tail
+    // ringing is not a death either: the outgoing deck was paused at
+    // the cut on purpose, and the finish waits for the tail end.
+    const echoRinging = m.echoTailUntil != null && nowAudio < m.echoTailUntil;
+    if (nowAudio >= m.blendEndAt - 0.05 || (!m.recovering && !engine.isPlaying(pId) && !echoRinging)) {
       apFinishWithExtendRelease(m);
       return;
     }
@@ -2641,7 +3160,8 @@ export default function App() {
       on: true, phase: 'crossfading', playingKey: m.playingKey,
       nextTitle: m.nextTitle, barsToGo: null,
       blendProgress: Math.round(Math.min(1, Math.max(0, (nowAudio - m.blendStartAt) / Math.max(0.1, m.blendSec))) * 100) / 100,
-      bass: m.bassSwapped ? 'swapped' : 'cut', note: null,
+      bass: m.bassSwapped ? 'swapped' : 'cut',
+      note: m.contingencyNote ?? m.transNote,
     });
   }, []);
 
@@ -2690,6 +3210,7 @@ export default function App() {
           apSetEq(m.freeKey, m.teaseEqSnap);
         }
         if (m.eqSnap) apRestoreEq(m);
+        apRestoreTrim(m);
       }
       apRef.current = null;
       setApOn(false);

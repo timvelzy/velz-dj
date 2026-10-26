@@ -753,3 +753,267 @@ export function planTransition(a: SmartPlanInput): SmartPlan {
     note: `Smart mix-in · ${P}-bar phrase blend · first kick ${fmtTime(firstKick)}`,
   };
 }
+
+// ─── Auto-DJ smoothness: ranked fixes (research 2026-10-26) ─────────────
+// Pure planning for the transition engine. Status of each fix against
+// what already existed in this codebase:
+//   Fix 3 equal-power — ALREADY PRESENT (engine crossfader is cos/sin
+//     equal-power, scheduled and immediate). What was missing, and is
+//     added here, is auto-gain: per-track loudness matching on load.
+//   Fix 2 bass-swap — the one-bass hold + structural/fallback swap
+//     already existed. Added here: the outgoing mid/high ease-out
+//     around the swap (driver schedules it; the curves live in the
+//     engine), and the swap-delay contingency below.
+//   Fix 1 phrase-aligned — already present for smart plans (downbeat
+//     snapped blend starts, whole-phrase lengths). Added here: whole-
+//     bar fallback blends + silence trim, so the legacy path cannot
+//     land mid-phrase or play into silence either.
+//   Fix 4 overlap/silence/vocal — overlap already present via plans.
+//     Added here: explicit silence trim + a mid-band vocal-density
+//     proxy (no stems) that feeds type selection.
+//   Fix 5 guardrails — Camelot + tempo window already existed in
+//     pickNextTrack. Added here: energy-slope sanity + a severity
+//     verdict that can DOWNGRADE a blend instead of blending blindly.
+//   Fix 6 type selection — NEW: blend / breakdown / cut / filter /
+//     echo chosen per pair, not one crossfader for everything.
+//   Fix 8 contingencies — NEW (live branches only): delay-swap,
+//     shorten-cut, echo-finish. Extend-loop stays plan-time only
+//     (extend/sustain modes already loop phrases); re-scheduling a
+//     running crossfader curve mid-blend was judged too risky.
+//   Fix 7 stems — DEFERRED, deliberately: no in-browser Demucs exists
+//     in this codebase, the browser model is ~126–170 MB with CPU
+//     times of ~1–3 min per minute of audio and a reported WASM-heap
+//     load failure, and djay's real-time claim is Apple-silicon Core
+//     ML, not a browser result. The vocal-clash fallback is the EQ
+//     mid-dip + breakdown/cut selection below — never block a
+//     transition on separation.
+
+/** Integrated loudness proxy + true peak from cached band peaks. */
+export interface TrackLoudness {
+  /** 10*log10(mean square) over all RMS buckets — dBFS-ish, comparable across tracks. */
+  integratedDb: number;
+  /** Max bucket peak (linear amplitude). */
+  truePeak: number;
+}
+
+export function trackLoudness(t: TrackInfo | null | undefined): TrackLoudness | null {
+  const p = t?.peaks;
+  if (!p || p.rms.length === 0) return null;
+  let ms = 0;
+  for (let i = 0; i < p.rms.length; i++) ms += p.rms[i] * p.rms[i];
+  ms /= p.rms.length;
+  let peak = 0;
+  for (let i = 0; i < p.max.length; i++) if (p.max[i] > peak) peak = p.max[i];
+  return { integratedDb: 10 * Math.log10(Math.max(ms, 1e-12)), truePeak: peak };
+}
+
+/** Gain (dB) that matches the incoming track to the outgoing track's loudness. */
+export function autoGainDb(
+  out: TrackInfo,
+  incoming: TrackInfo,
+): { gainDb: number; limited: boolean } | null {
+  const o = trackLoudness(out);
+  const i = trackLoudness(incoming);
+  if (!o || !i) return null;
+  let gainDb = clamp(o.integratedDb - i.integratedDb, -6, 6);
+  let limited = false;
+  if (i.truePeak > 0) {
+    const peakAfter = i.truePeak * Math.pow(10, gainDb / 20);
+    if (peakAfter > 0.99) {
+      gainDb = 20 * Math.log10(0.99 / Math.max(i.truePeak, 1e-6));
+      limited = true;
+    }
+  }
+  return { gainDb, limited };
+}
+
+/** First/last bucket above the noise floor, in track seconds (null without peaks). */
+function soundBounds(t: TrackInfo): { first: number; last: number } | null {
+  const p = t.peaks;
+  if (!p || p.rms.length === 0 || p.rate <= 0) return null;
+  const ref = p90(p.rms);
+  const thr = Math.max(0.002, 0.02 * ref);
+  let first = -1;
+  let last = -1;
+  for (let i = 0; i < p.rms.length; i++) {
+    if (p.rms[i] > thr) {
+      if (first < 0) first = i;
+      last = i;
+    }
+  }
+  if (first < 0) return null;
+  return { first: first / p.rate, last: last / p.rate };
+}
+
+/** First audible sound (leading-silence trim) or null. */
+export function firstSoundSec(t: TrackInfo): number | null {
+  return soundBounds(t)?.first ?? null;
+}
+
+/** Last audible sound (trailing-silence trim) or null. */
+export function lastSoundSec(t: TrackInfo): number | null {
+  return soundBounds(t)?.last ?? null;
+}
+
+/** Mean mid-band energy over [t0, t1] as a fraction of the track's own mid p90 (0..1). */
+export function vocalDensity(t: TrackInfo, t0: number, t1: number): number | null {
+  const p = t.peaks;
+  if (!p || p.mid.length === 0 || p.rate <= 0 || t1 <= t0) return null;
+  const ref = p90(p.mid);
+  if (ref <= 0) return null;
+  const i0 = clamp(Math.floor(t0 * p.rate), 0, p.mid.length - 1);
+  const i1 = clamp(Math.ceil(t1 * p.rate), 0, p.mid.length - 1);
+  if (i1 < i0) return null;
+  let sum = 0;
+  for (let i = i0; i <= i1; i++) sum += p.mid[i];
+  return clamp(sum / (i1 - i0 + 1) / ref, 0, 1);
+}
+
+/** A bar is "vocal-dense" when its mid-band mean clears the bass-state-style line. */
+export const VOCAL_DENSE_RATIO = 0.4;
+
+/** Energy direction across a window: second half vs first half of low-band energy. */
+export function energySlope(t: TrackInfo, t0: number, t1: number): 'rising' | 'falling' | 'flat' | null {
+  const env = trackBassEnvelope(t);
+  if (!env || t1 <= t0) return null;
+  const mid = (t0 + t1) / 2;
+  const mean = (a: number, b: number): number => {
+    let s = 0;
+    let n = 0;
+    for (let x = a; x <= b; x += 0.25) {
+      s += envAt(env, x);
+      n++;
+    }
+    return n ? s / n : 0;
+  };
+  const first = mean(t0, mid);
+  const second = mean(mid, t1);
+  if (first <= 0) return null;
+  const r = second / first;
+  if (r > 1.25) return 'rising';
+  if (r < 0.8) return 'falling';
+  return 'flat';
+}
+
+// ─── Guardrails (fix 5) ─────────────────────────────────────────────────
+
+export interface Guardrail {
+  bpmGapPct: number;
+  halfDouble: boolean;
+  keyScore: number;
+  keysKnown: boolean;
+  outSlope: 'rising' | 'falling' | 'flat' | null;
+  inSlope: 'rising' | 'falling' | 'flat' | null;
+  severity: 'ok' | 'warn' | 'downgrade';
+  reasons: string[];
+}
+
+const CAMELOT_RE = /^(\d{1,2})([AB])$/i;
+
+/**
+ * Pairing verdict. Downgrade (never a plain blend) when the BPM gap
+ * exceeds ~8% without a half/double relationship, or when both keys are
+ * known and clash. Warn on bad energy direction (outgoing rising while
+ * incoming falls), unknown keys, or a 6–8% gap. Queue picks are never
+ * skipped by this — the driver only changes the transition TYPE.
+ */
+export function evaluateGuardrails(out: TrackInfo, incoming: TrackInfo): Guardrail {
+  const reasons: string[] = [];
+  let bpmGapPct = 0;
+  let halfDouble = false;
+  if (out.bpm > 0 && incoming.bpm > 0) {
+    const ratio = incoming.bpm / out.bpm;
+    bpmGapPct = Math.abs(ratio - 1) * 100;
+    halfDouble = Math.abs(ratio - 0.5) < 0.03 || Math.abs(ratio - 2) < 0.03;
+  }
+  const keysKnown =
+    !!out.key && !!incoming.key && CAMELOT_RE.test(out.key) && CAMELOT_RE.test(incoming.key);
+  const keyScore = camelotScore(out.key, incoming.key);
+  let outSlope: Guardrail['outSlope'] = null;
+  let inSlope: Guardrail['inSlope'] = null;
+  if (out.beatGrid && out.beatGrid.bpm > 0 && out.duration > 0) {
+    const b = barSeconds(out.beatGrid);
+    outSlope = energySlope(out, Math.max(0, out.duration - 16 * b), out.duration);
+  }
+  if (incoming.beatGrid && incoming.beatGrid.bpm > 0 && incoming.duration > 0) {
+    const b = barSeconds(incoming.beatGrid);
+    inSlope = energySlope(incoming, 0, Math.min(incoming.duration, 16 * b));
+  }
+  const energyBad = outSlope === 'rising' && inSlope === 'falling';
+  let severity: Guardrail['severity'] = 'ok';
+  if ((bpmGapPct > 8 && !halfDouble) || (keysKnown && keyScore === 0)) {
+    severity = 'downgrade';
+    if (bpmGapPct > 8 && !halfDouble) reasons.push(`BPM gap ${bpmGapPct.toFixed(0)}%`);
+    if (keysKnown && keyScore === 0) reasons.push(`key clash ${out.key} vs ${incoming.key}`);
+  } else {
+    if (energyBad) reasons.push('energy falls the wrong way (out rising, in falling)');
+    if (!keysKnown) reasons.push('key unknown on one side');
+    if (bpmGapPct > 6) reasons.push(`BPM gap ${bpmGapPct.toFixed(0)}%`);
+    if (reasons.length > 0) severity = 'warn';
+  }
+  return { bpmGapPct, halfDouble, keyScore, keysKnown, outSlope, inSlope, severity, reasons };
+}
+
+// ─── Transition-type selection (fix 6) ──────────────────────────────────
+
+export type TransitionType = 'blend' | 'breakdown' | 'cut' | 'filter' | 'echo';
+
+export function transitionLabel(t: TransitionType): string {
+  switch (t) {
+    case 'blend': return 'Bass-swap blend';
+    case 'breakdown': return 'Breakdown swap';
+    case 'cut': return 'Downbeat cut';
+    case 'filter': return 'Filter fade';
+    case 'echo': return 'Echo-out';
+  }
+}
+
+/**
+ * Pick the transition for a pair. A downgraded pairing never gets a
+ * plain blend: a big gap or clash gets a deliberate echo-out moment,
+ * a moderate gap gets a filter fade (a cut would be harsher than the
+ * mismatch needs). A breakdown at the join beats a cut (the incoming
+ * drops into a hole instead of over a vocal), and a vocal clash with
+ * no hole gets a downbeat cut. Everything else is the default
+ * phrase fade + bass swap.
+ */
+export function selectTransitionType(a: {
+  severity: Guardrail['severity'];
+  bpmGapPct: number;
+  breakdownAtJoin: boolean;
+  vocalClash: boolean;
+}): TransitionType {
+  if (a.severity === 'downgrade') return a.bpmGapPct > 15 ? 'echo' : 'filter';
+  if (a.breakdownAtJoin) return 'breakdown';
+  if (a.vocalClash) return 'cut';
+  return 'blend';
+}
+
+// ─── Live contingency branches (fix 8) ──────────────────────────────────
+
+export type ContingencyAction = 'none' | 'delay-swap' | 'shorten-cut' | 'echo-finish';
+
+/**
+ * Decide a live branch during a blend. Only three branches: the swap
+ * can wait one phrase (kick long past, outgoing still full, room left),
+ * the blend must end now (almost over, swap never fired, outgoing
+ * still full — a late muddy swap is worse than a cut), or the grids
+ * have diverged badly (PLL unlocked 3+ ticks — finish with an echo
+ * tail instead of a misaligned blend). Extend-loop stays plan-time
+ * only (extend/sustain modes); a fired branch runs once per transition.
+ */
+export function decideContingency(a: {
+  bassSwapped: boolean;
+  blendRemainingBars: number;
+  pllBadTicks: number;
+  kickOverdueBars: number;
+  outBass: 'present' | 'absent' | 'unknown';
+}): ContingencyAction {
+  if (a.bassSwapped) return 'none';
+  if (a.pllBadTicks >= 3) return 'echo-finish';
+  if (a.kickOverdueBars >= 4 && a.blendRemainingBars >= 4 && a.outBass === 'present') {
+    return 'delay-swap';
+  }
+  if (a.blendRemainingBars < 2 && a.outBass === 'present') return 'shorten-cut';
+  return 'none';
+}

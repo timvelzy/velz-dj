@@ -1451,26 +1451,68 @@ export class DJEngine {
   }
 
   /**
-   * Schedule a low-EQ move (knob values, dB = knob × 26, same mapping as
-   * setEqAuto) on the audio clock. durSec <= 0 steps the value at startAt.
+   * Schedule an EQ move on one band (knob values, dB = knob × 26, same
+   * mapping as setEqAuto) on the audio clock. durSec <= 0 steps the
+   * value at startAt. Mid Q is left alone — only the gain is automated.
    */
-  scheduleEqLowCurve(id: string, fromKnob: number, toKnob: number, startAt: number, durSec: number): void {
+  scheduleEqCurve(
+    id: string,
+    band: 'low' | 'mid' | 'high',
+    fromKnob: number,
+    toKnob: number,
+    startAt: number,
+    durSec: number,
+  ): void {
     const d = this.decks.get(id);
     if (!d) return;
+    const node = band === 'low' ? d.eqLow : band === 'mid' ? d.eqMid : d.eqHigh;
     const start = Math.max(startAt, this.ctx.currentTime);
     const fromDb = clamp(fromKnob, -1, 1) * 26;
     const toDb = clamp(toKnob, -1, 1) * 26;
     if (durSec <= 0) {
-      d.eqLow.gain.cancelScheduledValues(start);
-      d.eqLow.gain.setValueAtTime(toDb, start);
+      node.gain.cancelScheduledValues(start);
+      node.gain.setValueAtTime(toDb, start);
       return;
     }
     const pts = 64;
     const curve = new Float32Array(pts);
     for (let i = 0; i < pts; i++) curve[i] = fromDb + (toDb - fromDb) * (i / (pts - 1));
-    d.eqLow.gain.cancelScheduledValues(start);
-    d.eqLow.gain.setValueAtTime(fromDb, start);
-    d.eqLow.gain.setValueCurveAtTime(curve, start, durSec);
+    node.gain.cancelScheduledValues(start);
+    node.gain.setValueAtTime(fromDb, start);
+    node.gain.setValueCurveAtTime(curve, start, durSec);
+  }
+
+  /** Low-band shorthand for the original bass-swap call sites. */
+  scheduleEqLowCurve(id: string, fromKnob: number, toKnob: number, startAt: number, durSec: number): void {
+    this.scheduleEqCurve(id, 'low', fromKnob, toKnob, startAt, durSec);
+  }
+
+  /**
+   * Schedule a lowpass filter sweep (v in [-1, 0], same frequency
+   * mapping as setFilter: 0 = 20kHz open, -1 = 100Hz closed) on the
+   * audio clock. The type switch to lowpass happens immediately: at
+   * 20kHz it is inaudible on the outgoing side, and the incoming side
+   * is quiet under the crossfader until the blend opens it. The driver
+   * restores allpass with setFilter(id, 0) at the finish.
+   */
+  scheduleFilterCurve(id: string, fromV: number, toV: number, startAt: number, durSec: number): void {
+    const d = this.decks.get(id);
+    if (!d) return;
+    const start = Math.max(startAt, this.ctx.currentTime);
+    const freq = (v: number): number => 100 * Math.pow(200, 1 - Math.abs(clamp(v, -1, 0)));
+    d.filter.type = 'lowpass';
+    d.filter.Q.value = 2;
+    if (durSec <= 0) {
+      d.filter.frequency.cancelScheduledValues(start);
+      d.filter.frequency.setValueAtTime(freq(toV), start);
+      return;
+    }
+    const pts = 64;
+    const curve = new Float32Array(pts);
+    for (let i = 0; i < pts; i++) curve[i] = freq(fromV + (toV - fromV) * (i / (pts - 1)));
+    d.filter.frequency.cancelScheduledValues(start);
+    d.filter.frequency.setValueAtTime(freq(fromV), start);
+    d.filter.frequency.setValueCurveAtTime(curve, start, durSec);
   }
 
   /** Hold a low-EQ value from an audio time (step — used for the blend-start bass cut). */
@@ -1486,15 +1528,34 @@ export class DJEngine {
     this.decks.get(id)?.eqLow.gain.cancelScheduledValues(this.ctx.currentTime);
   }
 
+  /** Cancel outstanding scheduled automation on one EQ band of a deck. */
+  cancelEqBandAutomation(id: string, band: 'low' | 'mid' | 'high'): void {
+    const d = this.decks.get(id);
+    if (!d) return;
+    const node = band === 'low' ? d.eqLow : band === 'mid' ? d.eqMid : d.eqHigh;
+    node.gain.cancelScheduledValues(this.ctx.currentTime);
+  }
+
+  /** Cancel outstanding scheduled automation on all three EQ bands of a deck (crossfader untouched). */
+  cancelEqAllBands(id: string): void {
+    this.cancelEqBandAutomation(id, 'low');
+    this.cancelEqBandAutomation(id, 'mid');
+    this.cancelEqBandAutomation(id, 'high');
+  }
+
   /**
    * Cancel outstanding scheduled automation on a deck's crossfader (both
-   * sides — the crossfader is shared) and low EQ. Call before any
+   * sides — the crossfader is shared) and all EQ bands. Call before any
    * immediate move (takeover, blend finish) so a scheduled curve cannot
-   * override it afterwards.
+   * override it afterwards. Manual moves use setTargetAtTime, not
+   * scheduled values, so they are unaffected.
    */
   cancelDeckAutomation(id: string): void {
     const t = this.ctx.currentTime;
-    this.decks.get(id)?.eqLow.gain.cancelScheduledValues(t);
+    const d = this.decks.get(id);
+    d?.eqLow.gain.cancelScheduledValues(t);
+    d?.eqMid.gain.cancelScheduledValues(t);
+    d?.eqHigh.gain.cancelScheduledValues(t);
     this.decks.get('deckA')?.xfade.gain.cancelScheduledValues(t);
     this.decks.get('deckB')?.xfade.gain.cancelScheduledValues(t);
   }
