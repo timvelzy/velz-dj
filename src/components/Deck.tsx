@@ -45,6 +45,8 @@ interface DeckProps {
   onSetOneOne: () => void;
   onStop: () => void;
   onTempo: (v: number) => void;
+  /** Fader grab: disengage SYNC on a synced follower, keeping tempo (App tempoGrab). */
+  onTempoGrab: () => void;
   onSync: () => void;
   onMaster: () => void;
   onKeyLock: () => void;
@@ -196,7 +198,7 @@ export default function Deck(props: DeckProps) {
         onButton: (p) => { if (p) props.onCueDown(); else props.onCueUp(); },
       }),
       midi.registerControl(`${deckId}.sync`, { kind: 'button', onButton: (p) => { if (p) props.onSync(); } }),
-      midi.registerControl(`${deckId}.tempo`, { kind: 'fader', onAbsolute: (v) => props.onTempo(0.84 + v * 0.32) }),
+      midi.registerControl(`${deckId}.tempo`, { kind: 'fader', onAbsolute: (v) => { props.onTempoGrab(); props.onTempo(0.84 + v * 0.32); } }),
       midi.registerControl(`${deckId}.jog`, {
         kind: 'jog',
         onRelative: (d) => {
@@ -227,8 +229,29 @@ export default function Deck(props: DeckProps) {
   }, [deckId]);
 
   const grid: BeatGrid | null = state.track?.beatGrid ?? null;
-  const effTempo = state.syncActive && !isMaster ? undefined : state.tempo;
-  const bpmNow = grid && grid.bpm > 0 ? grid.bpm * (effTempo ?? 1) : 0;
+  // Traktor SYNC display: a synced follower's fader and BPM readout
+  // follow the MASTER, not the stale manual tempo. syncRatio is the
+  // exact tempo the engine targets (master BPM / track BPM); the
+  // engine's own syncBaseTempo converges to the same value through its
+  // PLL (local-BPM follow on walked grids can differ slightly — the
+  // LOCKED indicator, not this readout, is the phase authority).
+  // No master BPM yet (250ms poll) → fall back to the manual tempo.
+  const syncedFollower = state.syncActive && !isMaster;
+  const syncRatio = syncedFollower && props.masterBpm > 0 && grid && grid.bpm > 0
+    ? props.masterBpm / grid.bpm
+    : null;
+  /** Tempo the fader + % readout show: sync offset while synced, manual otherwise. */
+  const displayTempo = syncRatio ?? state.tempo;
+  const bpmNow = grid && grid.bpm > 0
+    ? (syncRatio !== null ? props.masterBpm : grid.bpm * state.tempo)
+    : 0;
+  /** Manual tempo input (fader, 0% button, keys): grabbing the fader of
+   *  a synced follower disengages SYNC first, keeping current tempo,
+   *  then the new value applies. Idempotent when not synced. */
+  const manualTempo = (v: number) => {
+    if (syncedFollower) props.onTempoGrab();
+    props.onTempo(v);
+  };
 
   const fmtDur = (d: number) => {
     const m = Math.floor(d / 60);
@@ -342,132 +365,159 @@ export default function Deck(props: DeckProps) {
         </button>
       )}
 
-      {/* Transport row */}
-      <div className="flex items-center gap-3">
-        <JogWheel
-          deckId={deckId}
-          paused={!isPlaying}
-          onBend={(a) => { if (a === 0) engine.clearNudge(deckId); else engine.setNudge(deckId, a); }}
-          onScratch={(d) => engine.seek(deckId, engine.position(deckId) + d)}
-        />
-        <div className="flex flex-col gap-1.5">
-          <div className="flex gap-1.5">
+      {/* Transport cluster — reference layout: vertical TEMPO fader
+          left with a live green % readout, NUDGE + above and NUDGE -
+          below, round play / CUE / phase buttons + SYNC in the middle
+          row, MASTER below. Every control drives audio live; nothing
+          here is decorative. The jog wheel stays to the right (scratch
+          when paused, bend while playing). */}
+      <div className="rounded-lg border border-zinc-800 bg-[#0a0f1e] p-3">
+        <div className="flex items-start gap-4">
+          {/* TEMPO column */}
+          <div className="flex shrink-0 flex-col items-center gap-1">
+            <span className="text-[11px] font-bold tracking-widest text-zinc-300">TEMPO</span>
+            <input
+              type="range"
+              min={0.84}
+              max={1.16}
+              step={0.0005}
+              value={clamp(displayTempo, 0.84, 1.16)}
+              onPointerDown={() => props.onTempoGrab()}
+              onChange={(e) => manualTempo(Number(e.target.value))}
+              className={`h-28 w-2 ${syncedFollower ? 'accent-emerald-500' : 'accent-sky-500'}`}
+              style={{ writingMode: 'vertical-lr', direction: 'rtl' } as React.CSSProperties}
+              title={
+                syncedFollower
+                  ? 'Tempo ±16% — synced to master (thumb pins at the limit if the offset exceeds ±16%; the % readout stays true). Grabbing the fader disengages SYNC and keeps the current tempo.'
+                  : 'Tempo ±16% — live playback rate'
+              }
+            />
+            <span className="font-mono text-sm text-emerald-400">
+              {((displayTempo - 1) * 100).toFixed(1)}%
+            </span>
+            {syncedFollower && (
+              <span className="rounded bg-emerald-900 px-1 text-[9px] font-bold text-emerald-300">SYNC</span>
+            )}
             <button
-              onClick={props.onPlayPause}
-              className={`h-11 w-16 rounded-lg font-bold ${isPlaying ? 'bg-emerald-600' : 'bg-zinc-700 hover:bg-zinc-600'} text-white`}
+              onClick={() => manualTempo(1)}
+              className="rounded bg-zinc-800 px-2 py-0.5 text-[10px] text-zinc-400 hover:bg-zinc-700"
             >
-              {isPlaying ? '❚❚' : '▶'}
-            </button>
-            <button
-              onPointerDown={cueDownOnButton}
-              onPointerUp={cueUpIfPressed}
-              onPointerLeave={cueUpIfPressed}
-              onPointerCancel={cueUpIfPressed}
-              onContextMenu={(e) => e.preventDefault()}
-              title="Hold to preview from cue point"
-              className="h-11 w-14 touch-none select-none rounded-lg bg-zinc-700 font-bold text-amber-300 hover:bg-zinc-600 active:bg-amber-600 active:text-black"
-            >
-              CUE
+              0%
             </button>
           </div>
-          <div className="flex gap-1.5">
+          {/* Button column */}
+          <div className="flex flex-1 flex-col items-stretch gap-2">
             <button
-              onClick={props.onSync}
-              className={`h-8 flex-1 rounded text-xs font-bold ${state.syncActive ? 'bg-sky-600 text-white' : 'bg-zinc-800 text-zinc-400 hover:bg-zinc-700'}`}
+              className="h-8 rounded border border-zinc-700 bg-zinc-800/90 text-xs font-bold text-zinc-200 hover:bg-zinc-700 active:bg-sky-700"
+              onPointerDown={() => props.onNudgeStart(1)}
+              onPointerUp={props.onNudgeEnd}
+              onPointerLeave={props.onNudgeEnd}
+              onPointerCancel={props.onNudgeEnd}
+              onContextMenu={(e) => e.preventDefault()}
             >
-              SYNC
+              ▲ NUDGE +
+            </button>
+            <div className="flex items-center justify-between gap-2">
+              <button
+                onClick={props.onPlayPause}
+                title={isPlaying ? 'Pause' : 'Play'}
+                className={`h-14 w-14 shrink-0 rounded-full text-lg font-bold text-white ${isPlaying ? 'bg-emerald-600' : 'bg-zinc-700 hover:bg-zinc-600'}`}
+              >
+                {isPlaying ? '❚❚' : '▶'}
+              </button>
+              <button
+                onPointerDown={cueDownOnButton}
+                onPointerUp={cueUpIfPressed}
+                onPointerLeave={cueUpIfPressed}
+                onPointerCancel={cueUpIfPressed}
+                onContextMenu={(e) => e.preventDefault()}
+                title="CUE: hold to preview from cue point (release returns to it)"
+                className="h-14 w-14 shrink-0 touch-none select-none rounded-full border-2 border-zinc-500 text-xl font-bold text-amber-300 hover:bg-zinc-800 active:bg-amber-600 active:text-black"
+              >
+                ▢
+              </button>
+              <button
+                onClick={props.onSetOneOne}
+                disabled={!state.buffer}
+                title="Phase align (SET 1.1): re-anchor the beat grid at the playhead — the beat nearest the playhead becomes bar 1 beat 1 (grid phase only, no re-analysis, saved with the track)"
+                className="h-14 w-14 shrink-0 rounded-full border border-sky-500 text-xl font-bold text-sky-400 hover:bg-sky-950 disabled:opacity-40"
+              >
+                ↻
+              </button>
+              <button
+                onClick={props.onSync}
+                title="SYNC: match the master tempo and hold phase on the master grid (grabbing the tempo fader disengages SYNC and keeps the current tempo)"
+                className={`h-11 flex-1 rounded border px-2 text-sm font-bold ${
+                  state.syncActive
+                    ? 'border-emerald-500 bg-emerald-600 text-white'
+                    : 'border-emerald-600/70 bg-transparent text-emerald-400 hover:bg-emerald-950'
+                }`}
+              >
+                SYNC
+              </button>
+            </div>
+            <button
+              className="h-8 rounded border border-zinc-700 bg-zinc-800/90 text-xs font-bold text-zinc-200 hover:bg-zinc-700 active:bg-sky-700"
+              onPointerDown={() => props.onNudgeStart(-1)}
+              onPointerUp={props.onNudgeEnd}
+              onPointerLeave={props.onNudgeEnd}
+              onPointerCancel={props.onNudgeEnd}
+              onContextMenu={(e) => e.preventDefault()}
+            >
+              ▼ NUDGE −
             </button>
             <button
               onClick={props.onMaster}
-              className={`h-8 flex-1 rounded text-xs font-bold ${isMaster ? 'bg-amber-500 text-black' : 'bg-zinc-800 text-zinc-400 hover:bg-zinc-700'}`}
-              title="Set as sync master"
+              title="MASTER: this deck is the tempo clock — synced followers chase it (only one master at a time)"
+              className={`h-8 rounded text-xs font-bold ${isMaster ? 'bg-amber-500 text-black' : 'bg-zinc-800 text-zinc-400 hover:bg-zinc-700'}`}
             >
               MASTER
             </button>
-            <button
-              onClick={props.onKeyLock}
-              className={`h-8 flex-1 rounded text-xs font-bold ${state.keyLock ? 'bg-violet-600 text-white' : 'bg-zinc-800 text-zinc-400 hover:bg-zinc-700'}`}
-              title="Key lock (pitch preserved when tempo changes)"
-            >
-              KEY
-            </button>
           </div>
-          {(lock || queued) && (
-            <div className="flex items-center gap-2 font-mono text-[10px]">
-              {lock && (
-                <span className={lock.locked ? 'text-emerald-400' : 'text-amber-400'}>
-                  {lock.locked ? '● SYNC LOCKED' : `○ SYNC ${lock.errMs >= 0 ? '+' : ''}${lock.errMs.toFixed(0)}ms`}
-                </span>
-              )}
-              {queued && <span className="text-amber-300">▸ QUEUED — drops on the bar</span>}
-            </div>
-          )}
-          <div className="flex gap-1.5">
-            {(['-1', '+1'] as const).map((d) => (
-              <button
-                key={d}
-                className="h-8 flex-1 rounded bg-zinc-800 text-xs font-bold text-zinc-300 hover:bg-zinc-700 active:bg-sky-700"
-                onPointerDown={() => props.onNudgeStart(d === '-1' ? -1 : 1)}
-                onPointerUp={props.onNudgeEnd}
-                onPointerLeave={props.onNudgeEnd}
-                onPointerCancel={props.onNudgeEnd}
-                onContextMenu={(e) => e.preventDefault()}
-              >
-                {d === '-1' ? '− NUDGE' : 'NUDGE +'}
-              </button>
-            ))}
-          </div>
-          <div className="flex gap-1.5">
-            <button
-              onClick={props.onSetCue}
-              disabled={!state.buffer}
-              title="Set cue point to current position (CUE returns here; unset = track start)"
-              className="h-8 flex-1 rounded bg-zinc-800 text-xs font-bold text-amber-300 hover:bg-zinc-700 disabled:opacity-40"
-            >
-              SET CUE
-            </button>
-            <button
-              onClick={props.onSetOneOne}
-              disabled={!state.buffer}
-              title="Set 1.1: re-anchor the beat grid here — the beat nearest the playhead becomes bar 1 beat 1 (grid phase only, no re-analysis, saved with the track)"
-              className="h-8 flex-1 rounded bg-zinc-800 text-xs font-bold text-sky-300 hover:bg-zinc-700 disabled:opacity-40"
-            >
-              SET 1.1
-            </button>
-            <button
-              onClick={props.onStop}
-              disabled={!state.buffer}
-              title="Stop and return to cue point (track start if none set)"
-              className="h-8 flex-1 rounded bg-zinc-800 text-xs font-bold text-zinc-300 hover:bg-zinc-700 disabled:opacity-40"
-            >
-              ■ STOP
-            </button>
-          </div>
-        </div>
-        {/* Tempo fader */}
-        <div className="flex flex-col items-center gap-1">
-          <span className="font-mono text-xs text-zinc-300">
-            {((state.tempo - 1) * 100).toFixed(1)}%
-          </span>
-          <input
-            type="range"
-            min={0.84}
-            max={1.16}
-            step={0.0005}
-            value={state.tempo}
-            disabled={state.syncActive && !isMaster}
-            onChange={(e) => props.onTempo(Number(e.target.value))}
-            className="h-28 w-2 accent-sky-500 disabled:opacity-40"
-            style={{ writingMode: 'vertical-lr', direction: 'rtl' } as React.CSSProperties}
-            title="Tempo ±16%"
+          <JogWheel
+            deckId={deckId}
+            paused={!isPlaying}
+            onBend={(a) => { if (a === 0) engine.clearNudge(deckId); else engine.setNudge(deckId, a); }}
+            onScratch={(d) => engine.seek(deckId, engine.position(deckId) + d)}
           />
-          <button
-            onClick={() => props.onTempo(1)}
-            className="rounded bg-zinc-800 px-2 py-0.5 text-[10px] text-zinc-400 hover:bg-zinc-700"
-          >
-            0%
-          </button>
         </div>
+        {(lock || queued) && (
+          <div className="mt-2 flex items-center gap-2 font-mono text-[10px]">
+            {lock && (
+              <span className={lock.locked ? 'text-emerald-400' : 'text-amber-400'}>
+                {lock.locked ? '● SYNC LOCKED' : `○ SYNC ${lock.errMs >= 0 ? '+' : ''}${lock.errMs.toFixed(0)}ms`}
+              </span>
+            )}
+            {queued && <span className="text-amber-300">▸ QUEUED — drops on the bar</span>}
+          </div>
+        )}
+      </div>
+
+      {/* SET CUE / STOP / KEY row (SET 1.1 now lives in the cluster as ↻) */}
+      <div className="flex gap-1.5">
+        <button
+          onClick={props.onSetCue}
+          disabled={!state.buffer}
+          title="Set cue point to current position (CUE returns here; unset = track start)"
+          className="h-8 flex-1 rounded bg-zinc-800 text-xs font-bold text-amber-300 hover:bg-zinc-700 disabled:opacity-40"
+        >
+          SET CUE
+        </button>
+        <button
+          onClick={props.onStop}
+          disabled={!state.buffer}
+          title="Stop and return to cue point (track start if none set)"
+          className="h-8 flex-1 rounded bg-zinc-800 text-xs font-bold text-zinc-300 hover:bg-zinc-700 disabled:opacity-40"
+        >
+          ■ STOP
+        </button>
+        <button
+          onClick={props.onKeyLock}
+          className={`h-8 flex-1 rounded text-xs font-bold ${state.keyLock ? 'bg-violet-600 text-white' : 'bg-zinc-800 text-zinc-400 hover:bg-zinc-700'}`}
+          title="Key lock (pitch preserved when tempo changes)"
+        >
+          KEY
+        </button>
       </div>
 
       {/* Hotcues + loop */}

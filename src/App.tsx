@@ -1042,7 +1042,31 @@ export default function App() {
       else setMasterDeck(deckId); // follow self = no-op until a master is picked
     }
     engine.setSync(deckId, on);
-    setDeckState(deckKey, { ...st, syncActive: on });
+    // Sync-off keeps the current effective tempo in audio (engine
+    // release path); mirror it into the fader so the fader never jumps
+    // back to the pre-sync manual value. Sync-on leaves the manual
+    // tempo alone (it is the return value if sync is later grabbed off).
+    const nextTempo = on ? st.tempo : engine.userTempoFor(deckId);
+    setDeckState(deckKey, { ...st, syncActive: on, tempo: nextTempo });
+  }, [deckState, setDeckState, masterDeck]);
+
+  /**
+   * Transport fader grab (Traktor workflow): touching the tempo fader
+   * of a synced follower disengages SYNC, and the deck keeps its
+   * current tempo — the engine release path already holds the effective
+   * tempo as the user tempo, so this only mirrors it into React state
+   * and clears the sync flag. Idempotent: a second grab (stale props
+   * during the same gesture) is a no-op in audio. Autopilot never calls
+   * this — it drives sync through the engine directly — so unattended
+   * blends are untouched.
+   */
+  const tempoGrab = useCallback((deckKey: 'A' | 'B') => {
+    const deckId = `deck${deckKey}` as 'deckA' | 'deckB';
+    const st = deckState(deckKey);
+    if (!st.syncActive || masterDeck === deckId) return;
+    engine.setSync(deckId, false);
+    setDeckState(deckKey, { ...st, syncActive: false, tempo: engine.userTempoFor(deckId) });
+    debugLog('transport', 'tempo grab disengaged sync', deckId, { tempo: engine.userTempoFor(deckId) });
   }, [deckState, setDeckState, masterDeck]);
 
   const toggleMaster = useCallback((deckKey: 'A' | 'B') => {
@@ -2882,6 +2906,7 @@ export default function App() {
         engine.setTempo(deckId, v);
         setDeckState(deckKey, { ...deckState(deckKey), tempo: v });
       },
+      onTempoGrab: () => tempoGrab(deckKey),
       onSync: () => toggleSync(deckKey),
       onMaster: () => toggleMaster(deckKey),
       onKeyLock: () => {

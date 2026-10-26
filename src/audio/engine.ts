@@ -915,6 +915,14 @@ export class DJEngine {
     this.masterDeckId = id;
   }
 
+  /** Current user-tempo value for a deck (audio truth after a sync
+   *  release, where setSync(false) keeps the effective tempo as the
+   *  user tempo). Read-only: the UI mirrors it into the fader so the
+   *  fader never jumps when sync disengages. */
+  userTempoFor(id: string): number {
+    return this.decks.get(id)?.userTempo ?? 1;
+  }
+
   /** Master BPM including the master deck's tempo. 0 if no master. */
   masterEffectiveBpm(): number {
     if (!this.masterDeckId) return 0;
