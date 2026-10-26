@@ -92,6 +92,37 @@ const fileExt = (f?: File): string | undefined => {
   return i > 0 ? f.name.slice(i + 1).toUpperCase() : undefined;
 };
 
+/**
+ * Round 11 — bounded await for deck-load I/O. The Round 9/10 stall was a
+ * blob read or decode that never settled: with a bare await, `analyzing`
+ * stays true forever, the autopilot machine can only wait and then fail
+ * the pick, and the retry loads the same wedged deck again. A stage that
+ * takes longer than DECODE_STAGE_TIMEOUT_MS is treated as failed, not
+ * waited on. Normal reads/decodes of 60MB WAVs take under 2s, so 20s is
+ * generous; one retry per stage keeps a load's worst case inside the
+ * machine's 120s preparing window.
+ */
+const DECODE_STAGE_TIMEOUT_MS = 20000;
+
+class DecodeStageTimeout extends Error {
+  constructor(public stage: 'arrayBuffer' | 'decode') {
+    super(`decode stage timed out: ${stage}`);
+    this.name = 'DecodeStageTimeout';
+  }
+}
+
+function withDecodeTimeout<T>(promise: Promise<T>, stage: 'arrayBuffer' | 'decode'): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new DecodeStageTimeout(stage)), DECODE_STAGE_TIMEOUT_MS);
+  });
+  // Race subscribes to both promises, so a late settlement of the loser
+  // never surfaces as an unhandled rejection.
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timer !== undefined) clearTimeout(timer);
+  });
+}
+
 export default function App() {
   const [ready, setReady] = useState(false);
   const [starting, setStarting] = useState(false);
@@ -218,6 +249,21 @@ export default function App() {
   }, []);
   const deckStateRef = useRef({ A: deckA, B: deckB });
   deckStateRef.current = { A: deckA, B: deckB };
+  // Round 11 — per-deck load generation: a load retired by a stage
+  // timeout (or superseded by a newer load) must never apply its buffer
+  // or wipe a newer load's state when it settles late.
+  const loadGenRef = useRef({ A: 0, B: 0 });
+  // Round 11 — shared decode-only context for the retry path: if a decode
+  // wedges on the live playback context, retrying on an isolated offline
+  // context tests whether the stall is live-context-bound, and rescues
+  // the load when it is. Lazily created; never audible.
+  const decodeCtxRef = useRef<OfflineAudioContext | null>(null);
+  const getDecodeCtx = useCallback((): OfflineAudioContext => {
+    if (!decodeCtxRef.current) {
+      decodeCtxRef.current = new OfflineAudioContext({ numberOfChannels: 2, length: 1, sampleRate: 44100 });
+    }
+    return decodeCtxRef.current;
+  }, []);
 
   // ─── Waveform peaks (Phase 4): attach computed/cached peaks to a track
   // wherever it lives (library + either deck), computing at most once.
@@ -461,11 +507,46 @@ export default function App() {
     d.posBaseTime = engine.ctx.currentTime;
     d.loopStart = null;
     d.loopEnd = null;
+    // Round 11: generation-guard the whole load (see loadGenRef).
+    const gen = ++loadGenRef.current[deckKey];
+    const stillCurrent = () => loadGenRef.current[deckKey] === gen;
     setDeckState(deckKey, { ...deckInit(), analyzing: true, analysisProgress: 0 });
 
     try {
-      const raw = await file.arrayBuffer();
-      const buffer = await engine.ctx.decodeAudioData(raw);
+      // Round 11: bounded blob read — one retry on timeout, then loud failure.
+      let raw: ArrayBuffer;
+      try {
+        raw = await withDecodeTimeout(file.arrayBuffer(), 'arrayBuffer');
+      } catch (e) {
+        if (e instanceof DecodeStageTimeout) {
+          debugLog('transport', 'load blob read timed out, retrying', deckId, { track: file.name });
+          raw = await withDecodeTimeout(file.arrayBuffer(), 'arrayBuffer');
+        } else {
+          throw e;
+        }
+      }
+      // Round 11: bounded decode — on a live-context timeout, retry once
+      // on the isolated offline context (copying the buffer so the two
+      // decodes never share it). A retry success proves the stall was
+      // live-context-bound and rescues the load; a second timeout fails
+      // loudly below instead of hanging forever.
+      let buffer: AudioBuffer;
+      try {
+        buffer = await withDecodeTimeout(engine.ctx.decodeAudioData(raw), 'decode');
+      } catch (e) {
+        if (e instanceof DecodeStageTimeout) {
+          debugLog('transport', 'load decode timed out, retrying on offline context', deckId, {
+            track: file.name,
+          });
+          buffer = await withDecodeTimeout(getDecodeCtx().decodeAudioData(raw.slice(0)), 'decode');
+          debugLog('transport', 'load decode retry succeeded on offline context', deckId, {
+            track: file.name,
+          });
+        } else {
+          throw e;
+        }
+      }
+      if (!stillCurrent()) return;
       const traktorTrack = traktor ? findTraktorTrack(traktor, file) : undefined;
       const key = fileKeyFor(file);
 
@@ -490,9 +571,12 @@ export default function App() {
           if (hc.slot < 4) hotcues[hc.slot] = hc.position;
         }
       } else {
-        const { grid, spectralData } = await analyzeTrack(buffer, (p) =>
-          setDeckState(deckKey, { ...deckInit(), analyzing: true, analysisProgress: p * 0.85 }),
-        );
+        const { grid, spectralData } = await analyzeTrack(buffer, (p) => {
+          // Round 11: a stale load's progress must never wipe a newer load's state.
+          if (stillCurrent()) {
+            setDeckState(deckKey, { ...deckInit(), analyzing: true, analysisProgress: p * 0.85 });
+          }
+        });
         const keyRes = detectKey(buffer);
         track = {
           id: `t${++trackSeq}`,
@@ -540,6 +624,9 @@ export default function App() {
         }
         track.manualHotcues = manual;
       }
+      // Round 11: awaits above (record lookup) may have let a newer load
+      // start; never wipe its state with this load's success.
+      if (!stillCurrent()) return;
       setDeckState(deckKey, { ...deckInit(), track, buffer, hotcues, hotcueAuto });
       recorderRef.current?.noteTrack({
         deck: deckKey, title: track.title, artist: track.artist, bpm: track.bpm, key: track.key ?? '',
@@ -554,11 +641,19 @@ export default function App() {
         noteLibrarySaveError(file.name, e);
       }
     } catch (e) {
+      // Round 11: a stale load's failure must never wipe a newer load's
+      // state (and its alert would freeze the machine's ticks).
+      if (!stillCurrent()) return;
       console.error('Load failed', e);
       setDeckState(deckKey, deckInit());
+      if (e instanceof DecodeStageTimeout) {
+        debugLog('transport', 'load decode stage timed out', deckId, {
+          track: file.name, stage: e.stage,
+        });
+      }
       alert(`Could not load ${file.name}: ${e instanceof Error ? e.message : e}`);
     }
-  }, [setDeckState, traktor, ensurePeaks, noteLibrarySaveError]);
+  }, [setDeckState, traktor, ensurePeaks, noteLibrarySaveError, getDecodeCtx]);
 
   // Restored library tracks load WITHOUT re-analysis: the stored beat grid,
   // key, and peaks are already the track's analysis (a Traktor-matched
@@ -580,10 +675,45 @@ export default function App() {
     d.posBaseTime = engine.ctx.currentTime;
     d.loopStart = null;
     d.loopEnd = null;
+    // Round 11: generation-guard the whole load (see loadGenRef).
+    const gen = ++loadGenRef.current[deckKey];
+    const stillCurrent = () => loadGenRef.current[deckKey] === gen;
     setDeckState(deckKey, { ...deckInit(), analyzing: true, analysisProgress: 0 });
     try {
-      const raw = await track.file.arrayBuffer();
-      const buffer = await engine.ctx.decodeAudioData(raw);
+      // Round 11: bounded blob read — one retry on timeout, then loud failure.
+      let raw: ArrayBuffer;
+      try {
+        raw = await withDecodeTimeout(track.file.arrayBuffer(), 'arrayBuffer');
+      } catch (e) {
+        if (e instanceof DecodeStageTimeout) {
+          debugLog('transport', 'load blob read timed out, retrying', deckId, { track: track.title });
+          raw = await withDecodeTimeout(track.file.arrayBuffer(), 'arrayBuffer');
+        } else {
+          throw e;
+        }
+      }
+      // Round 11: bounded decode — on a live-context timeout, retry once
+      // on the isolated offline context (copying the buffer so the two
+      // decodes never share it). A retry success proves the stall was
+      // live-context-bound and rescues the load; a second timeout fails
+      // loudly below instead of hanging forever.
+      let buffer: AudioBuffer;
+      try {
+        buffer = await withDecodeTimeout(engine.ctx.decodeAudioData(raw), 'decode');
+      } catch (e) {
+        if (e instanceof DecodeStageTimeout) {
+          debugLog('transport', 'load decode timed out, retrying on offline context', deckId, {
+            track: track.title,
+          });
+          buffer = await withDecodeTimeout(getDecodeCtx().decodeAudioData(raw.slice(0)), 'decode');
+          debugLog('transport', 'load decode retry succeeded on offline context', deckId, {
+            track: track.title,
+          });
+        } else {
+          throw e;
+        }
+      }
+      if (!stillCurrent()) return;
       d.buffer = buffer;
       d.grid = track.beatGrid;
       d.userTempo = 1;
@@ -609,11 +739,19 @@ export default function App() {
       // them, this falls back to the peaks cache / computation.
       ensurePeaks(track, buffer);
     } catch (e) {
+      // Round 11: a stale load's failure must never wipe a newer load's
+      // state (and its alert would freeze the machine's ticks).
+      if (!stillCurrent()) return;
       console.error('Restored load failed', e);
       setDeckState(deckKey, deckInit());
+      if (e instanceof DecodeStageTimeout) {
+        debugLog('transport', 'load decode stage timed out', deckId, {
+          track: track.title, stage: e.stage,
+        });
+      }
       alert(`Could not load ${track.title}: ${e instanceof Error ? e.message : e}`);
     }
-  }, [setDeckState, ensurePeaks]);
+  }, [setDeckState, ensurePeaks, getDecodeCtx]);
 
   const loadLibraryTrack = useCallback((trackId: string, deckKey: 'A' | 'B') => {
     const t = tracks.find((x) => x.id === trackId);
