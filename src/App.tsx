@@ -111,16 +111,67 @@ class DecodeStageTimeout extends Error {
   }
 }
 
-function withDecodeTimeout<T>(promise: Promise<T>, stage: 'arrayBuffer' | 'decode'): Promise<T> {
+function withDecodeTimeout<T>(
+  promise: Promise<T>,
+  stage: 'arrayBuffer' | 'decode',
+  ms: number = DECODE_STAGE_TIMEOUT_MS,
+): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new DecodeStageTimeout(stage)), DECODE_STAGE_TIMEOUT_MS);
+    timer = setTimeout(() => reject(new DecodeStageTimeout(stage)), ms);
   });
   // Race subscribes to both promises, so a late settlement of the loser
   // never surfaces as an unhandled rejection.
   return Promise.race([promise, timeout]).finally(() => {
     if (timer !== undefined) clearTimeout(timer);
   });
+}
+
+/**
+ * Round 12 — generic bounded await for non-decode async work (an
+ * IndexedDB refetch). A plain Error, not a DecodeStageTimeout: callers
+ * catch it per strategy and move on to the next read method.
+ */
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error('timed out')), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timer !== undefined) clearTimeout(timer);
+  });
+}
+
+/**
+ * Round 12 — read a blob in slices and concatenate. Round 11 proved the
+ * wedge sits in a single whole-blob arrayBuffer() on IndexedDB-restored
+ * Files (initial read AND retry both timed out at 20s, while decode was
+ * never reached). If a whole-blob read wedges but small reads work, this
+ * bypasses it by method rather than by object. 16MB slices keep the
+ * worst case (4 slices for a 63MB WAV at 10s each) inside the autopilot
+ * machine's 120s preparing window. Transient peak is ~2x the file size
+ * (slices + concatenated copy) before decode; acceptable against a load
+ * that otherwise never completes.
+ */
+const BLOB_CHUNK_SIZE = 16 * 1024 * 1024;
+const BLOB_CHUNK_TIMEOUT_MS = 10000;
+
+async function readBlobChunked(blob: Blob): Promise<ArrayBuffer> {
+  const chunks: ArrayBuffer[] = [];
+  let total = 0;
+  for (let off = 0; off < blob.size; off += BLOB_CHUNK_SIZE) {
+    const part = blob.slice(off, Math.min(off + BLOB_CHUNK_SIZE, blob.size));
+    const buf = await withDecodeTimeout(part.arrayBuffer(), 'arrayBuffer', BLOB_CHUNK_TIMEOUT_MS);
+    chunks.push(buf);
+    total += buf.byteLength;
+  }
+  const out = new Uint8Array(total);
+  let pos = 0;
+  for (const chunk of chunks) {
+    out.set(new Uint8Array(chunk), pos);
+    pos += chunk.byteLength;
+  }
+  return out.buffer;
 }
 
 export default function App() {
@@ -680,18 +731,72 @@ export default function App() {
     const stillCurrent = () => loadGenRef.current[deckKey] === gen;
     setDeckState(deckKey, { ...deckInit(), analyzing: true, analysisProgress: 0 });
     try {
-      // Round 11: bounded blob read — one retry on timeout, then loud failure.
-      let raw: ArrayBuffer;
+      // Round 12: robust restored-blob read. Round 11 proved a single
+      // whole-blob arrayBuffer() on a restored File can wedge forever
+      // (initial read AND same-object retry both timed out at 20s, on
+      // 2nd-and-later loads of a played deck, while decode was never
+      // reached). No code path explains the wedge, so instead of
+      // retrying the identical read, escalate through bypasses, each
+      // logged distinctly so the next retest log shows which one worked:
+      // (1) direct read of the restored File; (2) a freshly fetched
+      // record from IndexedDB (new Blob object, new transaction) read
+      // directly; (3) chunked slice reads on the freshest File object
+      // available. Worst case stays inside the machine's 120s preparing
+      // window (20 + 20 + 20 + 4x10s for a 63MB WAV). Only if all three
+      // fail does the load fail loudly below, as before.
+      let raw: ArrayBuffer | null = null;
+      let readFile: File = track.file;
       try {
         raw = await withDecodeTimeout(track.file.arrayBuffer(), 'arrayBuffer');
       } catch (e) {
-        if (e instanceof DecodeStageTimeout) {
-          debugLog('transport', 'load blob read timed out, retrying', deckId, { track: track.title });
-          raw = await withDecodeTimeout(track.file.arrayBuffer(), 'arrayBuffer');
-        } else {
-          throw e;
+        if (!(e instanceof DecodeStageTimeout)) throw e;
+        debugLog('transport', 'load blob read timed out, trying library refetch', deckId, {
+          track: track.title,
+        });
+      }
+      if (!raw && track.fileKey) {
+        try {
+          const fresh = await withTimeout(getLibraryRecord(track.fileKey), DECODE_STAGE_TIMEOUT_MS);
+          if (fresh?.file) {
+            readFile = fresh.file;
+            debugLog('transport', 'load restored blob refetched from library', deckId, {
+              track: track.title,
+            });
+            try {
+              raw = await withDecodeTimeout(readFile.arrayBuffer(), 'arrayBuffer');
+              debugLog('transport', 'load restored blob refetch read succeeded', deckId, {
+                track: track.title,
+              });
+            } catch (e) {
+              if (!(e instanceof DecodeStageTimeout)) throw e;
+              debugLog('transport', 'load restored blob refetch read timed out, trying chunked read', deckId, {
+                track: track.title,
+              });
+            }
+          } else {
+            debugLog('transport', 'load library refetch empty, trying chunked read', deckId, {
+              track: track.title,
+            });
+          }
+        } catch {
+          // Any refetch failure (timeout, missing record, IDB error)
+          // just escalates to the chunked read; the load only fails
+          // loudly if every strategy fails.
+          debugLog('transport', 'load library refetch failed, trying chunked read', deckId, {
+            track: track.title,
+          });
         }
       }
+      if (!raw) {
+        try {
+          raw = await readBlobChunked(readFile);
+          debugLog('transport', 'load chunked read succeeded', deckId, { track: track.title });
+        } catch (e) {
+          if (!(e instanceof DecodeStageTimeout)) throw e;
+          debugLog('transport', 'load chunked read failed', deckId, { track: track.title });
+        }
+      }
+      if (!raw) throw new DecodeStageTimeout('arrayBuffer');
       // Round 11: bounded decode — on a live-context timeout, retry once
       // on the isolated offline context (copying the buffer so the two
       // decodes never share it). A retry success proves the stall was
