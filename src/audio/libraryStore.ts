@@ -47,6 +47,9 @@ export interface StoredLibraryTrack {
       slot survives reloads and fresh-file re-adds. */
   manualHotcues?: (number | null)[];
   savedAt: string; // ISO
+  /** Seed group for bundled tracks ('velz' | 'loops'), when the record
+      came from the seed mechanism. Absent for user uploads. */
+  seedGroup?: 'velz' | 'loops';
   /** The audio itself. Stored as the picked File; read back as a Blob. */
   file: Blob;
 }
@@ -120,6 +123,7 @@ export function trackToRecord(track: TrackInfo): StoredLibraryTrack | null {
     peaks: track.peaks,
     manualHotcues: track.manualHotcues,
     savedAt: new Date().toISOString(),
+    seedGroup: track.seedGroup,
     file: track.file,
   };
 }
@@ -162,6 +166,7 @@ export function recordToTrack(record: StoredLibraryTrack): TrackInfo | null {
     file,
     fileKey: record.fileKey,
     restored: true,
+    seedGroup: record.seedGroup,
   };
 }
 

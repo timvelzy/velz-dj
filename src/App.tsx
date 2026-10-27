@@ -56,11 +56,15 @@ import {
   saveLibraryRecord,
 } from './audio/libraryStore';
 import {
+  LOOP_SEEDS,
+  LOOP_SEED_MANIFEST_VERSION,
   SEED_MANIFEST_VERSION,
   SEED_TRACKS,
+  getLoopSeededVersion,
   getSeededVersion,
   runSeeding,
   seedPlaceholder,
+  setLoopSeededVersion,
   setSeededVersion,
 } from './audio/seedTracks';
 import {
@@ -293,29 +297,37 @@ export default function App() {
     loadLibraryRecords()
       .then((restored) => {
         if (cancelled) return;
-        // Bundled Velz seeds: placeholder rows land with the restored
+        // Bundled seeds: placeholder rows land with the restored
         // library immediately; each seed's fetch + analysis runs in the
         // background and swaps its row for the saved record when done.
-        // Provisioning is version-gated (see seedTracks.ts): a seed the
-        // user deleted stays deleted until the manifest version bumps.
+        // Two independent groups, each version-gated (see
+        // seedTracks.ts): 'velz' releases and 'loops' example loops. A
+        // seed the user deleted stays deleted until its own group's
+        // manifest version bumps.
         const existing = new Set(restored.map((t) => t.fileKey).filter((k): k is string => Boolean(k)));
-        const pending =
+        const pendingVelz =
           getSeededVersion() === SEED_MANIFEST_VERSION
             ? []
             : SEED_TRACKS.filter((def) => !existing.has(def.fileKey));
+        const pendingLoops =
+          getLoopSeededVersion() === LOOP_SEED_MANIFEST_VERSION
+            ? []
+            : LOOP_SEEDS.filter((def) => !existing.has(def.fileKey));
+        const pending = [...pendingVelz, ...pendingLoops];
         const merged = [...restored, ...pending.map(seedPlaceholder)];
         merged.sort((a, b) => a.title.localeCompare(b.title));
         setTracks(merged);
         if (!pending.length) {
           if (getSeededVersion() !== SEED_MANIFEST_VERSION) setSeededVersion(SEED_MANIFEST_VERSION);
+          if (getLoopSeededVersion() !== LOOP_SEED_MANIFEST_VERSION) setLoopSeededVersion(LOOP_SEED_MANIFEST_VERSION);
           return;
         }
-        void runSeeding(existing, {
-          onProgress: (fileKey, p) => {
+        const callbacks = {
+          onProgress: (fileKey: string, p: number) => {
             if (cancelled) return;
             setTracks((ts) => ts.map((t) => (t.fileKey === fileKey ? { ...t, analysisProgress: p } : t)));
           },
-          onReady: (track) => {
+          onReady: (track: TrackInfo) => {
             if (cancelled) return;
             // A placeholder removed mid-seed stays removed.
             if (!tracksRef.current.some((t) => t.fileKey === track.fileKey)) return;
@@ -325,14 +337,24 @@ export default function App() {
               ),
             );
           },
-          onError: (fileKey, fileName, error) => {
+          onError: (fileKey: string, fileName: string, error: unknown) => {
             if (cancelled) return;
             setTracks((ts) => ts.filter((t) => t.fileKey !== fileKey));
             noteLibrarySaveError(fileName, error);
           },
-        }).then((ok) => {
-          if (ok && !cancelled) setSeededVersion(SEED_MANIFEST_VERSION);
-        });
+        };
+        // Sequential passes (one heavy decode+analysis at a time), each
+        // recording only its own group's version on success.
+        void (async () => {
+          if (pendingVelz.length) {
+            const ok = await runSeeding(existing, callbacks, SEED_TRACKS);
+            if (ok && !cancelled) setSeededVersion(SEED_MANIFEST_VERSION);
+          }
+          if (pendingLoops.length) {
+            const ok = await runSeeding(existing, callbacks, LOOP_SEEDS);
+            if (ok && !cancelled) setLoopSeededVersion(LOOP_SEED_MANIFEST_VERSION);
+          }
+        })();
       })
       .catch((e) => console.warn('Saved library restore failed', e));
     return () => {

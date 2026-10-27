@@ -21,19 +21,23 @@
  * provisioning is gated on a localStorage marker. The service worker is
  * cache-first for same-origin GETs and matches with ignoreSearch, so a
  * query string would NOT bust it — a changed seed must ship under a new
- * versioned filename AND a bumped SEED_MANIFEST_VERSION, or existing
- * installs will keep fetching the stale cached bytes. The `group`
- * field exists so a future set (e.g. clearly-labeled example beats)
- * can follow this same mechanism under its own group without touching
- * the Velz release entries.
+ * versioned filename AND a bumped manifest version, or existing
+ * installs will keep fetching the stale cached bytes.
+ *
+ * Two independent seed groups share this mechanism, each with its own
+ * manifest version and marker, so bumping one never re-seeds the other:
+ * 'velz' (Tim's own releases, SEED_MANIFEST_VERSION) and 'loops'
+ * (clearly-labeled Gemini-generated example loops from the Midnight
+ * Concrete file, LOOP_SEED_MANIFEST_VERSION). The `group` field on each
+ * def is what the library badge reads.
  *
  * Seed policy (deliberate, version-gated): seeds are ordinary library
  * records once saved — deletable per track, cleared by "Clear saved"
  * like uploads. A deleted seed does NOT come back on its own: it only
- * returns when SEED_MANIFEST_VERSION bumps. Clearing the library does
- * not restore seeds either, for the same reason — the marker, not the
- * record set, decides provisioning, so provisioning never surprises a
- * visitor who deliberately emptied their library.
+ * returns when its group's manifest version bumps. Clearing the library
+ * does not restore seeds either, for the same reason — the marker, not
+ * the record set, decides provisioning, so provisioning never surprises
+ * a visitor who deliberately emptied their library.
  */
 
 import { analyzeTrack } from './analysis';
@@ -44,7 +48,45 @@ import type { BeatGrid, TrackInfo } from '../types';
 /** Bump when the seed set or a seed file changes. Resets provisioning. */
 export const SEED_MANIFEST_VERSION = 1;
 
+/** Bump when the loop seed set or a loop file changes. Independent of
+    SEED_MANIFEST_VERSION: bumping one never re-seeds the other. */
+export const LOOP_SEED_MANIFEST_VERSION = 1;
+
 const SEED_VERSION_KEY = 'velz-dj:seedVersion';
+const LOOP_SEED_VERSION_KEY = 'velz-dj:loopSeedVersion';
+
+function getVersion(key: string): number {
+  try {
+    const raw = window.localStorage.getItem(key);
+    return raw == null ? 0 : Number(raw) || 0;
+  } catch {
+    return 0;
+  }
+}
+
+function setVersion(key: string, version: number): void {
+  try {
+    window.localStorage.setItem(key, String(version));
+  } catch {
+    /* private mode etc. — seeding just retries next visit */
+  }
+}
+
+export function getSeededVersion(): number {
+  return getVersion(SEED_VERSION_KEY);
+}
+
+export function setSeededVersion(version: number): void {
+  setVersion(SEED_VERSION_KEY, version);
+}
+
+export function getLoopSeededVersion(): number {
+  return getVersion(LOOP_SEED_VERSION_KEY);
+}
+
+export function setLoopSeededVersion(version: number): void {
+  setVersion(LOOP_SEED_VERSION_KEY, version);
+}
 
 export interface SeedTrackDef {
   /** Namespaced library identity — never collides with an upload's
@@ -60,14 +102,17 @@ export interface SeedTrackDef {
   /** ffprobe-verified duration in seconds — placeholder display only;
       the saved record carries the decoded buffer's duration. */
   duration: number;
-  /** Verified from dj-games tracks.ts. Absent = unknown: analysis
-      detects it, and nothing is hardcoded (Battery in the Red). */
+  /** Display-only BPM for placeholder rows. Velz seeds: verified from
+      dj-games tracks.ts. Loop seeds: measured 123.0 grid (see the split
+      README). Absent = unknown: analysis detects it, and nothing is
+      hardcoded (Battery in the Red). */
   bpm?: number;
   /** Verified from dj-games tracks.ts. Absent = analysis detects it. */
   key?: string;
-  /** 'velz' = Tim's own releases. A future example-beats set would use
-      its own group and be labeled as examples in the UI. */
-  group: 'velz';
+  /** 'velz' = Tim's own releases. 'loops' = Gemini-generated example
+      loops (Midnight Concrete file) — labeled as examples in the UI,
+      never as Velz releases. */
+  group: 'velz' | 'loops';
 }
 
 const base = import.meta.env.BASE_URL;
@@ -106,22 +151,98 @@ export const SEED_TRACKS: SeedTrackDef[] = [
   },
 ];
 
-export function getSeededVersion(): number {
-  try {
-    const raw = window.localStorage.getItem(SEED_VERSION_KEY);
-    return raw == null ? 0 : Number(raw) || 0;
-  } catch {
-    return 0;
-  }
-}
-
-export function setSeededVersion(version: number): void {
-  try {
-    window.localStorage.setItem(SEED_VERSION_KEY, String(version));
-  } catch {
-    /* private mode etc. — seeding just retries next visit */
-  }
-}
+/**
+ * Example loops from the Gemini-generated "Midnight Concrete" file,
+ * split into 8 loops (see ~/workspace/mixer-loops/midnight-concrete/).
+ * These are NOT Velz releases: the artist credit says so, the library
+ * shows an EXAMPLE LOOP badge, and the same 8 files seed the sampler
+ * pads (loop mode armed). Durations are the exact split-file durations
+ * (ffprobe-verified); BPM 123.0 is the measured grid for all 8 segments
+ * (onset-autocorrelation, high confidence — see the split README),
+ * placeholder display only; saved records carry the analyzed grid.
+ */
+export const LOOP_SEEDS: SeedTrackDef[] = [
+  {
+    fileKey: 'seed|mc-01-tech-house-groove-v1',
+    fileName: 'mc-01-tech-house-groove-v1.mp3',
+    title: 'Midnight Concrete: Tech House Groove',
+    artist: 'Example loop (Gemini)',
+    url: `${base}tracks/mc-01-tech-house-groove-v1.mp3`,
+    duration: 15.7,
+    bpm: 123.0,
+    group: 'loops',
+  },
+  {
+    fileKey: 'seed|mc-02-underground-techno-v1',
+    fileName: 'mc-02-underground-techno-v1.mp3',
+    title: 'Midnight Concrete: Underground Techno',
+    artist: 'Example loop (Gemini)',
+    url: `${base}tracks/mc-02-underground-techno-v1.mp3`,
+    duration: 15.64,
+    bpm: 123.0,
+    group: 'loops',
+  },
+  {
+    fileKey: 'seed|mc-03-dnb-halftime-v1',
+    fileName: 'mc-03-dnb-halftime-v1.mp3',
+    title: 'Midnight Concrete: DnB / Halftime',
+    artist: 'Example loop (Gemini)',
+    url: `${base}tracks/mc-03-dnb-halftime-v1.mp3`,
+    duration: 15.74,
+    bpm: 123.0,
+    group: 'loops',
+  },
+  {
+    fileKey: 'seed|mc-04-energetic-breakbeat-v1',
+    fileName: 'mc-04-energetic-breakbeat-v1.mp3',
+    title: 'Midnight Concrete: Energetic Breakbeat',
+    artist: 'Example loop (Gemini)',
+    url: `${base}tracks/mc-04-energetic-breakbeat-v1.mp3`,
+    duration: 13.92,
+    bpm: 123.0,
+    group: 'loops',
+  },
+  {
+    fileKey: 'seed|mc-05-deep-house-v1',
+    fileName: 'mc-05-deep-house-v1.mp3',
+    title: 'Midnight Concrete: Deep House',
+    artist: 'Example loop (Gemini)',
+    url: `${base}tracks/mc-05-deep-house-v1.mp3`,
+    duration: 15.78,
+    bpm: 123.0,
+    group: 'loops',
+  },
+  {
+    fileKey: 'seed|mc-06-peak-time-techno-v1',
+    fileName: 'mc-06-peak-time-techno-v1.mp3',
+    title: 'Midnight Concrete: Peak-Time Techno',
+    artist: 'Example loop (Gemini)',
+    url: `${base}tracks/mc-06-peak-time-techno-v1.mp3`,
+    duration: 15.72,
+    bpm: 123.0,
+    group: 'loops',
+  },
+  {
+    fileKey: 'seed|mc-07-rolling-tech-house-v1',
+    fileName: 'mc-07-rolling-tech-house-v1.mp3',
+    title: 'Midnight Concrete: Rolling Tech House',
+    artist: 'Example loop (Gemini)',
+    url: `${base}tracks/mc-07-rolling-tech-house-v1.mp3`,
+    duration: 15.5,
+    bpm: 123.0,
+    group: 'loops',
+  },
+  {
+    fileKey: 'seed|mc-08-gritty-breakbeat-v1',
+    fileName: 'mc-08-gritty-breakbeat-v1.mp3',
+    title: 'Midnight Concrete: Gritty Breakbeat',
+    artist: 'Example loop (Gemini)',
+    url: `${base}tracks/mc-08-gritty-breakbeat-v1.mp3`,
+    duration: 31.22,
+    bpm: 123.0,
+    group: 'loops',
+  },
+];
 
 /**
  * Metadata-only placeholder shown in the library while a seed is being
@@ -154,6 +275,7 @@ export function seedPlaceholder(def: SeedTrackDef): TrackInfo {
     restored: true,
     analyzing: true,
     analysisProgress: 0,
+    seedGroup: def.group,
   };
 }
 
@@ -164,13 +286,13 @@ export interface SeedCallbacks {
 }
 
 /**
- * Fetch, decode, analyze and save every seed whose fileKey is not in
- * `existingFileKeys`, one at a time (sequential: a full decode plus
- * several offline renders per track is the heaviest work this app does,
- * and parallel runs spike memory on small machines). Returns true when
- * every seed is present or was saved — the caller then records the
- * manifest version. Any failure returns false so provisioning retries
- * next visit; one bad seed never aborts the rest.
+ * Fetch, decode, analyze and save every seed in `defs` whose fileKey is
+ * not in `existingFileKeys`, one at a time (sequential: a full decode
+ * plus several offline renders per track is the heaviest work this app
+ * does, and parallel runs spike memory on small machines). Returns true
+ * when every seed is present or was saved — the caller then records
+ * the group's manifest version. Any failure returns false so
+ * provisioning retries next visit; one bad seed never aborts the rest.
  *
  * Decoding uses an isolated OfflineAudioContext, never the live
  * playback context: no AudioContext is started, nothing is audible,
@@ -179,10 +301,11 @@ export interface SeedCallbacks {
 export async function runSeeding(
   existingFileKeys: Set<string>,
   callbacks: SeedCallbacks,
+  defs: SeedTrackDef[] = SEED_TRACKS,
 ): Promise<boolean> {
   const decodeCtx = new OfflineAudioContext({ numberOfChannels: 2, length: 1, sampleRate: 44100 });
   let allOk = true;
-  for (const def of SEED_TRACKS) {
+  for (const def of defs) {
     if (existingFileKeys.has(def.fileKey)) continue;
     try {
       const res = await fetch(def.url);
@@ -206,6 +329,7 @@ export async function runSeeding(
         file,
         fileKey: def.fileKey,
         restored: true,
+        seedGroup: def.group,
       };
       await saveLibraryRecord(track);
       callbacks.onReady(track);

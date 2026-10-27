@@ -104,4 +104,9 @@ export interface TrackInfo {
   analyzing?: boolean;
   /** 0..1 analysis progress (meaningful while analyzing) */
   analysisProgress?: number;
+  /** Seed group for bundled tracks: 'velz' = Tim's own releases,
+      'loops' = clearly-labeled example loops (Gemini-generated Midnight
+      Concrete set). Absent for user uploads. Persisted with the library
+      record so the library badge survives reloads. */
+  seedGroup?: 'velz' | 'loops';
 }

@@ -105,7 +105,19 @@ export default function Library({ tracks, masterKey, onAddFiles, onLoadToDeck, o
                   className={`cursor-grab border-t border-zinc-900 ${selectedTrackId === t.id ? 'bg-cyan-950/60' : 'hover:bg-zinc-900'}`}
                   title="Drag onto a deck — click to select for hardware load"
                 >
-                  <td className="px-2 py-1.5 font-medium text-zinc-200">{t.title}</td>
+                  <td className="px-2 py-1.5 font-medium text-zinc-200">
+                    {t.title}
+                    {t.seedGroup === 'velz' && (
+                      <span className="ml-2 rounded bg-emerald-900 px-1 py-px text-[9px] font-bold text-emerald-300" title="Bundled with the mixer: one of Tim's own Velz releases">
+                        VELZ PICK
+                      </span>
+                    )}
+                    {t.seedGroup === 'loops' && (
+                      <span className="ml-2 rounded bg-amber-900 px-1 py-px text-[9px] font-bold text-amber-300" title="Bundled example loop (Gemini-generated Midnight Concrete) — not a Velz release">
+                        EXAMPLE LOOP
+                      </span>
+                    )}
+                  </td>
                   <td className="px-2 py-1.5 text-zinc-500">{t.artist || '—'}</td>
                   <td className="px-2 py-1.5 font-mono text-zinc-300">
                     {t.analyzing ? (

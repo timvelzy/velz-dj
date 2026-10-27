@@ -2,6 +2,16 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { engine } from '../audio/engine';
 import { midi } from '../midi';
 import { Knob } from './Mixer';
+import {
+  SAMPLER_SEED_VERSION,
+  deleteSamplerPad,
+  encodeBufferToWav,
+  getSamplerSeededVersion,
+  loadSamplerPads,
+  saveSamplerPad,
+  setSamplerSeededVersion,
+} from '../audio/samplerStore';
+import { LOOP_SEEDS } from '../audio/seedTracks';
 
 const PAD_KEYS = ['1', '2', '3', '4', '5', '6', '7', '8'];
 
@@ -468,25 +478,64 @@ export default function Sampler() {
     if (engine.triggerSample(i)) flash(i);
   }, [flash]);
 
+  // ─── Pad persistence ──────────────────────────────────────────────────
+  // Pads survive reloads (IndexedDB, see samplerStore.ts): the encoded
+  // bytes per pad live in padBlobs, and every mutation below persists
+  // the pad's bytes + name + volume + trim + loop-arm flag. Settings
+  // changes (knob drags, trim edits) save debounced so a drag doesn't
+  // rewrite the blob on every tick; loads/clears save immediately.
+  const padBlobs = useRef<(Blob | null)[]>(Array(8).fill(null));
+  const padSaveTimers = useRef<(number | null)[]>(Array(8).fill(null));
+
+  const persistPad = useCallback((i: number) => {
+    const p = engine.pads[i];
+    const blob = padBlobs.current[i];
+    if (!p.buffer || !blob) return;
+    void saveSamplerPad({
+      padIndex: i,
+      name: p.name,
+      blob,
+      volume: p.volume,
+      trimStart: p.trimStart,
+      trimEnd: p.trimEnd,
+      loop: p.loop,
+      savedAt: new Date().toISOString(),
+    }).catch((e) => console.warn('Sampler pad save failed', e));
+  }, []);
+
+  const schedulePadSave = useCallback((i: number) => {
+    window.clearTimeout(padSaveTimers.current[i] ?? undefined);
+    padSaveTimers.current[i] = window.setTimeout(() => persistPad(i), 400);
+  }, [persistPad]);
+
   const load = useCallback(async (i: number, file: File) => {
-    if (await engine.loadSampleFromFile(i, file)) refreshPad(i);
-  }, [refreshPad]);
+    if (await engine.loadSampleFromFile(i, file)) {
+      padBlobs.current[i] = file;
+      persistPad(i);
+      refreshPad(i);
+    }
+  }, [refreshPad, persistPad]);
 
   const clear = useCallback((i: number) => {
     engine.clearSample(i);
+    padBlobs.current[i] = null;
+    window.clearTimeout(padSaveTimers.current[i] ?? undefined);
+    void deleteSamplerPad(i).catch((e) => console.warn('Sampler pad delete failed', e));
     setEditPad((cur) => (cur === i ? null : cur));
     refreshPad(i);
   }, [refreshPad]);
 
   const setVol = useCallback((i: number, v: number) => {
     engine.setPadVolume(i, v);
+    schedulePadSave(i);
     refreshPad(i);
-  }, [refreshPad]);
+  }, [refreshPad, schedulePadSave]);
 
   const toggleLoop = useCallback((i: number) => {
     engine.setPadLoop(i, !engine.pads[i].loop);
+    schedulePadSave(i);
     refreshPad(i);
-  }, [refreshPad]);
+  }, [refreshPad, schedulePadSave]);
 
   // Trim editing: which pad's editor is open (null = none). Zoom state
   // lives inside the editor and resets when switching pads (keyed).
@@ -494,12 +543,95 @@ export default function Sampler() {
 
   const setTrim = useCallback((i: number, start: number, end: number) => {
     engine.setPadTrim(i, start, end);
+    schedulePadSave(i);
     refreshPad(i);
-  }, [refreshPad]);
+  }, [refreshPad, schedulePadSave]);
 
   const resetTrim = useCallback((i: number) => {
     engine.resetPadTrim(i);
+    schedulePadSave(i);
     refreshPad(i);
+  }, [refreshPad, schedulePadSave]);
+
+  // Restore saved pads + seed the Midnight Concrete loops, once on
+  // mount. Restore first (saved records win), then seeding fills only
+  // pads with no saved record and no buffer — a pad the user loaded,
+  // cleared, or replaced is never clobbered. Decoding uses an isolated
+  // OfflineAudioContext and staging needs no live AudioContext, so this
+  // runs silently before the first gesture creates one. Seeded loops
+  // ship loop-ARMED (they repeat in sync when triggered) but nothing
+  // plays until the user taps a pad, a key, or MIDI.
+  const padsRestoredRef = useRef(false);
+  useEffect(() => {
+    if (padsRestoredRef.current) return;
+    padsRestoredRef.current = true;
+    let cancelled = false;
+    void (async () => {
+      const decodeCtx = new OfflineAudioContext({ numberOfChannels: 2, length: 1, sampleRate: 44100 });
+      try {
+        const saved = await loadSamplerPads();
+        for (const rec of saved) {
+          if (cancelled) return;
+          if (engine.pads[rec.padIndex].buffer) continue;
+          try {
+            const bytes = await rec.blob.arrayBuffer();
+            const buffer = await decodeCtx.decodeAudioData(bytes.slice(0));
+            if (cancelled) return;
+            if (!engine.stagePadSample(rec.padIndex, buffer, rec.name)) continue;
+            padBlobs.current[rec.padIndex] = rec.blob;
+            engine.setPadVolume(rec.padIndex, rec.volume);
+            if (rec.trimEnd > 0) engine.setPadTrim(rec.padIndex, rec.trimStart, rec.trimEnd);
+            engine.setPadLoop(rec.padIndex, rec.loop);
+            refreshPad(rec.padIndex);
+          } catch (e) {
+            console.warn('Sampler pad restore failed', rec.padIndex, e);
+          }
+        }
+      } catch (e) {
+        console.warn('Sampler restore failed', e);
+      }
+      if (cancelled || getSamplerSeededVersion() === SAMPLER_SEED_VERSION) return;
+      let allOk = true;
+      for (let i = 0; i < LOOP_SEEDS.length && i < 8; i++) {
+        if (cancelled) return;
+        const def = LOOP_SEEDS[i];
+        if (engine.pads[i].buffer) continue;
+        try {
+          const res = await fetch(def.url);
+          if (!res.ok) throw new Error(`fetch ${def.url} failed: HTTP ${res.status}`);
+          const bytes = await res.arrayBuffer();
+          const buffer = await decodeCtx.decodeAudioData(bytes.slice(0));
+          if (cancelled) return;
+          if (engine.pads[i].buffer) continue;
+          if (!engine.stagePadSample(i, buffer, def.title)) {
+            allOk = false;
+            continue;
+          }
+          const blob = new Blob([bytes], { type: 'audio/mpeg' });
+          padBlobs.current[i] = blob;
+          engine.setPadVolume(i, 0.8);
+          engine.setPadLoop(i, true);
+          refreshPad(i);
+          await saveSamplerPad({
+            padIndex: i,
+            name: def.title,
+            blob,
+            volume: 0.8,
+            trimStart: 0,
+            trimEnd: buffer.duration,
+            loop: true,
+            savedAt: new Date().toISOString(),
+          });
+        } catch (e) {
+          console.warn('Sampler seed failed', def.title, e);
+          allOk = false;
+        }
+      }
+      if (allOk && !cancelled) setSamplerSeededVersion(SAMPLER_SEED_VERSION);
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, [refreshPad]);
 
   // Loop state can change from MIDI (pad tap / LOOP toggle), so sync the
@@ -527,12 +659,16 @@ export default function Sampler() {
   const finishRecToPad = useCallback((buffer: AudioBuffer | null) => {
     if (buffer) {
       engine.loadSample(recPadRef.current, buffer, `Deck ${recDeckRef.current} rec`);
+      // Recordings have no file: persist WAV-encoded bytes so the pad
+      // survives a reload like any loaded sample.
+      padBlobs.current[recPadRef.current] = encodeBufferToWav(buffer);
+      persistPad(recPadRef.current);
       refreshPad(recPadRef.current);
       flash(recPadRef.current);
     } else {
       setRecError('No audio captured — was the deck still playing?');
     }
-  }, [refreshPad, flash]);
+  }, [refreshPad, flash, persistPad]);
 
   const stopRec = useCallback(async () => {
     setRecording(false);

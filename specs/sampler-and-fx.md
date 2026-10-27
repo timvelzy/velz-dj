@@ -79,11 +79,32 @@ getPadState(padIndex: number): { loaded: boolean; name: string; volume: number }
   trim region; mouse wheel, centered on the pointer; FIT resets).
   Handle dragging maps to the zoomed time scale; dragging the
   waveform background pans the zoomed view. Zoom is view-only state,
-  not persisted. Pads (and trim) are session-only — no sampler
-  persistence exists yet.
+  not persisted.
+
+### Pad persistence + seeded loops (implemented 2026-10-27)
+- Pads persist across reloads in their own IndexedDB database
+  (`velz-dj-sampler`, store `pads`, keyed by pad index — separate
+  from the track library, so clearing the library never wipes pads).
+  Each record stores the encoded audio bytes plus name, volume, trim
+  offsets, and the loop-arm flag. Restore decodes in an
+  OfflineAudioContext and stages the buffer before the first gesture
+  creates the live AudioContext. Settings edits save debounced;
+  loads/clears save immediately; deck recordings persist as
+  WAV-encoded bytes. Trim offsets persist with the sample records.
+- Seeded sampler pack: on first visit (version-gated, independent of
+  the track-library seed gates), the 8 Gemini-generated Midnight
+  Concrete example loops fill pads 1–8, full trim, volume 0.8, loop
+  mode ARMED — nothing plays until the user taps a pad, a key, or
+  MIDI. Seeding only fills pads with no saved record, so a pad the
+  user loaded, cleared, or replaced is never clobbered; a deleted or
+  replaced seed stays that way until the sampler seed version bumps.
+- The same 8 loops also seed the track library under their own group
+  (`loops`), labeled EXAMPLE LOOP with artist "Example loop
+  (Gemini)" — never as Velz releases. Library rows for bundled tracks
+  carry a VELZ PICK or EXAMPLE LOOP badge (see `seedGroup`).
 
 ### Out of scope (V2)
-- Pitch control, sample slicing. (Loop mode, trim editing, and capture-from-deck are now implemented.)
+- Pitch control, sample slicing. (Loop mode, trim editing, capture-from-deck, pad persistence, and the seeded loop pack are now implemented.)
 
 ---
 

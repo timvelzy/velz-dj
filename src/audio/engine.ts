@@ -1833,6 +1833,28 @@ export class DJEngine {
     return true;
   }
 
+  /**
+   * Stage a decoded buffer onto a pad WITHOUT requiring the live
+   * AudioContext. Restore/seed path only: the buffer was decoded in an
+   * OfflineAudioContext before the first user gesture creates the live
+   * context (init() "must be called from a user gesture"), and
+   * AudioBuffers are usable in any context. Only valid on a pad with no
+   * sounding voice or running loop — the caller guarantees freshness
+   * (restore runs once on mount; seeding only touches empty pads).
+   * Sets full trim; volume/loop are applied by the caller via the
+   * normal setters, which need no live context either.
+   */
+  stagePadSample(padIndex: number, buffer: AudioBuffer, name: string): boolean {
+    if (padIndex < 0 || padIndex > 7) return false;
+    const pad = this.pads[padIndex];
+    if (pad.source || pad.looping) return false;
+    pad.buffer = buffer;
+    pad.name = name;
+    pad.trimStart = 0;
+    pad.trimEnd = buffer.duration;
+    return true;
+  }
+
   /** Decode and load from a File/Blob. */
   async loadSampleFromFile(padIndex: number, file: File): Promise<boolean> {
     if (!this.ctx) return false;
