@@ -24,12 +24,16 @@
  * versioned filename AND a bumped manifest version, or existing
  * installs will keep fetching the stale cached bytes.
  *
- * Two independent seed groups share this mechanism, each with its own
- * manifest version and marker, so bumping one never re-seeds the other:
- * 'velz' (Tim's own releases, SEED_MANIFEST_VERSION) and 'loops'
+ * Four independent seed groups share this mechanism, each with its own
+ * manifest version and marker, so bumping one never re-seeds another:
+ * 'velz' (Tim's own releases, SEED_MANIFEST_VERSION), 'loops'
  * (clearly-labeled Gemini-generated example loops from the Midnight
- * Concrete file, LOOP_SEED_MANIFEST_VERSION). The `group` field on each
- * def is what the library badge reads.
+ * Concrete file, LOOP_SEED_MANIFEST_VERSION), 'perpetual' (Perpetual
+ * Groove file, PG_SEED_MANIFEST_VERSION) and 'warehouse' (Warehouse
+ * Floor file, WF_SEED_MANIFEST_VERSION). The `group` field on each def
+ * is what the library badge reads: all three loop sets share group
+ * 'loops', so they all render the EXAMPLE LOOP badge, while their
+ * provisioning stays independently gated per set.
  *
  * Seed policy (deliberate, version-gated): seeds are ordinary library
  * records once saved — deletable per track, cleared by "Clear saved"
@@ -52,8 +56,20 @@ export const SEED_MANIFEST_VERSION = 1;
     SEED_MANIFEST_VERSION: bumping one never re-seeds the other. */
 export const LOOP_SEED_MANIFEST_VERSION = 1;
 
+/** Bump when the Perpetual Groove seed set or one of its files changes.
+    Independent of every other group: bumping this never re-seeds the
+    Midnight Concrete loops (or the Velz picks), so a deleted MC loop
+    stays deleted. */
+export const PG_SEED_MANIFEST_VERSION = 1;
+
+/** Bump when the Warehouse Floor seed set or one of its files changes.
+    Independent of every other group, same guarantee as above. */
+export const WF_SEED_MANIFEST_VERSION = 1;
+
 const SEED_VERSION_KEY = 'velz-dj:seedVersion';
 const LOOP_SEED_VERSION_KEY = 'velz-dj:loopSeedVersion';
+const PG_SEED_VERSION_KEY = 'velz-dj:pgSeedVersion';
+const WF_SEED_VERSION_KEY = 'velz-dj:wfSeedVersion';
 
 function getVersion(key: string): number {
   try {
@@ -88,6 +104,22 @@ export function setLoopSeededVersion(version: number): void {
   setVersion(LOOP_SEED_VERSION_KEY, version);
 }
 
+export function getPgSeededVersion(): number {
+  return getVersion(PG_SEED_VERSION_KEY);
+}
+
+export function setPgSeededVersion(version: number): void {
+  setVersion(PG_SEED_VERSION_KEY, version);
+}
+
+export function getWfSeededVersion(): number {
+  return getVersion(WF_SEED_VERSION_KEY);
+}
+
+export function setWfSeededVersion(version: number): void {
+  setVersion(WF_SEED_VERSION_KEY, version);
+}
+
 export interface SeedTrackDef {
   /** Namespaced library identity — never collides with an upload's
       name|size|lastModified key. */
@@ -110,8 +142,10 @@ export interface SeedTrackDef {
   /** Verified from dj-games tracks.ts. Absent = analysis detects it. */
   key?: string;
   /** 'velz' = Tim's own releases. 'loops' = Gemini-generated example
-      loops (Midnight Concrete file) — labeled as examples in the UI,
-      never as Velz releases. */
+      loops (Midnight Concrete, Perpetual Groove, Warehouse Floor
+      files) — labeled as examples in the UI, never as Velz releases.
+      The three loop sets share this group value so the badge logic is
+      unchanged; their provisioning is gated per set, not per group. */
   group: 'velz' | 'loops';
 }
 
@@ -239,6 +273,127 @@ export const LOOP_SEEDS: SeedTrackDef[] = [
     artist: 'Example loop (Gemini)',
     url: `${base}tracks/mc-08-gritty-breakbeat-v1.mp3`,
     duration: 31.22,
+    bpm: 123.0,
+    group: 'loops',
+  },
+];
+
+/**
+ * Example loops from the Gemini-generated "Perpetual Groove" file, split
+ * into 5 pieces (see ~/workspace/mixer-loops/perpetual-groove/). Unlike
+ * Midnight Concrete this file is one continuous arrangement, not
+ * distinct loops: the split kept only the genuinely distinct textures
+ * (intro, core groove, breakdown, transitional passage) plus the
+ * fade-out tail, which is a one-shot, NOT a loop — its title says so.
+ * No genre labels are claimed. Durations are the exact split-file
+ * durations (ffprobe-verified); BPM 130.0 is the beat-grid fit for the
+ * one render (onset autocorrelation said 129.2 — MEDIUM confidence),
+ * placeholder display only; saved records carry the analyzed grid.
+ * Library-only: these never touch the sampler pads.
+ */
+export const PG_SEEDS: SeedTrackDef[] = [
+  {
+    fileKey: 'seed|pg-01-loop-intro-v1',
+    fileName: 'pg-01-loop-intro-v1.mp3',
+    title: 'Perpetual Groove: Intro',
+    artist: 'Example loop (Gemini)',
+    url: `${base}tracks/pg-01-loop-intro-v1.mp3`,
+    duration: 16.002,
+    bpm: 130.0,
+    group: 'loops',
+  },
+  {
+    fileKey: 'seed|pg-02-loop-main-groove-v1',
+    fileName: 'pg-02-loop-main-groove-v1.mp3',
+    title: 'Perpetual Groove: Main Groove',
+    artist: 'Example loop (Gemini)',
+    url: `${base}tracks/pg-02-loop-main-groove-v1.mp3`,
+    duration: 14.769,
+    bpm: 130.0,
+    group: 'loops',
+  },
+  {
+    fileKey: 'seed|pg-03-loop-breakdown-v1',
+    fileName: 'pg-03-loop-breakdown-v1.mp3',
+    title: 'Perpetual Groove: Breakdown',
+    artist: 'Example loop (Gemini)',
+    url: `${base}tracks/pg-03-loop-breakdown-v1.mp3`,
+    duration: 14.769,
+    bpm: 130.0,
+    group: 'loops',
+  },
+  {
+    fileKey: 'seed|pg-04-loop-passage-v1',
+    fileName: 'pg-04-loop-passage-v1.mp3',
+    title: 'Perpetual Groove: Passage',
+    artist: 'Example loop (Gemini)',
+    url: `${base}tracks/pg-04-loop-passage-v1.mp3`,
+    duration: 14.769,
+    bpm: 130.0,
+    group: 'loops',
+  },
+  {
+    fileKey: 'seed|pg-05-outro-tail-v1',
+    fileName: 'pg-05-outro-tail-v1.mp3',
+    title: 'Perpetual Groove: Outro Tail (one-shot, not a loop)',
+    artist: 'Example loop (Gemini)',
+    url: `${base}tracks/pg-05-outro-tail-v1.mp3`,
+    duration: 5.31,
+    bpm: 130.0,
+    group: 'loops',
+  },
+];
+
+/**
+ * Example loops from the Gemini-generated "Warehouse Floor" file, split
+ * into 4 loops (see ~/workspace/mixer-loops/warehouse-floor/). No genre
+ * labels are claimed. Durations are the exact split-file durations
+ * (ffprobe-verified); BPM 123 is a kick-onset-interval estimate
+ * (MEDIUM confidence), placeholder display only; saved records carry
+ * the analyzed grid. Caveats from the split README, carried into the
+ * titles where they change how a file behaves: loop 1 opens with ~0.6 s
+ * of silence before the first kick; loop 4 is truncated mid-groove
+ * (the source ends mid-pattern) and may repeat abruptly — its title
+ * says so. Library-only: these never touch the sampler pads.
+ */
+export const WF_SEEDS: SeedTrackDef[] = [
+  {
+    fileKey: 'seed|wf-01-loop-v1',
+    fileName: 'wf-01-loop-v1.mp3',
+    title: 'Warehouse Floor: Loop 1',
+    artist: 'Example loop (Gemini)',
+    url: `${base}tracks/wf-01-loop-v1.mp3`,
+    duration: 16.095,
+    bpm: 123.0,
+    group: 'loops',
+  },
+  {
+    fileKey: 'seed|wf-02-loop-v1',
+    fileName: 'wf-02-loop-v1.mp3',
+    title: 'Warehouse Floor: Loop 2',
+    artist: 'Example loop (Gemini)',
+    url: `${base}tracks/wf-02-loop-v1.mp3`,
+    duration: 15.605,
+    bpm: 123.0,
+    group: 'loops',
+  },
+  {
+    fileKey: 'seed|wf-03-loop-v1',
+    fileName: 'wf-03-loop-v1.mp3',
+    title: 'Warehouse Floor: Loop 3',
+    artist: 'Example loop (Gemini)',
+    url: `${base}tracks/wf-03-loop-v1.mp3`,
+    duration: 15.78,
+    bpm: 123.0,
+    group: 'loops',
+  },
+  {
+    fileKey: 'seed|wf-04-loop-v1',
+    fileName: 'wf-04-loop-v1.mp3',
+    title: 'Warehouse Floor: Loop 4 (truncated)',
+    artist: 'Example loop (Gemini)',
+    url: `${base}tracks/wf-04-loop-v1.mp3`,
+    duration: 13.602,
     bpm: 123.0,
     group: 'loops',
   },

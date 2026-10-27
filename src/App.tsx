@@ -58,14 +58,22 @@ import {
 import {
   LOOP_SEEDS,
   LOOP_SEED_MANIFEST_VERSION,
+  PG_SEEDS,
+  PG_SEED_MANIFEST_VERSION,
   SEED_MANIFEST_VERSION,
   SEED_TRACKS,
+  WF_SEEDS,
+  WF_SEED_MANIFEST_VERSION,
   getLoopSeededVersion,
+  getPgSeededVersion,
   getSeededVersion,
+  getWfSeededVersion,
   runSeeding,
   seedPlaceholder,
   setLoopSeededVersion,
+  setPgSeededVersion,
   setSeededVersion,
+  setWfSeededVersion,
 } from './audio/seedTracks';
 import {
   deletePlaylist,
@@ -300,10 +308,12 @@ export default function App() {
         // Bundled seeds: placeholder rows land with the restored
         // library immediately; each seed's fetch + analysis runs in the
         // background and swaps its row for the saved record when done.
-        // Two independent groups, each version-gated (see
-        // seedTracks.ts): 'velz' releases and 'loops' example loops. A
-        // seed the user deleted stays deleted until its own group's
-        // manifest version bumps.
+        // Four independent groups, each version-gated (see
+        // seedTracks.ts): 'velz' releases, 'loops' example loops
+        // (Midnight Concrete), and the Perpetual Groove + Warehouse
+        // Floor example sets. A seed the user deleted stays deleted
+        // until its own group's manifest version bumps — provisioning
+        // one set never resurrects another set's deleted seeds.
         const existing = new Set(restored.map((t) => t.fileKey).filter((k): k is string => Boolean(k)));
         const pendingVelz =
           getSeededVersion() === SEED_MANIFEST_VERSION
@@ -313,13 +323,23 @@ export default function App() {
           getLoopSeededVersion() === LOOP_SEED_MANIFEST_VERSION
             ? []
             : LOOP_SEEDS.filter((def) => !existing.has(def.fileKey));
-        const pending = [...pendingVelz, ...pendingLoops];
+        const pendingPg =
+          getPgSeededVersion() === PG_SEED_MANIFEST_VERSION
+            ? []
+            : PG_SEEDS.filter((def) => !existing.has(def.fileKey));
+        const pendingWf =
+          getWfSeededVersion() === WF_SEED_MANIFEST_VERSION
+            ? []
+            : WF_SEEDS.filter((def) => !existing.has(def.fileKey));
+        const pending = [...pendingVelz, ...pendingLoops, ...pendingPg, ...pendingWf];
         const merged = [...restored, ...pending.map(seedPlaceholder)];
         merged.sort((a, b) => a.title.localeCompare(b.title));
         setTracks(merged);
         if (!pending.length) {
           if (getSeededVersion() !== SEED_MANIFEST_VERSION) setSeededVersion(SEED_MANIFEST_VERSION);
           if (getLoopSeededVersion() !== LOOP_SEED_MANIFEST_VERSION) setLoopSeededVersion(LOOP_SEED_MANIFEST_VERSION);
+          if (getPgSeededVersion() !== PG_SEED_MANIFEST_VERSION) setPgSeededVersion(PG_SEED_MANIFEST_VERSION);
+          if (getWfSeededVersion() !== WF_SEED_MANIFEST_VERSION) setWfSeededVersion(WF_SEED_MANIFEST_VERSION);
           return;
         }
         const callbacks = {
@@ -353,6 +373,14 @@ export default function App() {
           if (pendingLoops.length) {
             const ok = await runSeeding(existing, callbacks, LOOP_SEEDS);
             if (ok && !cancelled) setLoopSeededVersion(LOOP_SEED_MANIFEST_VERSION);
+          }
+          if (pendingPg.length) {
+            const ok = await runSeeding(existing, callbacks, PG_SEEDS);
+            if (ok && !cancelled) setPgSeededVersion(PG_SEED_MANIFEST_VERSION);
+          }
+          if (pendingWf.length) {
+            const ok = await runSeeding(existing, callbacks, WF_SEEDS);
+            if (ok && !cancelled) setWfSeededVersion(WF_SEED_MANIFEST_VERSION);
           }
         })();
       })

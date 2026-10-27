@@ -102,6 +102,19 @@ getPadState(padIndex: number): { loaded: boolean; name: string; volume: number }
   (`loops`), labeled EXAMPLE LOOP with artist "Example loop
   (Gemini)" — never as Velz releases. Library rows for bundled tracks
   carry a VELZ PICK or EXAMPLE LOOP badge (see `seedGroup`).
+- Two more Gemini-generated loop sets seed the library ONLY (pads
+  untouched — the Midnight Concrete loops already occupy pads 1–8,
+  and library seeding must never clobber pads): Perpetual Groove
+  (5 pieces from one continuous ~130 BPM arrangement — intro, main
+  groove, breakdown, passage, plus an outro tail labeled as a
+  one-shot, not a loop) and Warehouse Floor (4 loops, ~123 BPM; loop
+  4 is truncated mid-groove and its title says so). Each set has its
+  own version gate (`velz-dj:pgSeedVersion`,
+  `velz-dj:wfSeedVersion`), independent of the Midnight Concrete loop
+  gate, so provisioning one set never resurrects another set's
+  deleted seeds. Same EXAMPLE LOOP badge, same "Example loop
+  (Gemini)" artist, same placeholder/analyze/save semantics as the
+  other seed groups. Titles are prefixed with the set name.
 
 ### Out of scope (V2)
 - Pitch control, sample slicing. (Loop mode, trim editing, capture-from-deck, pad persistence, and the seeded loop pack are now implemented.)
