@@ -11,9 +11,11 @@ interface PadUIState {
   flashing: boolean;
   loop: boolean; // loop mode armed
   looping: boolean; // loop currently playing
+  trimStart: number; // seconds
+  trimEnd: number; // seconds (full duration when untrimmed)
 }
 
-function renderMiniWaveform(buffer: AudioBuffer, canvas: HTMLCanvasElement) {
+function renderMiniWaveform(buffer: AudioBuffer, canvas: HTMLCanvasElement, trimStart = 0, trimEnd?: number) {
   const ctx = canvas.getContext('2d');
   if (!ctx) return;
   const data = buffer.getChannelData(0);
@@ -32,9 +34,270 @@ function renderMiniWaveform(buffer: AudioBuffer, canvas: HTMLCanvasElement) {
     const y2 = ((1 + max) / 2) * h;
     ctx.fillRect(x, y1, 1, Math.max(1, y2 - y1));
   }
+  // Trim shading: dim the regions outside [trimStart, trimEnd] so the
+  // kept region reads at a glance, with ticks at the trim points.
+  const end = trimEnd ?? buffer.duration;
+  if (end < buffer.duration || trimStart > 0) {
+    const x0 = (trimStart / buffer.duration) * w;
+    const x1 = (end / buffer.duration) * w;
+    ctx.fillStyle = 'rgba(0,0,0,0.55)';
+    if (x0 > 0) ctx.fillRect(0, 0, x0, h);
+    if (x1 < w) ctx.fillRect(x1, 0, w - x1, h);
+    ctx.fillStyle = '#e4e4e7';
+    ctx.fillRect(Math.max(0, x0), 0, 1, h);
+    ctx.fillRect(Math.min(w - 1, x1), 0, 1, h);
+  }
 }
 
-function Pad({ index, state, onTrigger, onLoad, onClear, onVolume, onToggleLoop }: {
+/** Large trim editor: full-width waveform with draggable start/end
+ * handles plus numeric start/end fields for fine adjustment. The pad's
+ * 72px mini waveform is too small for usable drag handles, so the drag
+ * interaction lives here; the mini waveform only shows the trim shading. */
+function drawEditorWaveform(buffer: AudioBuffer, canvas: HTMLCanvasElement, trimStart: number, trimEnd: number, viewStart: number, viewDur: number) {
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return;
+  const data = buffer.getChannelData(0);
+  const w = canvas.width, h = canvas.height;
+  ctx.clearRect(0, 0, w, h);
+  ctx.fillStyle = '#22d3ee';
+  // Only the visible window is drawn, so zooming reveals fine detail.
+  const viewStartIdx = Math.floor((viewStart / buffer.duration) * data.length);
+  const viewCount = Math.max(1, Math.floor((viewDur / buffer.duration) * data.length));
+  const step = Math.max(1, Math.floor(viewCount / w));
+  for (let x = 0; x < w; x++) {
+    let min = 1, max = -1;
+    for (let i = 0; i < step; i += 4) {
+      const v = data[viewStartIdx + x * step + i] ?? 0;
+      if (v < min) min = v;
+      if (v > max) max = v;
+    }
+    const y1 = ((1 + min) / 2) * (h - 16);
+    const y2 = ((1 + max) / 2) * (h - 16);
+    ctx.fillRect(x, y1, 1, Math.max(1, y2 - y1));
+  }
+  const x0 = ((trimStart - viewStart) / viewDur) * w;
+  const x1 = ((trimEnd - viewStart) / viewDur) * w;
+  ctx.fillStyle = 'rgba(0,0,0,0.6)';
+  if (x0 > 0) ctx.fillRect(0, 0, x0, h - 16);
+  if (x1 < w) ctx.fillRect(x1, 0, w - x1, h - 16);
+  // Handles: full-height bars with a grab cap on top.
+  ctx.fillStyle = '#fbbf24';
+  ctx.fillRect(Math.max(0, x0 - 1), 0, 3, h - 16);
+  ctx.fillRect(Math.min(w - 3, x1 - 1), 0, 3, h - 16);
+  ctx.fillStyle = '#fbbf24';
+  ctx.fillRect(Math.max(0, x0 - 4), 0, 9, 5);
+  ctx.fillRect(Math.min(w - 9, x1 - 4), 0, 9, 5);
+  // Time labels: visible window edges, plus trim-handle times when
+  // the handle is in view.
+  ctx.fillStyle = '#a1a1aa';
+  ctx.font = '10px monospace';
+  ctx.fillText(`${viewStart.toFixed(2)}s`, 2, h - 4);
+  const viewEndLabel = `${(viewStart + viewDur).toFixed(2)}s`;
+  ctx.fillText(viewEndLabel, w - 40, h - 4);
+  if (x0 >= -10 && x0 <= w + 10) ctx.fillText(`${trimStart.toFixed(2)}s`, Math.max(0, Math.min(w - 40, x0 - 2)), 12);
+  if (x1 >= -10 && x1 <= w + 10) ctx.fillText(`${trimEnd.toFixed(2)}s`, Math.max(0, Math.min(w - 40, x1 - 32)), 12);
+}
+
+function TrimEditor({ index, state, onTrim, onReset, onClose }: {
+  index: number;
+  state: PadUIState;
+  onTrim: (start: number, end: number) => void;
+  onReset: () => void;
+  onClose: () => void;
+}) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const dragWhich = useRef<'start' | 'end' | null>(null);
+  const panRef = useRef<{ startX: number; startView: number } | null>(null);
+  const buffer = engine.pads[index].buffer;
+  const duration = buffer?.duration ?? 0;
+  const { trimStart, trimEnd } = state;
+
+  // Zoom is view-only state (per editor view, not persisted): zoom 1
+  // shows the whole sample; up to 32x for sub-second fine-tuning.
+  const [zoom, setZoom] = useState(1);
+  const [viewStart, setViewStart] = useState(0);
+  const viewDur = duration > 0 ? duration / zoom : 0;
+  const clampView = (z: number, s: number) => {
+    const vd = duration / z;
+    return Math.min(Math.max(0, duration - vd), Math.max(0, s));
+  };
+  // Zoom around an anchor time (trim midpoint for the buttons, pointer
+  // time for the wheel) so the view follows the trim region instead
+  // of jumping away.
+  const zoomAround = (newZoom: number, anchor: number) => {
+    const z = Math.min(32, Math.max(1, newZoom));
+    const newViewDur = duration / z;
+    const s = anchor - (anchor - viewStart) * (newViewDur / viewDur);
+    setZoom(z);
+    setViewStart(clampView(z, s));
+  };
+
+  // Numeric drafts: local text while focused (so typing "1." isn't
+  // fought by live clamping), synced from engine state otherwise —
+  // including live drag updates.
+  const [startDraft, setStartDraft] = useState(trimStart.toFixed(2));
+  const [endDraft, setEndDraft] = useState(trimEnd.toFixed(2));
+  const [focused, setFocused] = useState<'start' | 'end' | null>(null);
+  useEffect(() => { if (focused !== 'start') setStartDraft(trimStart.toFixed(2)); }, [trimStart, focused]);
+  useEffect(() => { if (focused !== 'end') setEndDraft(trimEnd.toFixed(2)); }, [trimEnd, focused]);
+
+  useEffect(() => {
+    if (buffer && canvasRef.current) drawEditorWaveform(buffer, canvasRef.current, trimStart, trimEnd, viewStart, viewDur);
+  }, [buffer, trimStart, trimEnd, viewStart, viewDur]);
+
+  // Mouse-wheel zoom around the pointer (native non-passive listener
+  // so the page doesn't scroll while zooming the waveform).
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas || duration <= 0) return;
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      const rect = canvas.getBoundingClientRect();
+      const anchor = viewStart + ((e.clientX - rect.left) / rect.width) * viewDur;
+      zoomAround(zoom * Math.exp(-e.deltaY * 0.0015), anchor);
+    };
+    canvas.addEventListener('wheel', onWheel, { passive: false });
+    return () => canvas.removeEventListener('wheel', onWheel);
+    // zoomAround/clampView are re-created each render; re-registering
+    // on zoom/view change keeps the handler reading fresh values.
+  }, [zoom, viewStart, viewDur, duration]);
+
+  const timeFromEvent = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    const rect = canvasRef.current!.getBoundingClientRect();
+    return Math.min(
+      viewStart + viewDur,
+      Math.max(viewStart, viewStart + ((e.clientX - rect.left) / rect.width) * viewDur),
+    );
+  };
+  const applyAt = (which: 'start' | 'end', t: number) => {
+    if (which === 'start') onTrim(t, trimEnd);
+    else onTrim(trimStart, t);
+  };
+
+  const commitStart = () => {
+    const v = parseFloat(startDraft);
+    if (Number.isFinite(v)) onTrim(v, trimEnd);
+  };
+  const commitEnd = () => {
+    const v = parseFloat(endDraft);
+    if (Number.isFinite(v)) onTrim(trimStart, v);
+  };
+
+  if (!buffer) return null;
+  return (
+    <div className="mt-2 rounded-lg border border-amber-500/50 bg-black/50 p-2">
+      <div className="flex items-center justify-between gap-2">
+        <span className="text-[11px] font-mono text-amber-200">
+          PAD {index + 1} TRIM — {state.name} · kept {(trimEnd - trimStart).toFixed(2)}s of {duration.toFixed(2)}s
+        </span>
+        <span className="flex items-center gap-1">
+          <span className="text-[10px] font-mono text-zinc-500">ZOOM</span>
+          <button
+            onClick={() => zoomAround(zoom / 2, (trimStart + trimEnd) / 2)}
+            className="text-[11px] font-mono text-zinc-300 hover:text-amber-200 border border-zinc-700 rounded px-1.5 py-0.5"
+            title="Zoom out (centers on the trim region)"
+          >
+            −
+          </button>
+          <span className="text-[11px] font-mono text-zinc-200 w-10 text-center">
+            {zoom < 10 ? zoom.toFixed(1) : Math.round(zoom)}×
+          </span>
+          <button
+            onClick={() => zoomAround(zoom * 2, (trimStart + trimEnd) / 2)}
+            className="text-[11px] font-mono text-zinc-300 hover:text-amber-200 border border-zinc-700 rounded px-1.5 py-0.5"
+            title="Zoom in (centers on the trim region)"
+          >
+            +
+          </button>
+          <button
+            onClick={() => { setZoom(1); setViewStart(0); }}
+            className="text-[11px] font-mono text-zinc-300 hover:text-amber-200 border border-zinc-700 rounded px-1.5 py-0.5"
+            title="Reset zoom to the full sample"
+          >
+            FIT
+          </button>
+        </span>
+        <button onClick={onClose} className="text-[11px] font-mono text-zinc-400 hover:text-zinc-100 px-1" title="Close trim editor">✕</button>
+      </div>
+      <canvas
+        ref={canvasRef}
+        width={640}
+        height={110}
+        className="w-full h-[110px] mt-1 rounded bg-black/40 cursor-ew-resize touch-none"
+        onPointerDown={(e) => {
+          const rect = canvasRef.current!.getBoundingClientRect();
+          const x = e.clientX - rect.left;
+          const pxPerSec = rect.width / viewDur;
+          const x0 = (trimStart - viewStart) * pxPerSec;
+          const x1 = (trimEnd - viewStart) * pxPerSec;
+          (e.target as HTMLCanvasElement).setPointerCapture(e.pointerId);
+          // Near a handle (10px grab zone, in zoomed pixels) → drag
+          // that handle, with the pointer mapped to the zoomed time
+          // scale. Anywhere else → pan the zoomed view (a no-op at
+          // zoom 1, where the whole sample is visible).
+          if (Math.abs(x - x0) <= 10) {
+            dragWhich.current = 'start';
+            applyAt('start', timeFromEvent(e));
+          } else if (Math.abs(x - x1) <= 10) {
+            dragWhich.current = 'end';
+            applyAt('end', timeFromEvent(e));
+          } else {
+            panRef.current = { startX: e.clientX, startView: viewStart };
+          }
+        }}
+        onPointerMove={(e) => {
+          if (dragWhich.current) {
+            applyAt(dragWhich.current, timeFromEvent(e));
+            return;
+          }
+          if (panRef.current) {
+            const rect = canvasRef.current!.getBoundingClientRect();
+            const dxSec = ((e.clientX - panRef.current.startX) / rect.width) * viewDur;
+            setViewStart(clampView(zoom, panRef.current.startView - dxSec));
+          }
+        }}
+        onPointerUp={() => { dragWhich.current = null; panRef.current = null; }}
+        onPointerCancel={() => { dragWhich.current = null; panRef.current = null; }}
+      />
+      <div className="flex flex-wrap items-center gap-3 mt-2">
+        <label className="flex items-center gap-1 text-[11px] font-mono text-zinc-300">
+          start
+          <input
+            type="number" min={0} max={duration} step={0.01} value={startDraft}
+            className="w-20 rounded border border-zinc-700 bg-zinc-900 px-1 py-0.5 text-zinc-100"
+            onFocus={() => setFocused('start')}
+            onBlur={() => { setFocused(null); commitStart(); }}
+            onKeyDown={(e) => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur(); }}
+            onChange={(e) => setStartDraft(e.target.value)}
+          />
+          s
+        </label>
+        <label className="flex items-center gap-1 text-[11px] font-mono text-zinc-300">
+          end
+          <input
+            type="number" min={0} max={duration} step={0.01} value={endDraft}
+            className="w-20 rounded border border-zinc-700 bg-zinc-900 px-1 py-0.5 text-zinc-100"
+            onFocus={() => setFocused('end')}
+            onBlur={() => { setFocused(null); commitEnd(); }}
+            onKeyDown={(e) => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur(); }}
+            onChange={(e) => setEndDraft(e.target.value)}
+          />
+          s
+        </label>
+        <button
+          onClick={onReset}
+          className="text-[11px] font-mono text-zinc-300 hover:text-amber-200 border border-zinc-700 rounded px-2 py-0.5"
+          title="Reset trim to the full sample"
+        >
+          RESET TO FULL
+        </button>
+        <span className="text-[10px] font-mono text-zinc-500">drag amber handles (10px grab) · drag background to pan when zoomed · mouse wheel zooms at the pointer · type exact seconds · 5ms fades · trim is non-destructive</span>
+      </div>
+    </div>
+  );
+}
+
+function Pad({ index, state, onTrigger, onLoad, onClear, onVolume, onToggleLoop, onEdit, editing }: {
   index: number;
   state: PadUIState;
   onTrigger: () => void;
@@ -42,6 +305,8 @@ function Pad({ index, state, onTrigger, onLoad, onClear, onVolume, onToggleLoop 
   onClear: () => void;
   onVolume: (v: number) => void;
   onToggleLoop: () => void;
+  onEdit: () => void;
+  editing: boolean;
 }) {
   const fileRef = useRef<HTMLInputElement>(null);
   const waveRef = useRef<HTMLCanvasElement>(null);
@@ -50,20 +315,22 @@ function Pad({ index, state, onTrigger, onLoad, onClear, onVolume, onToggleLoop 
   useEffect(() => {
     const pad = engine.pads[index];
     if (state.loaded && pad.buffer && waveRef.current) {
-      renderMiniWaveform(pad.buffer, waveRef.current);
+      renderMiniWaveform(pad.buffer, waveRef.current, state.trimStart, state.trimEnd);
     }
-  }, [state.loaded, index]);
+  }, [state.loaded, state.trimStart, state.trimEnd, index]);
 
   return (
     <div
       className={`relative rounded-lg border p-1.5 select-none transition-colors ${
-        state.looping
-          ? 'bg-emerald-500/25 border-emerald-400'
-          : state.flashing
-            ? 'bg-cyan-500/40 border-cyan-300'
-            : state.loaded
-              ? 'bg-zinc-800 border-zinc-600 hover:border-cyan-400 cursor-pointer'
-              : 'bg-zinc-900 border-zinc-700 border-dashed hover:border-zinc-500 cursor-pointer'
+        editing
+          ? 'bg-zinc-800 border-amber-400'
+          : state.looping
+            ? 'bg-emerald-500/25 border-emerald-400'
+            : state.flashing
+              ? 'bg-cyan-500/40 border-cyan-300'
+              : state.loaded
+                ? 'bg-zinc-800 border-zinc-600 hover:border-cyan-400 cursor-pointer'
+                : 'bg-zinc-900 border-zinc-700 border-dashed hover:border-zinc-500 cursor-pointer'
       }`}
       onClick={() => (state.loaded ? onTrigger() : fileRef.current?.click())}
       onContextMenu={(e) => { e.preventDefault(); if (state.loaded) onClear(); }}
@@ -112,6 +379,17 @@ function Pad({ index, state, onTrigger, onLoad, onClear, onVolume, onToggleLoop 
               LOOP
             </button>
             <button
+              className={`text-[9px] font-mono px-1 rounded border ${
+                editing
+                  ? 'text-amber-200 border-amber-400 bg-amber-500/20'
+                  : 'text-zinc-500 border-zinc-700 hover:text-amber-200'
+              }`}
+              onClick={(e) => { e.stopPropagation(); onEdit(); }}
+              title="Edit trim: drag the start/end handles on the large waveform, or type exact seconds."
+            >
+              EDIT
+            </button>
+            <button
               className="text-[9px] text-zinc-500 hover:text-cyan-300 font-mono"
               onClick={(e) => { e.stopPropagation(); setShowVol(!showVol); }}
             >
@@ -134,7 +412,7 @@ function Pad({ index, state, onTrigger, onLoad, onClear, onVolume, onToggleLoop 
 
 export default function Sampler() {
   const [pads, setPads] = useState<PadUIState[]>(
-    Array.from({ length: 8 }, () => ({ name: '', loaded: false, volume: 0.8, flashing: false, loop: false, looping: false }))
+    Array.from({ length: 8 }, () => ({ name: '', loaded: false, volume: 0.8, flashing: false, loop: false, looping: false, trimStart: 0, trimEnd: 0 }))
   );
   // Quantize defaults ON (EDM sync feature): pads drop on the next master
   // beat. The checkbox defeats it for manual triggering.
@@ -164,9 +442,10 @@ export default function Sampler() {
       if (
         cur.name === p.name && cur.loaded === !!p.buffer && cur.volume === p.volume
         && cur.loop === p.loop && cur.looping === p.looping
+        && cur.trimStart === p.trimStart && cur.trimEnd === p.trimEnd
       ) return prev;
       const next = [...prev];
-      next[i] = { ...next[i], name: p.name, loaded: !!p.buffer, volume: p.volume, loop: p.loop, looping: p.looping };
+      next[i] = { ...next[i], name: p.name, loaded: !!p.buffer, volume: p.volume, loop: p.loop, looping: p.looping, trimStart: p.trimStart, trimEnd: p.trimEnd };
       return next;
     });
   }, []);
@@ -197,6 +476,7 @@ export default function Sampler() {
 
   const clear = useCallback((i: number) => {
     engine.clearSample(i);
+    setEditPad((cur) => (cur === i ? null : cur));
     refreshPad(i);
   }, [refreshPad]);
 
@@ -207,6 +487,20 @@ export default function Sampler() {
 
   const toggleLoop = useCallback((i: number) => {
     engine.setPadLoop(i, !engine.pads[i].loop);
+    refreshPad(i);
+  }, [refreshPad]);
+
+  // Trim editing: which pad's editor is open (null = none). Zoom state
+  // lives inside the editor and resets when switching pads (keyed).
+  const [editPad, setEditPad] = useState<number | null>(null);
+
+  const setTrim = useCallback((i: number, start: number, end: number) => {
+    engine.setPadTrim(i, start, end);
+    refreshPad(i);
+  }, [refreshPad]);
+
+  const resetTrim = useCallback((i: number) => {
+    engine.resetPadTrim(i);
     refreshPad(i);
   }, [refreshPad]);
 
@@ -372,7 +666,7 @@ export default function Sampler() {
           </label>
           {/* Channel volume + mute live on the sampler strip in the
               mixer now (single control, no competing VOL here). */}
-          <span className="text-[10px] font-mono text-zinc-600">VOL + MUTE on mixer strip · LOOP on a pad: tap pad to start, tap again to stop</span>
+          <span className="text-[10px] font-mono text-zinc-600">VOL + MUTE on mixer strip · LOOP on a pad: tap pad to start, tap again to stop · EDIT on a pad: trim start/end with zoom</span>
         </div>
       </div>
       {/* Record from a playing deck into a pad. Tap is parallel to the
@@ -441,10 +735,22 @@ export default function Sampler() {
               onClear={() => clear(i)}
               onVolume={(v) => setVol(i, v)}
               onToggleLoop={() => toggleLoop(i)}
+              onEdit={() => setEditPad((cur) => (cur === i ? null : i))}
+              editing={editPad === i}
             />
           </div>
         ))}
       </div>
+      {editPad !== null && pads[editPad].loaded && (
+        <TrimEditor
+          key={editPad}
+          index={editPad}
+          state={pads[editPad]}
+          onTrim={(s, e) => setTrim(editPad, s, e)}
+          onReset={() => resetTrim(editPad)}
+          onClose={() => setEditPad(null)}
+        />
+      )}
     </div>
   );
 }

@@ -184,6 +184,8 @@ export interface SamplerPad {
   source: AudioBufferSourceNode | null; // currently playing voice (for retrigger)
   loop: boolean; // loop MODE armed: triggering starts a repeating loop
   looping: boolean; // a loop is currently playing (UI-readable)
+  trimStart: number; // seconds: non-destructive trim region start (0 = full)
+  trimEnd: number; // seconds: non-destructive trim region end (duration = full)
 }
 
 /**
@@ -271,6 +273,7 @@ export class DJEngine {
   private samplerAnalyser!: AnalyserNode;
   pads: SamplerPad[] = Array.from({ length: 8 }, () => ({
     buffer: null, name: '', volume: 0.8, source: null, loop: false, looping: false,
+    trimStart: 0, trimEnd: 0,
   }));
   samplerQuantize = true; // default ON: pads launch quantized (checkbox defeats it)
 
@@ -1825,6 +1828,8 @@ export class DJEngine {
     const pad = this.pads[padIndex];
     pad.buffer = buffer;
     pad.name = name;
+    pad.trimStart = 0;
+    pad.trimEnd = buffer.duration;
     return true;
   }
 
@@ -1849,11 +1854,75 @@ export class DJEngine {
     pad.buffer = null;
     pad.name = '';
     pad.loop = false;
+    pad.trimStart = 0;
+    pad.trimEnd = 0;
   }
 
   setPadVolume(padIndex: number, v: number): void {
     if (padIndex < 0 || padIndex > 7) return;
     this.pads[padIndex].volume = Math.min(1, Math.max(0, v));
+  }
+
+  /**
+   * Non-destructive per-pad trim. The full decoded buffer is always
+   * kept; playback (one-shot and loop iterations) uses only
+   * [trimStart, trimEnd). Offsets clamp to [0, duration] and a minimum
+   * 10ms region is enforced, so invalid input can never crash or
+   * permanently silence a pad. A trim change applies to the next
+   * trigger / next loop iteration; a voice already sounding is never
+   * rewritten. Trim lives in memory with the sample itself — pads are
+   * not persisted across reloads, so neither is trim.
+   */
+  setPadTrim(padIndex: number, start: number, end: number): void {
+    if (padIndex < 0 || padIndex > 7) return;
+    const pad = this.pads[padIndex];
+    if (!pad.buffer) return;
+    if (!Number.isFinite(start) || !Number.isFinite(end)) return;
+    const dur = pad.buffer.duration;
+    const MIN_LEN = 0.01;
+    let s = Math.min(dur, Math.max(0, start));
+    let e = Math.min(dur, Math.max(0, end));
+    if (e - s < MIN_LEN) {
+      if (s + MIN_LEN <= dur) e = s + MIN_LEN;
+      else s = Math.max(0, e - MIN_LEN);
+    }
+    if (e - s < MIN_LEN) { s = 0; e = Math.min(dur, MIN_LEN); }
+    pad.trimStart = s;
+    pad.trimEnd = e;
+  }
+
+  resetPadTrim(padIndex: number): void {
+    if (padIndex < 0 || padIndex > 7) return;
+    const pad = this.pads[padIndex];
+    if (!pad.buffer) return;
+    pad.trimStart = 0;
+    pad.trimEnd = pad.buffer.duration;
+  }
+
+  /** Trimmed playback region for a pad (seconds, within the buffer). */
+  private padTrimRegion(pad: SamplerPad): { offset: number; duration: number } {
+    if (!pad.buffer) return { offset: 0, duration: 0 };
+    const dur = pad.buffer.duration;
+    const offset = Math.min(dur, Math.max(0, pad.trimStart));
+    const end = Math.min(dur, Math.max(0, pad.trimEnd));
+    if (end <= offset) return { offset: 0, duration: dur };
+    return { offset, duration: end - offset };
+  }
+
+  /** Loop period in master beats for the pad's CURRENT trimmed region. */
+  private padTrimPeriodBeats(pad: SamplerPad, spb: number): number {
+    const { duration } = this.padTrimRegion(pad);
+    return Math.min(32, Math.max(1, Math.round(duration / spb)));
+  }
+
+  /** 5ms fades at region boundaries so trims never click. */
+  private fadeVoiceGain(g: GainNode, at: number, peak: number, dur: number): void {
+    const FADE = 0.005;
+    const end = at + dur;
+    g.gain.setValueAtTime(0, at);
+    g.gain.linearRampToValueAtTime(peak, at + Math.min(FADE, dur));
+    g.gain.setValueAtTime(peak, Math.max(at + FADE, end - FADE));
+    g.gain.linearRampToValueAtTime(0, end);
   }
 
   setSamplerMaster(v: number): void {
@@ -2086,16 +2155,17 @@ export class DJEngine {
       if (q !== null) when = q;
     }
 
+    const region = this.padTrimRegion(pad);
     const src = this.ctx.createBufferSource();
     src.buffer = pad.buffer;
     const g = this.ctx.createGain();
-    g.gain.value = pad.volume;
+    this.fadeVoiceGain(g, when, pad.volume, region.duration);
     src.connect(g);
     g.connect(this.samplerBus);
     src.onended = () => { if (pad.source === src) pad.source = null; };
     pad.source = src;
     try {
-      src.start(when);
+      src.start(when, region.offset, region.duration);
       return true;
     } catch {
       pad.source = null;
@@ -2121,12 +2191,14 @@ export class DJEngine {
    * time-stretch; samples are plain BufferSources, not the WSOLA deck
    * path, so the sample always plays at its natural pitch and speed):
    *
-   * - The loop period is the sample's duration rounded to the nearest
-   *   whole number of master beats (1..32, Traktor loop sizes), measured
-   *   at the master tempo when the loop starts. A sample longer than
-   *   its period is cut at the period boundary; a shorter one leaves a
-   *   gap of silence until the next boundary. The raw sample is never
-   *   trimmed, padded, or re-pitched — only its restart points move.
+   * - The loop period is the pad's TRIMMED region duration rounded to
+   *   the nearest whole number of master beats (1..32, Traktor loop
+   *   sizes), measured at the master tempo when the loop starts. A
+   *   region longer than its period is cut at the period boundary; a
+   *   shorter one leaves a gap of silence until the next boundary. The
+   *   raw sample is never trimmed, padded, or re-pitched — only its
+   *   restart points move. Trim edits mid-loop take effect from the
+   *   next iteration (the period follows the current trim).
    * - Iteration starts are scheduled on master beat boundaries: the
    *   first hit uses the same next-beat quantize as one-shots, and each
    *   following start is re-anchored to the live master grid (the anchor
@@ -2147,7 +2219,7 @@ export class DJEngine {
 
     const bpm = this.masterEffectiveBpm() || this.fx.bpm || 124;
     state.spb = 60 / bpm;
-    state.beats = Math.min(32, Math.max(1, Math.round(pad.buffer.duration / state.spb)));
+    state.beats = this.padTrimPeriodBeats(pad, state.spb);
 
     let when = this.ctx.currentTime;
     if (this.samplerQuantize) {
@@ -2168,10 +2240,20 @@ export class DJEngine {
     const pad = this.pads[padIndex];
     const state = this.padLoops[padIndex];
     if (!pad.buffer) return;
+    // Trim applies from the next scheduled iteration: the region is
+    // read fresh here, so a trim edit lands on the next pass without
+    // touching the voice already sounding.
+    const region = this.padTrimRegion(pad);
+    // Stop at the period boundary so a region longer than its period
+    // never overlaps the next iteration (previously long samples ran
+    // past the boundary and stacked on top of the next pass).
+    const bpm = this.masterEffectiveBpm();
+    const spb = bpm > 0 ? 60 / bpm : state.spb;
+    const playDur = Math.min(region.duration, state.beats * spb);
     const src = this.ctx.createBufferSource();
     src.buffer = pad.buffer;
     const g = this.ctx.createGain();
-    g.gain.value = pad.volume;
+    this.fadeVoiceGain(g, at, pad.volume, playDur);
     src.connect(g);
     g.connect(this.samplerBus);
     const entry = { src, at };
@@ -2183,7 +2265,8 @@ export class DJEngine {
     state.pending.push(entry);
     pad.source = src;
     try {
-      src.start(at);
+      src.start(at, region.offset, region.duration);
+      src.stop(at + playDur);
     } catch {
       const i = state.pending.indexOf(entry);
       if (i >= 0) state.pending.splice(i, 1);
@@ -2201,6 +2284,11 @@ export class DJEngine {
       return;
     }
     const now = this.ctx.currentTime;
+    // A trim edit mid-loop takes effect from the next iteration: the
+    // period follows the current trimmed region at the live tempo.
+    const bpmNow = this.masterEffectiveBpm();
+    const spbNow = bpmNow > 0 ? 60 / bpmNow : state.spb;
+    state.beats = this.padTrimPeriodBeats(pad, spbNow);
     let guard = 0;
     while (state.nextAt !== null && state.nextAt < now + 0.3 && guard++ < 4) {
       const at: number = state.nextAt;

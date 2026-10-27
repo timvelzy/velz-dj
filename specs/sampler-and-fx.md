@@ -61,8 +61,29 @@ getPadState(padIndex: number): { loaded: boolean; name: string; volume: number }
   (fx.bpm, default 124). Pad volume + sampler master/EQ/filter/FX send
   apply exactly as for one-shots.
 
+### Trim editing (implemented 2026-10-27)
+- Non-destructive per-pad trim: the full decoded buffer is always
+  kept; each pad stores start/end offsets (seconds). One-shots play
+  only the trimmed region; loop mode loops the trimmed region with
+  the period recomputed from the trimmed duration (same whole-beat
+  rounding, 1–32). Trim edits apply from the next trigger / next loop
+  iteration; a sounding voice is never rewritten.
+- UI: EDIT button on each loaded pad opens an expanded editor below
+  the pad grid — large waveform with draggable amber start/end
+  handles, numeric start/end fields (seconds, commit on blur/Enter),
+  RESET TO FULL. The pad's mini waveform shades the trimmed-out
+  regions. 5ms fades at trim boundaries prevent clicks. Offsets
+  clamp to [0, duration] with a 10ms minimum region; invalid input
+  is clamped, never a crash or a permanently silent pad.
+- Zoom: the editor waveform zooms 1×–32× (buttons, centered on the
+  trim region; mouse wheel, centered on the pointer; FIT resets).
+  Handle dragging maps to the zoomed time scale; dragging the
+  waveform background pans the zoomed view. Zoom is view-only state,
+  not persisted. Pads (and trim) are session-only — no sampler
+  persistence exists yet.
+
 ### Out of scope (V2)
-- Pitch control, sample slicing. (Loop mode and capture-from-deck are now implemented.)
+- Pitch control, sample slicing. (Loop mode, trim editing, and capture-from-deck are now implemented.)
 
 ---
 
