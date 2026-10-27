@@ -182,6 +182,22 @@ export interface SamplerPad {
   name: string;
   volume: number; // 0..1
   source: AudioBufferSourceNode | null; // currently playing voice (for retrigger)
+  loop: boolean; // loop MODE armed: triggering starts a repeating loop
+  looping: boolean; // a loop is currently playing (UI-readable)
+}
+
+/**
+ * Runtime state for one pad's loop. The mode flag lives on SamplerPad
+ * (above); this holds only the scheduler's working state, so clearing a
+ * pad or loading a new sample can cancel scheduling without touching
+ * the armed mode.
+ */
+interface PadLoopState {
+  timer: number | null; // lookahead scheduler interval
+  nextAt: number | null; // audio time of the next iteration start
+  beats: number; // loop period, in master beats
+  spb: number; // last reference seconds-per-beat (fallback when no grid)
+  pending: { src: AudioBufferSourceNode; at: number }[]; // scheduled voices
 }
 
 /** Pads are one-shots: deck→sampler recordings cap at 30s with auto-stop. */
@@ -242,7 +258,7 @@ export class DJEngine {
   };
   private fxIrTimer: number | null = null;
 
-  // Sampler — 8 one-shot pads
+  // Sampler — 8 pads (one-shot by default, per-pad loop mode)
   private samplerBus!: GainNode;
   private samplerMaster!: GainNode;
   private samplerTrim!: GainNode;
@@ -254,9 +270,14 @@ export class DJEngine {
   private samplerCueGain!: GainNode;
   private samplerAnalyser!: AnalyserNode;
   pads: SamplerPad[] = Array.from({ length: 8 }, () => ({
-    buffer: null, name: '', volume: 0.8, source: null,
+    buffer: null, name: '', volume: 0.8, source: null, loop: false, looping: false,
   }));
   samplerQuantize = true; // default ON: pads launch quantized (checkbox defeats it)
+
+  /** Per-pad loop scheduler state (parallel to `pads`). */
+  private padLoops: PadLoopState[] = Array.from({ length: 8 }, () => ({
+    timer: null, nextAt: null, beats: 4, spb: 60 / 124, pending: [],
+  }));
 
   // Quantized launch (EDM sync feature): decks wait for the master grid.
   // 'bar' = drop on the next master bar with the slave on a downbeat (the
@@ -1795,9 +1816,12 @@ export class DJEngine {
 
   // ─── Sampler ────────────────────────────────────────────────────────────
 
-  /** Load an AudioBuffer into a pad. Returns false if index out of range. */
+  /** Load an AudioBuffer into a pad. Returns false if index out of range.
+   * A running loop is stopped (no further iterations scheduled) but a
+   * voice already sounding finishes its pass, matching one-shot loads. */
   loadSample(padIndex: number, buffer: AudioBuffer, name: string): boolean {
     if (padIndex < 0 || padIndex > 7 || !this.ctx) return false;
+    this.stopPadLoop(padIndex);
     const pad = this.pads[padIndex];
     pad.buffer = buffer;
     pad.name = name;
@@ -1819,10 +1843,12 @@ export class DJEngine {
   clearSample(padIndex: number): void {
     if (padIndex < 0 || padIndex > 7) return;
     const pad = this.pads[padIndex];
+    this.stopPadLoop(padIndex);
     try { pad.source?.stop(); } catch { /* already stopped */ }
     pad.source = null;
     pad.buffer = null;
     pad.name = '';
+    pad.loop = false;
   }
 
   setPadVolume(padIndex: number, v: number): void {
@@ -2031,11 +2057,25 @@ export class DJEngine {
 
 /** Trigger a pad. Retriggers if already playing. Quantize snaps to the
    * next master beat through the shared quantization hook (pads use beats
-   * so one-shots stay snappy; decks use bars). Default ON. */
+   * so one-shots stay snappy; decks use bars). Default ON.
+   *
+   * Loop mode: when the pad's loop flag is armed, triggering STARTS a
+   * repeating loop (first hit quantized like a one-shot); triggering
+   * again STOPS it — the voice already sounding finishes its pass and
+   * no further iterations are scheduled. Loop mode off = one-shot,
+   * exactly as before. */
   triggerSample(padIndex: number): boolean {
     if (!this.ctx || padIndex < 0 || padIndex > 7) return false;
     const pad = this.pads[padIndex];
     if (!pad.buffer) return false;
+
+    if (pad.loop) {
+      if (pad.looping) {
+        this.stopPadLoop(padIndex);
+        return true;
+      }
+      return this.startPadLoop(padIndex);
+    }
 
     // Retrigger: stop current voice
     try { pad.source?.stop(); } catch { /* already stopped */ }
@@ -2061,6 +2101,158 @@ export class DJEngine {
       pad.source = null;
       return false;
     }
+  }
+
+  /**
+   * Arm/disarm a pad's loop mode. Disarming a running loop stops it the
+   * same way as triggering the pad again: the current pass finishes,
+   * nothing new is scheduled. Arming never starts playback on its own
+   * (loops start only from a pad press, key, or MIDI — a user gesture).
+   */
+  setPadLoop(padIndex: number, on: boolean): void {
+    if (padIndex < 0 || padIndex > 7) return;
+    const pad = this.pads[padIndex];
+    pad.loop = on;
+    if (!on && pad.looping) this.stopPadLoop(padIndex);
+  }
+
+  /**
+   * Loop sync semantics (the honest version — no pitch change, no
+   * time-stretch; samples are plain BufferSources, not the WSOLA deck
+   * path, so the sample always plays at its natural pitch and speed):
+   *
+   * - The loop period is the sample's duration rounded to the nearest
+   *   whole number of master beats (1..32, Traktor loop sizes), measured
+   *   at the master tempo when the loop starts. A sample longer than
+   *   its period is cut at the period boundary; a shorter one leaves a
+   *   gap of silence until the next boundary. The raw sample is never
+   *   trimmed, padded, or re-pitched — only its restart points move.
+   * - Iteration starts are scheduled on master beat boundaries: the
+   *   first hit uses the same next-beat quantize as one-shots, and each
+   *   following start is re-anchored to the live master grid (the anchor
+   *   beat is rounded to the nearest whole master beat, so tempo moves
+   *   shift the next boundary instead of accumulating drift).
+   * - With no master deck playing, there is no grid to sync to: the
+   *   loop free-runs at the last-known tempo (fx.bpm, default 124) with
+   *   the same whole-beat period. Starting a deck and making it master
+   *   re-anchors the loop to that grid on the next boundary.
+   * - Stopping (pad tap, LOOP off, new sample, clear) finishes the
+   *   current pass: scheduled-but-unstarted iterations are cancelled,
+   *   the sounding voice plays to its end.
+   */
+  private startPadLoop(padIndex: number): boolean {
+    const pad = this.pads[padIndex];
+    if (!pad.buffer || pad.looping) return false;
+    const state = this.padLoops[padIndex];
+
+    const bpm = this.masterEffectiveBpm() || this.fx.bpm || 124;
+    state.spb = 60 / bpm;
+    state.beats = Math.min(32, Math.max(1, Math.round(pad.buffer.duration / state.spb)));
+
+    let when = this.ctx.currentTime;
+    if (this.samplerQuantize) {
+      const q = this.nextQuantizedAudioTime('beat');
+      if (q !== null) when = q;
+    }
+    when = Math.max(when, this.ctx.currentTime + 0.02);
+
+    pad.looping = true;
+    this.scheduleLoopVoice(padIndex, when);
+    state.nextAt = this.loopNextStart(when, state.beats, state.spb);
+    state.timer = window.setInterval(() => this.loopTick(padIndex), 50);
+    return true;
+  }
+
+  /** Schedule one loop iteration at an absolute audio time. */
+  private scheduleLoopVoice(padIndex: number, at: number): void {
+    const pad = this.pads[padIndex];
+    const state = this.padLoops[padIndex];
+    if (!pad.buffer) return;
+    const src = this.ctx.createBufferSource();
+    src.buffer = pad.buffer;
+    const g = this.ctx.createGain();
+    g.gain.value = pad.volume;
+    src.connect(g);
+    g.connect(this.samplerBus);
+    const entry = { src, at };
+    src.onended = () => {
+      const i = state.pending.indexOf(entry);
+      if (i >= 0) state.pending.splice(i, 1);
+      if (pad.source === src) pad.source = null;
+    };
+    state.pending.push(entry);
+    pad.source = src;
+    try {
+      src.start(at);
+    } catch {
+      const i = state.pending.indexOf(entry);
+      if (i >= 0) state.pending.splice(i, 1);
+    }
+  }
+
+  /** Lookahead tick: keep the next iteration scheduled ~0.3s ahead so
+   * a timer hiccup never leaves a gap, and so each boundary is computed
+   * from the freshest master-grid reading. */
+  private loopTick(padIndex: number): void {
+    const pad = this.pads[padIndex];
+    const state = this.padLoops[padIndex];
+    if (!pad.looping || !pad.buffer || state.nextAt === null) {
+      this.stopPadLoop(padIndex);
+      return;
+    }
+    const now = this.ctx.currentTime;
+    let guard = 0;
+    while (state.nextAt !== null && state.nextAt < now + 0.3 && guard++ < 4) {
+      const at: number = state.nextAt;
+      this.scheduleLoopVoice(padIndex, at);
+      const next = this.loopNextStart(at, state.beats, state.spb);
+      state.nextAt = next <= at ? at + state.beats * state.spb : next;
+    }
+  }
+
+  /**
+   * Audio time of the loop iteration `beats` master beats after the
+   * iteration that started at `prevStart`. With a master grid, the
+   * previous start is snapped to the nearest whole master beat first,
+   * which re-anchors the loop to the grid every period instead of
+   * letting tempo drift accumulate. Without a master, free-runs at
+   * the reference tempo.
+   */
+  private loopNextStart(prevStart: number, beats: number, spbFallback: number): number {
+    const now = this.ctx.currentTime;
+    const bpm = this.masterEffectiveBpm();
+    const mBeats = bpm > 0 ? this.masterBeats() : null;
+    if (mBeats === null) return prevStart + beats * spbFallback;
+    const spb = 60 / bpm;
+    const prevBeats = mBeats + (prevStart - now) / spb;
+    const anchorBeats = Math.round(prevBeats);
+    let next = now + (anchorBeats + beats - mBeats) * spb;
+    // A tempo move can push the computed start into the past; step
+    // forward whole periods until it is ahead of now.
+    while (next < now + 0.05) next += beats * spb;
+    return next;
+  }
+
+  /**
+   * Stop a pad's loop. The sounding voice finishes its pass; voices
+   * scheduled for the future are cancelled and the scheduler stops.
+   * Safe to call when the pad is not looping.
+   */
+  private stopPadLoop(padIndex: number): void {
+    const pad = this.pads[padIndex];
+    const state = this.padLoops[padIndex];
+    if (state.timer !== null) {
+      window.clearInterval(state.timer);
+      state.timer = null;
+    }
+    state.nextAt = null;
+    const now = this.ctx ? this.ctx.currentTime : 0;
+    for (const entry of state.pending) {
+      if (entry.at > now + 0.005) {
+        try { entry.src.stop(); } catch { /* already stopped */ }
+      }
+    }
+    pad.looping = false;
   }
 
   // ─── Devices ──────────────────────────────────────────────────────────────

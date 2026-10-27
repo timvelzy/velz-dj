@@ -9,6 +9,8 @@ interface PadUIState {
   loaded: boolean;
   volume: number;
   flashing: boolean;
+  loop: boolean; // loop mode armed
+  looping: boolean; // loop currently playing
 }
 
 function renderMiniWaveform(buffer: AudioBuffer, canvas: HTMLCanvasElement) {
@@ -32,13 +34,14 @@ function renderMiniWaveform(buffer: AudioBuffer, canvas: HTMLCanvasElement) {
   }
 }
 
-function Pad({ index, state, onTrigger, onLoad, onClear, onVolume }: {
+function Pad({ index, state, onTrigger, onLoad, onClear, onVolume, onToggleLoop }: {
   index: number;
   state: PadUIState;
   onTrigger: () => void;
   onLoad: (file: File) => void;
   onClear: () => void;
   onVolume: (v: number) => void;
+  onToggleLoop: () => void;
 }) {
   const fileRef = useRef<HTMLInputElement>(null);
   const waveRef = useRef<HTMLCanvasElement>(null);
@@ -54,15 +57,23 @@ function Pad({ index, state, onTrigger, onLoad, onClear, onVolume }: {
   return (
     <div
       className={`relative rounded-lg border p-1.5 select-none transition-colors ${
-        state.flashing
-          ? 'bg-cyan-500/40 border-cyan-300'
-          : state.loaded
-            ? 'bg-zinc-800 border-zinc-600 hover:border-cyan-400 cursor-pointer'
-            : 'bg-zinc-900 border-zinc-700 border-dashed hover:border-zinc-500 cursor-pointer'
+        state.looping
+          ? 'bg-emerald-500/25 border-emerald-400'
+          : state.flashing
+            ? 'bg-cyan-500/40 border-cyan-300'
+            : state.loaded
+              ? 'bg-zinc-800 border-zinc-600 hover:border-cyan-400 cursor-pointer'
+              : 'bg-zinc-900 border-zinc-700 border-dashed hover:border-zinc-500 cursor-pointer'
       }`}
       onClick={() => (state.loaded ? onTrigger() : fileRef.current?.click())}
       onContextMenu={(e) => { e.preventDefault(); if (state.loaded) onClear(); }}
-      title={state.loaded ? `${state.name} — right-click to clear` : 'Click to load sample'}
+      title={state.loaded
+        ? state.looping
+          ? `${state.name} — looping in sync, click to stop (finishes the pass)`
+          : state.loop
+            ? `${state.name} — loop armed, click to start the loop; right-click to clear`
+            : `${state.name} — right-click to clear`
+        : 'Click to load sample'}
     >
       <input
         ref={fileRef}
@@ -86,12 +97,27 @@ function Pad({ index, state, onTrigger, onLoad, onClear, onVolume }: {
       <div className="flex items-center justify-between mt-1">
         <span className="text-[9px] text-zinc-500 font-mono">key {PAD_KEYS[index]}</span>
         {state.loaded && (
-          <button
-            className="text-[9px] text-zinc-500 hover:text-cyan-300 font-mono"
-            onClick={(e) => { e.stopPropagation(); setShowVol(!showVol); }}
-          >
-            vol
-          </button>
+          <span className="flex items-center gap-1">
+            <button
+              className={`text-[9px] font-mono px-1 rounded border ${
+                state.looping
+                  ? 'text-emerald-300 border-emerald-400 bg-emerald-500/20 animate-pulse'
+                  : state.loop
+                    ? 'text-cyan-300 border-cyan-500/60 bg-cyan-500/10'
+                    : 'text-zinc-500 border-zinc-700 hover:text-cyan-300'
+              }`}
+              onClick={(e) => { e.stopPropagation(); onToggleLoop(); }}
+              title="Loop mode: the pad repeats in sync with the master grid. Tap the pad to start, tap again to stop (finishes the pass)."
+            >
+              LOOP
+            </button>
+            <button
+              className="text-[9px] text-zinc-500 hover:text-cyan-300 font-mono"
+              onClick={(e) => { e.stopPropagation(); setShowVol(!showVol); }}
+            >
+              vol
+            </button>
+          </span>
         )}
       </div>
       {showVol && state.loaded && (
@@ -108,7 +134,7 @@ function Pad({ index, state, onTrigger, onLoad, onClear, onVolume }: {
 
 export default function Sampler() {
   const [pads, setPads] = useState<PadUIState[]>(
-    Array.from({ length: 8 }, () => ({ name: '', loaded: false, volume: 0.8, flashing: false }))
+    Array.from({ length: 8 }, () => ({ name: '', loaded: false, volume: 0.8, flashing: false, loop: false, looping: false }))
   );
   // Quantize defaults ON (EDM sync feature): pads drop on the next master
   // beat. The checkbox defeats it for manual triggering.
@@ -132,8 +158,15 @@ export default function Sampler() {
   const refreshPad = useCallback((i: number) => {
     const p = engine.pads[i];
     setPads((prev) => {
+      const cur = prev[i];
+      // No-op when nothing changed, so the 250ms loop-state poll below
+      // never forces a re-render on its own.
+      if (
+        cur.name === p.name && cur.loaded === !!p.buffer && cur.volume === p.volume
+        && cur.loop === p.loop && cur.looping === p.looping
+      ) return prev;
       const next = [...prev];
-      next[i] = { ...next[i], name: p.name, loaded: !!p.buffer, volume: p.volume };
+      next[i] = { ...next[i], name: p.name, loaded: !!p.buffer, volume: p.volume, loop: p.loop, looping: p.looping };
       return next;
     });
   }, []);
@@ -170,6 +203,20 @@ export default function Sampler() {
   const setVol = useCallback((i: number, v: number) => {
     engine.setPadVolume(i, v);
     refreshPad(i);
+  }, [refreshPad]);
+
+  const toggleLoop = useCallback((i: number) => {
+    engine.setPadLoop(i, !engine.pads[i].loop);
+    refreshPad(i);
+  }, [refreshPad]);
+
+  // Loop state can change from MIDI (pad tap / LOOP toggle), so sync the
+  // armed/looping flags on a slow poll, like the REC elapsed clock.
+  useEffect(() => {
+    const t = window.setInterval(() => {
+      for (let i = 0; i < 8; i++) refreshPad(i);
+    }, 250);
+    return () => window.clearInterval(t);
   }, [refreshPad]);
 
   const startRec = useCallback(() => {
@@ -256,8 +303,15 @@ export default function Sampler() {
         });
       },
     });
-    return () => { cleanups.forEach((c) => c()); volCleanups.forEach((c) => c()); qCleanup(); };
-  }, [trigger, setVol]);
+    // MIDI-learnable per-pad LOOP arm/disarm (same Learn-All panel).
+    const loopCleanups = PAD_KEYS.map((_, i) =>
+      midi.registerControl(`sampler.pad${i + 1}.loop`, {
+        kind: 'button',
+        onButton: (pressed) => { if (pressed) toggleLoop(i); },
+      })
+    );
+    return () => { cleanups.forEach((c) => c()); volCleanups.forEach((c) => c()); qCleanup(); loopCleanups.forEach((c) => c()); };
+  }, [trigger, setVol, toggleLoop]);
 
   // MIDI — record-from-deck toggle: same paths as the REC / STOP buttons,
   // using the current recDeck / recPad selections (via refs in startRec).
@@ -318,7 +372,7 @@ export default function Sampler() {
           </label>
           {/* Channel volume + mute live on the sampler strip in the
               mixer now (single control, no competing VOL here). */}
-          <span className="text-[10px] font-mono text-zinc-600">VOL + MUTE on mixer strip</span>
+          <span className="text-[10px] font-mono text-zinc-600">VOL + MUTE on mixer strip · LOOP on a pad: tap pad to start, tap again to stop</span>
         </div>
       </div>
       {/* Record from a playing deck into a pad. Tap is parallel to the
@@ -386,6 +440,7 @@ export default function Sampler() {
               onLoad={(f) => load(i, f)}
               onClear={() => clear(i)}
               onVolume={(v) => setVol(i, v)}
+              onToggleLoop={() => toggleLoop(i)}
             />
           </div>
         ))}

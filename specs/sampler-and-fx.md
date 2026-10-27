@@ -46,8 +46,23 @@ getPadState(padIndex: number): { loaded: boolean; name: string; volume: number }
 - `sampler.pad[N]` — note on triggers pad (velocity → volume).
 - Follows the existing `midi.registerControl` pattern in `src/midi.ts`.
 
+### Loop mode (implemented 2026-10-27)
+- Per-pad LOOP arm/disarm (UI button, keyboard via pad key, MIDI-learnable
+  `sampler.pad[N].loop`). Tapping a loop-armed pad starts the loop;
+  tapping again stops it — the sounding pass finishes, nothing new is
+  scheduled. One-shot behavior is unchanged when loop is off.
+- Sync: the loop period is the sample duration rounded to the nearest
+  whole master beats (1–32). Iteration starts land on master beat
+  boundaries (first hit uses the existing next-beat quantize; each
+  following start is re-anchored to the live master grid). No pitch
+  change, no time-stretch: a sample longer than its period is cut at
+  the boundary, a shorter one leaves silence until the next boundary.
+  With no master playing, the loop free-runs at the last-known tempo
+  (fx.bpm, default 124). Pad volume + sampler master/EQ/filter/FX send
+  apply exactly as for one-shots.
+
 ### Out of scope (V2)
-- Loop mode per pad, pitch control, capture-from-deck, sample slicing.
+- Pitch control, sample slicing. (Loop mode and capture-from-deck are now implemented.)
 
 ---
 
