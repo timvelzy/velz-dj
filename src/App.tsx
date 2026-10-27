@@ -56,6 +56,14 @@ import {
   saveLibraryRecord,
 } from './audio/libraryStore';
 import {
+  SEED_MANIFEST_VERSION,
+  SEED_TRACKS,
+  getSeededVersion,
+  runSeeding,
+  seedPlaceholder,
+  setSeededVersion,
+} from './audio/seedTracks';
+import {
   deletePlaylist,
   loadPlaylists,
   renamePlaylist,
@@ -284,7 +292,47 @@ export default function App() {
     let cancelled = false;
     loadLibraryRecords()
       .then((restored) => {
-        if (!cancelled && restored.length) setTracks(restored);
+        if (cancelled) return;
+        // Bundled Velz seeds: placeholder rows land with the restored
+        // library immediately; each seed's fetch + analysis runs in the
+        // background and swaps its row for the saved record when done.
+        // Provisioning is version-gated (see seedTracks.ts): a seed the
+        // user deleted stays deleted until the manifest version bumps.
+        const existing = new Set(restored.map((t) => t.fileKey).filter((k): k is string => Boolean(k)));
+        const pending =
+          getSeededVersion() === SEED_MANIFEST_VERSION
+            ? []
+            : SEED_TRACKS.filter((def) => !existing.has(def.fileKey));
+        const merged = [...restored, ...pending.map(seedPlaceholder)];
+        merged.sort((a, b) => a.title.localeCompare(b.title));
+        setTracks(merged);
+        if (!pending.length) {
+          if (getSeededVersion() !== SEED_MANIFEST_VERSION) setSeededVersion(SEED_MANIFEST_VERSION);
+          return;
+        }
+        void runSeeding(existing, {
+          onProgress: (fileKey, p) => {
+            if (cancelled) return;
+            setTracks((ts) => ts.map((t) => (t.fileKey === fileKey ? { ...t, analysisProgress: p } : t)));
+          },
+          onReady: (track) => {
+            if (cancelled) return;
+            // A placeholder removed mid-seed stays removed.
+            if (!tracksRef.current.some((t) => t.fileKey === track.fileKey)) return;
+            setTracks((ts) =>
+              [...ts.filter((t) => t.fileKey !== track.fileKey), track].sort((a, b) =>
+                a.title.localeCompare(b.title),
+              ),
+            );
+          },
+          onError: (fileKey, fileName, error) => {
+            if (cancelled) return;
+            setTracks((ts) => ts.filter((t) => t.fileKey !== fileKey));
+            noteLibrarySaveError(fileName, error);
+          },
+        }).then((ok) => {
+          if (ok && !cancelled) setSeededVersion(SEED_MANIFEST_VERSION);
+        });
       })
       .catch((e) => console.warn('Saved library restore failed', e));
     return () => {
