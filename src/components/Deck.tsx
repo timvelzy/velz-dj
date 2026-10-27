@@ -588,7 +588,7 @@ export default function Deck(props: DeckProps) {
         <button
           onClick={props.onToggleQuantize}
           className={`h-8 rounded px-2.5 text-xs font-bold ${state.quantize ? 'bg-violet-600 text-white' : 'bg-zinc-800 text-zinc-500'}`}
-          title="Quantize: Play/CUE launches drop on the master bar, hotcue jumps and loop points snap to the beat grid (off = manual control)"
+          title="Quantize: CUE launches drop on the master bar; Play with SYNC starts at once and slews into phase; hotcue jumps and loop points snap to the beat grid (off = manual control)"
           aria-label="Quantize on or off"
         >
           QTZ

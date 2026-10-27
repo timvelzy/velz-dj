@@ -55,6 +55,13 @@ export interface DeckNodes {
   /** Round-5 consecutive 50ms sync ticks with |phase| ≤ 30ms; LOCKED
    *  requires a sustained streak, not one lucky poll (see syncStatus). */
   syncLockStreak: number;
+  /** Catch-up slew deadline (ctx time; 0 = inactive). Armed by an
+   *  immediate sync launch (see playQuantized): while armed, syncTick
+   *  slews the tempo harder than the holding PLL so a press-timing
+   *  phase error converges within about a bar instead of many seconds.
+   *  Disarmed on pause, on sync-off, when the error reaches the lock
+   *  window, or when the deadline passes — whichever comes first. */
+  catchupUntil: number;
   nudge: number; // momentary pitch bend, e.g. ±0.05
   nudgeDeadline: number; // ctx time after which a nudge auto-expires (anti-latch)
   keyLock: boolean;
@@ -94,6 +101,25 @@ export function phaseErrorBeats(masterBeats: number, slaveBeats: number, range =
  */
 export function pllCorrection(errBeats: number, integral: number): number {
   return clamp(1 - errBeats * 0.25 - integral, 0.97, 1.03);
+}
+
+/**
+ * Catch-up slew correction for an immediate sync launch (see
+ * playQuantized): a stronger proportional term than the holding PLL,
+ * so a phase error left by starting exactly where the DJ pressed
+ * converges fast instead of lingering for many seconds. Gain
+ * 0.5/beat with a hard ±8% cap — the same order as the manual jog
+ * bend (±6%) and hold-to-bend (±5%), so the worklet never sees a
+ * bigger step than a DJ nudge. Convergence: at the cap, phase closes
+ * at 0.08 beats per master beat, so a typical press-timing error
+ * (≤0.25 beats) is gone in about a bar; the proportional gain then
+ * tails the correction smoothly to 1 as the error vanishes, so
+ * handing back to the holding PLL is stepless. A full-bar error
+ * (2 beats wrapped) takes as long as the cap allows — deliberately
+ * never a position jump. Pure — extracted for reasoning/tests.
+ */
+export function catchupCorrection(errBeats: number): number {
+  return clamp(1 - errBeats * 0.5, 0.92, 1.08);
 }
 
 /**
@@ -772,7 +798,7 @@ export class DJEngine {
       buffer: null,
       grid: null,
       posBase: 0, posBaseTime: ctx.currentTime, posRate: 1, pendingStartAt: null,
-      userTempo: 1, syncBaseTempo: 1, syncCorr: 1, syncInt: 0, syncFollowSm: 1, syncLockStreak: 0, nudge: 0, nudgeDeadline: 0,
+      userTempo: 1, syncBaseTempo: 1, syncCorr: 1, syncInt: 0, syncFollowSm: 1, syncLockStreak: 0, catchupUntil: 0, nudge: 0, nudgeDeadline: 0,
       keyLock: true,
       syncOn: false,
       loopStart: null, loopEnd: null,
@@ -907,6 +933,7 @@ export class DJEngine {
     d.source.disconnect();
     d.source = null;
     d.pendingStartAt = null; // also cancels a queued quantized launch
+    d.catchupUntil = 0; // a paused deck never resumes a stale catch-up slew
     d.posBaseTime = this.ctx.currentTime;
     d.nudge = 0; // momentary bend never survives a pause
     d.nudgeDeadline = 0;
@@ -996,6 +1023,7 @@ export class DJEngine {
       d.syncLockStreak = 0;
       d.syncCorr = 1;
       d.syncInt = 0;
+      d.catchupUntil = 0;
       this.applyTempo(d);
     } else {
       // Release: keep current effective tempo as the user tempo
@@ -1003,6 +1031,7 @@ export class DJEngine {
       d.syncCorr = 1;
       d.syncInt = 0;
       d.syncLockStreak = 0;
+      d.catchupUntil = 0;
       this.applyTempo(d);
     }
   }
@@ -1205,20 +1234,46 @@ export class DJEngine {
       const errMs = (err * 60) / mBpm * 1000;
       // Deadband: sub-2.5ms error counts as locked, never churns tempo.
       const errCtl = Math.abs(err) < 0.005 ? 0 : err;
-      // Integral term: absorbs steady-state rate mismatch so it dies
-      // instead of lingering. Round 5: clamp widened 0.5% → 1% (with the
-      // old 0.5% clamp and P = 0.25, a 1% residual mismatch still left
-      // ~10ms standing error — (1% − 0.5%) / 0.25 = 0.02 beats ≈ 10ms
-      // at 123 BPM — and 1.5% left ~20ms; mismatches up to 1% are now
-      // fully absorbed), with the per-tick step clamped so the
-      // integral can only slew 2%/s — no audible rate jumps from the
-      // integrator itself.
-      const dInt = clamp(errCtl * 0.004, -0.001, 0.001);
-      d.syncInt = clamp(d.syncInt + dInt, -0.01, 0.01);
-      const corr = pllCorrection(errCtl, d.syncInt);
-      if (Math.abs(corr - d.syncCorr) > 0.0002) {
-        d.syncCorr = corr;
-        changed = true;
+      // Catch-up slew (armed by an immediate sync launch): while armed,
+      // the phase error is closed with a stronger bounded correction
+      // instead of the holding PLL's ±3% — a press-timing error is gone
+      // in about a bar. The integral stays frozen at 0 so it cannot
+      // wind up during the slew, and the proportional gain tails the
+      // correction to 1 as the error vanishes, so the handover back
+      // to the holding PLL is stepless. Disarm at the lock window or
+      // at the deadline; a huge error simply converges as fast as the
+      // ±8% cap allows — the playhead is never jumped.
+      const catchupArmed = d.catchupUntil > 0 && now < d.catchupUntil;
+      if (catchupArmed && Math.abs(errMs) <= 30) {
+        d.catchupUntil = 0;
+        d.syncInt = 0;
+      }
+      if (d.catchupUntil > 0 && now < d.catchupUntil) {
+        const target = catchupCorrection(errCtl);
+        // Slew limit: 0.5% per 50ms tick (10%/s) — full ±8% authority
+        // in 0.8s, gentle for the worklet, far inside a bar at any tempo.
+        const next = d.syncCorr + clamp(target - d.syncCorr, -0.005, 0.005);
+        if (Math.abs(next - d.syncCorr) > 0.0002) {
+          d.syncCorr = next;
+          changed = true;
+        }
+      } else {
+        if (d.catchupUntil > 0) d.catchupUntil = 0; // deadline passed
+        // Integral term: absorbs steady-state rate mismatch so it dies
+        // instead of lingering. Round 5: clamp widened 0.5% → 1% (with the
+        // old 0.5% clamp and P = 0.25, a 1% residual mismatch still left
+        // ~10ms standing error — (1% − 0.5%) / 0.25 = 0.02 beats ≈ 10ms
+        // at 123 BPM — and 1.5% left ~20ms; mismatches up to 1% are now
+        // fully absorbed), with the per-tick step clamped so the
+        // integral can only slew 2%/s — no audible rate jumps from the
+        // integrator itself.
+        const dInt = clamp(errCtl * 0.004, -0.001, 0.001);
+        d.syncInt = clamp(d.syncInt + dInt, -0.01, 0.01);
+        const corr = pllCorrection(errCtl, d.syncInt);
+        if (Math.abs(corr - d.syncCorr) > 0.0002) {
+          d.syncCorr = corr;
+          changed = true;
+        }
       }
       // Lock streak (round 5): LOCKED is a sustained claim, not one
       // lucky poll. 10 consecutive ticks (500ms) inside ±30ms — the
@@ -1308,6 +1363,31 @@ export class DJEngine {
   }
 
   /**
+   * Arm the catch-up slew for an immediate sync launch: re-match the
+   * tempo against the slave's local BPM at the launch position (the
+   * same snap setSync does, so the first ticks don't glide from a
+   * stale ratio), freeze the PLL integral, reset the lock streak, and
+   * set the deadline — 32 master beats (8 bars), clamped to [2s, 16s],
+   * long enough for even a full-bar error to close at the ±8% cap;
+   * typical press-timing errors disarm at the lock window in ~a bar.
+   * Called before play() so the first applyTempo already uses the
+   * matched tempo. The slew itself lives in syncTick.
+   */
+  private armCatchup(d: DeckNodes): void {
+    const mBpm = this.masterEffectiveBpm();
+    if (mBpm && d.grid && d.grid.bpm > 0) {
+      const slaveBpm = this.bpmAtPosition(d, this.position(d.id));
+      d.syncBaseTempo = clamp(mBpm / slaveBpm, 0.5, 2);
+    }
+    d.syncFollowSm = d.syncBaseTempo;
+    d.syncInt = 0;
+    d.syncCorr = 1;
+    d.syncLockStreak = 0;
+    const spb = mBpm > 0 ? 60 / mBpm : 0.5;
+    d.catchupUntil = this.ctx.currentTime + clamp(32 * spb, 2, 16);
+  }
+
+  /**
    * EDM quantized launch — the single hook for deck Play and CUE starts.
    * When launchQuantize is on and a master deck is playing, the deck does
    * NOT start mid-beat: it waits for the master's next bar boundary
@@ -1319,13 +1399,33 @@ export class DJEngine {
    * until the start time passes. Returns the scheduled audio time, or
    * null when the deck has no buffer. The caller (App) gates this on the
    * deck's Q toggle, so Q off always means manual, immediate control.
+   *
+   * Immediate sync launch: when the caller passes immediateSync (deck
+   * Play presses only — CUE previews and autopilot drops never do) and
+   * the deck has SYNC on with a master playing, the deck instead starts
+   * AT ONCE from the pressed offset, with no bar wait and no downbeat
+   * snap, and the catch-up slew converges phase within about a bar.
+   * This is the default SYNC Play behavior; the bar-quantized path
+   * below is unchanged and still serves CUE, autopilot, and sync-off
+   * launches.
    */
-  playQuantized(id: string, opts?: { offset?: number }): number | null {
+  playQuantized(id: string, opts?: { offset?: number; immediateSync?: boolean }): number | null {
     const d = this.decks.get(id);
     if (!d || !d.buffer) return null;
     const offset = opts?.offset ?? d.posBase;
     const masterPlaying = this.masterDeckId !== null && this.masterDeckId !== id
       && this.isPlaying(this.masterDeckId) && this.masterBeats() !== null;
+    // Immediate sync launch (see docstring): start at once from the
+    // pressed offset — no bar wait, no downbeat snap. The catch-up
+    // slew does the syncing after the start instead of the wait doing
+    // it before. SYNC off, no master, or no usable grid on the slave
+    // falls through to the existing behavior untouched.
+    if (opts?.immediateSync && d.syncOn && masterPlaying && d.grid && d.grid.bpm > 0) {
+      this.armCatchup(d);
+      this.play(id, { offset });
+      debugLog('transport', 'immediate sync launch', id, { offset });
+      return this.ctx.currentTime;
+    }
     if (this.launchQuantize === 'off' || !masterPlaying) {
       this.play(id, { offset });
       return this.ctx.currentTime;

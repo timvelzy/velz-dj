@@ -1067,11 +1067,13 @@ export default function App() {
       engine.pause(deckId);
     } else {
       const st = deckState(deckKey);
-      // Quantized launch (EDM sync): with Q on, Play waits for the
-      // master's next bar and drops on a downbeat instead of starting
-      // mid-beat. Q off = the old immediate start.
+      // Quantized launch: with Q on and SYNC on, Play starts at once
+      // from the pressed position and the catch-up slew converges
+      // phase within about a bar (immediateSync). Otherwise Q on
+      // waits for the master's next bar and drops on a downbeat.
+      // Q off = the old immediate start (bar-aligned when sync is on).
       if (st.quantize) {
-        engine.playQuantized(deckId);
+        engine.playQuantized(deckId, { immediateSync: true });
       } else {
         const align = st.syncActive && masterDeck !== null && masterDeck !== deckId;
         engine.play(deckId, { alignToMaster: align });
@@ -3839,7 +3841,7 @@ export default function App() {
             <li><span className="text-zinc-200">Press SYNC on the deck that joins.</span> The MASTER deck sets the tempo; the other deck follows it and holds phase.</li>
             <li><span className="text-zinc-200">Watch the PHASE meter</span> in the sync view. Near zero means the downbeats line up. If it walks, the beat grids disagree.</li>
             <li><span className="text-zinc-200">Beats still drifting?</span> Check the grid confidence under the waveform. If the downbeat is off, pause on a downbeat and hit the 1.1 button to re-anchor the grid.</li>
-            <li><span className="text-zinc-200">QTZ on means Play and CUE drop on the next bar.</span> Turn QTZ off for manual, off-grid starts.</li>
+            <li><span className="text-zinc-200">QTZ on means CUE drops on the next bar, and Play with SYNC starts at once, then slews into phase within about a bar.</span> Turn QTZ off for manual, off-grid starts.</li>
             <li><span className="text-zinc-200">Blend with the crossfader and the EQs.</span> Cut the bass on the incoming deck, swap the basses at the drop, then move the crossfader across. Loops: pick a bar size, and Loop out keeps playing from the playhead.</li>
           </ol>
         </div>
