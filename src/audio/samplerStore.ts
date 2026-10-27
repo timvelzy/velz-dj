@@ -13,8 +13,9 @@
  * IndexedDB directly); restore decodes the bytes in an
  * OfflineAudioContext and stages the buffer onto the pad before the
  * first user gesture creates the live AudioContext. Trim offsets,
- * volume, and the loop-arm flag travel with the sample record, so a
- * trimmed, loop-armed pad comes back exactly as it was left.
+ * volume, the loop-arm flag, the per-pad EQ, and the LIVE trigger
+ * choice travel with the sample record, so a trimmed, EQ'd,
+ * loop-armed pad comes back exactly as it was left.
  *
  * Sampler seed provisioning is version-gated independently of the
  * track-library seeds: bumping one manifest never re-seeds the other.
@@ -39,6 +40,11 @@ export interface StoredSamplerPad {
   /** Loop mode armed (repeats in sync when triggered). Armed only —
       nothing plays until the user taps the pad, a key, or MIDI. */
   loop: boolean;
+  /** Per-pad 3-band EQ, dB, ±12. Optional: records saved before EQ
+      existed have no field and restore flat. */
+  eq?: { low: number; mid: number; high: number };
+  /** LIVE trigger choice. Optional: missing restores as off. */
+  live?: boolean;
   savedAt: string; // ISO
 }
 

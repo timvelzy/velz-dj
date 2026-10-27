@@ -186,6 +186,8 @@ export interface SamplerPad {
   looping: boolean; // a loop is currently playing (UI-readable)
   trimStart: number; // seconds: non-destructive trim region start (0 = full)
   trimEnd: number; // seconds: non-destructive trim region end (duration = full)
+  eq: { low: number; mid: number; high: number }; // per-pad 3-band EQ, dB, ±12, flat 0
+  live: boolean; // LIVE trigger: first hit starts at once, bypassing quantize
 }
 
 /**
@@ -271,9 +273,13 @@ export class DJEngine {
   private samplerFxSend!: GainNode;
   private samplerCueGain!: GainNode;
   private samplerAnalyser!: AnalyserNode;
+  /** Per-pad 3-band EQ chains (persistent nodes ahead of samplerBus,
+   * so EQ tweaks apply to voices already sounding as well as new
+   * ones). Created in init(); empty until then. */
+  private padEqNodes: { low: BiquadFilterNode; mid: BiquadFilterNode; high: BiquadFilterNode }[] = [];
   pads: SamplerPad[] = Array.from({ length: 8 }, () => ({
     buffer: null, name: '', volume: 0.8, source: null, loop: false, looping: false,
-    trimStart: 0, trimEnd: 0,
+    trimStart: 0, trimEnd: 0, eq: { low: 0, mid: 0, high: 0 }, live: false,
   }));
   samplerQuantize = true; // default ON: pads launch quantized (checkbox defeats it)
 
@@ -369,6 +375,25 @@ export class DJEngine {
     this.samplerAnalyser = this.ctx.createAnalyser();
     this.samplerAnalyser.fftSize = 256;
     this.samplerMaster.connect(this.samplerAnalyser);
+
+    // Per-pad 3-band EQ (quick-menu EQ, 2026-10-27): one persistent
+    // lowshelf/peaking/highshelf chain per pad, ahead of samplerBus,
+    // same frequencies/Q as the shared sampler EQ. Stored pad EQ
+    // values (e.g. restored from IndexedDB) are applied to the nodes
+    // here so the order of restore vs init can't lose them.
+    for (let i = 0; i < 8; i++) {
+      const low = this.ctx.createBiquadFilter();
+      low.type = 'lowshelf'; low.frequency.value = 200;
+      const mid = this.ctx.createBiquadFilter();
+      mid.type = 'peaking'; mid.frequency.value = 1000; mid.Q.value = 1;
+      const high = this.ctx.createBiquadFilter();
+      high.type = 'highshelf'; high.frequency.value = 3000;
+      low.connect(mid);
+      mid.connect(high);
+      high.connect(this.samplerBus);
+      this.padEqNodes.push({ low, mid, high });
+      this.applyPadEqToNodes(i);
+    }
 
     // Master limiter (Phase 3): the old −18 dB / 12:1 settings were a gentle
     // bus compressor that still let summed decks clip the output (and any
@@ -1830,6 +1855,11 @@ export class DJEngine {
     pad.name = name;
     pad.trimStart = 0;
     pad.trimEnd = buffer.duration;
+    // A new sample starts fresh: flat EQ, LIVE off (the previous
+    // sample's settings don't carry over).
+    pad.eq = { low: 0, mid: 0, high: 0 };
+    pad.live = false;
+    this.applyPadEqToNodes(padIndex);
     return true;
   }
 
@@ -1878,11 +1908,66 @@ export class DJEngine {
     pad.loop = false;
     pad.trimStart = 0;
     pad.trimEnd = 0;
+    pad.eq = { low: 0, mid: 0, high: 0 };
+    pad.live = false;
+    this.applyPadEqToNodes(padIndex);
   }
 
   setPadVolume(padIndex: number, v: number): void {
     if (padIndex < 0 || padIndex > 7) return;
     this.pads[padIndex].volume = Math.min(1, Math.max(0, v));
+  }
+
+  /** Per-pad 3-band EQ (dB, ±12, flat 0). Applies immediately to
+   * sounding voices (persistent per-pad filter chain) and every
+   * future voice. Composes with the shared sampler master EQ/filter:
+   * pad EQ first, then the sampler channel chain. */
+  setPadEq(padIndex: number, low: number, mid: number, high: number): void {
+    if (padIndex < 0 || padIndex > 7) return;
+    const pad = this.pads[padIndex];
+    pad.eq = {
+      low: clamp(Number.isFinite(low) ? low : 0, -12, 12),
+      mid: clamp(Number.isFinite(mid) ? mid : 0, -12, 12),
+      high: clamp(Number.isFinite(high) ? high : 0, -12, 12),
+    };
+    this.applyPadEqToNodes(padIndex);
+  }
+
+  resetPadEq(padIndex: number): void {
+    if (padIndex < 0 || padIndex > 7) return;
+    this.setPadEq(padIndex, 0, 0, 0);
+  }
+
+  /** Push the pad's stored EQ values into its persistent filter
+   * nodes. No-op before init (no nodes yet); init() applies stored
+   * values after creating the chains. */
+  private applyPadEqToNodes(padIndex: number): void {
+    const nodes = this.padEqNodes[padIndex];
+    const pad = this.pads[padIndex];
+    if (!nodes || !pad || !this.ctx) return;
+    const t = this.ctx.currentTime;
+    nodes.low.gain.setTargetAtTime(pad.eq.low, t, 0.02);
+    nodes.mid.gain.setTargetAtTime(pad.eq.mid, t, 0.02);
+    nodes.high.gain.setTargetAtTime(pad.eq.high, t, 0.02);
+  }
+
+  /** Per-pad voice path: voice gain → per-pad EQ → samplerBus. Falls
+   * back to a direct samplerBus connection before init (no EQ nodes
+   * yet) so early triggers still sound. */
+  private connectPadVoice(padIndex: number, src: AudioBufferSourceNode, g: GainNode): void {
+    const eq = this.padEqNodes[padIndex];
+    src.connect(g);
+    if (eq) g.connect(eq.low);
+    else g.connect(this.samplerBus);
+  }
+
+  /** LIVE trigger: when on, this pad's first hit starts at once,
+   * bypassing the global quantize wait; loop iterations after the
+   * first still lock to the live master grid. Default off (current
+   * quantized behavior is preserved). */
+  setPadLive(padIndex: number, on: boolean): void {
+    if (padIndex < 0 || padIndex > 7) return;
+    this.pads[padIndex].live = on;
   }
 
   /**
@@ -1892,8 +1977,8 @@ export class DJEngine {
    * 10ms region is enforced, so invalid input can never crash or
    * permanently silence a pad. A trim change applies to the next
    * trigger / next loop iteration; a voice already sounding is never
-   * rewritten. Trim lives in memory with the sample itself — pads are
-   * not persisted across reloads, so neither is trim.
+   * rewritten. Trim persists with the pad record (IndexedDB, see
+   * samplerStore.ts) and is restored on reload.
    */
   setPadTrim(padIndex: number, start: number, end: number): void {
     if (padIndex < 0 || padIndex > 7) return;
@@ -2148,7 +2233,9 @@ export class DJEngine {
 
 /** Trigger a pad. Retriggers if already playing. Quantize snaps to the
    * next master beat through the shared quantization hook (pads use beats
-   * so one-shots stay snappy; decks use bars). Default ON.
+   * so one-shots stay snappy; decks use bars). Default ON. A pad with
+   * LIVE on skips the quantize wait and starts at once (loop
+   * iterations after the first still lock to the grid).
    *
    * Loop mode: when the pad's loop flag is armed, triggering STARTS a
    * repeating loop (first hit quantized like a one-shot); triggering
@@ -2172,7 +2259,11 @@ export class DJEngine {
     try { pad.source?.stop(); } catch { /* already stopped */ }
 
     let when = this.ctx.currentTime;
-    if (this.samplerQuantize) {
+    // LIVE pads start at once; everything else waits for the next
+    // master beat when quantize is on (the wait is the whole beat
+    // when a master grid is running — that is the "lag" feel, and
+    // LIVE is the opt-out for it).
+    if (this.samplerQuantize && !pad.live) {
       const q = this.nextQuantizedAudioTime('beat');
       if (q !== null) when = q;
     }
@@ -2182,8 +2273,7 @@ export class DJEngine {
     src.buffer = pad.buffer;
     const g = this.ctx.createGain();
     this.fadeVoiceGain(g, when, pad.volume, region.duration);
-    src.connect(g);
-    g.connect(this.samplerBus);
+    this.connectPadVoice(padIndex, src, g);
     src.onended = () => { if (pad.source === src) pad.source = null; };
     pad.source = src;
     try {
@@ -2233,6 +2323,9 @@ export class DJEngine {
    * - Stopping (pad tap, LOOP off, new sample, clear) finishes the
    *   current pass: scheduled-but-unstarted iterations are cancelled,
    *   the sounding voice plays to its end.
+   * - LIVE (per-pad, quick menu): the first hit starts at once,
+   *   bypassing the quantize wait; every iteration after the first
+   *   still locks to the live master grid via loopTick.
    */
   private startPadLoop(padIndex: number): boolean {
     const pad = this.pads[padIndex];
@@ -2244,7 +2337,9 @@ export class DJEngine {
     state.beats = this.padTrimPeriodBeats(pad, state.spb);
 
     let when = this.ctx.currentTime;
-    if (this.samplerQuantize) {
+    // LIVE: the first hit starts at once; following iterations lock
+    // to the grid via loopTick regardless.
+    if (this.samplerQuantize && !pad.live) {
       const q = this.nextQuantizedAudioTime('beat');
       if (q !== null) when = q;
     }
@@ -2276,8 +2371,7 @@ export class DJEngine {
     src.buffer = pad.buffer;
     const g = this.ctx.createGain();
     this.fadeVoiceGain(g, at, pad.volume, playDur);
-    src.connect(g);
-    g.connect(this.samplerBus);
+    this.connectPadVoice(padIndex, src, g);
     const entry = { src, at };
     src.onended = () => {
       const i = state.pending.indexOf(entry);

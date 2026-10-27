@@ -11,8 +11,8 @@
 
 ### Audio graph
 ```
-[pad buffer] → BufferSourceNode → padGain → samplerBus → masterBus
-                                              ↘ cueBus (when PFL enabled)
+[pad buffer] → BufferSourceNode → padGain → per-pad EQ (low/mid/high) → samplerBus → sampler trim → shared sampler EQ → filter → samplerMaster → masterBus
+                                                                                     ↘ cue tap (post-filter) → cueBus · FX send (post-master) → fxBus
 ```
 - New `samplerBus: GainNode` in `DJEngine`, connected to `masterBus` (and optionally `cueBus`).
 - Each pad: `AudioBuffer`, `padGain: GainNode` (per-pad volume), `lastTriggerTime`.
@@ -80,6 +80,62 @@ getPadState(padIndex: number): { loaded: boolean; name: string; volume: number }
   Handle dragging maps to the zoomed time scale; dragging the
   waveform background pans the zoomed view. Zoom is view-only state,
   not persisted.
+
+### Quick menu + per-pad EQ + LIVE trigger (implemented 2026-10-27)
+
+Tim's feel report: pads "didn't feel as responsive as [they] should" —
+the diagnosis was two compounding waits, not a slow audio path. The
+tap-to-sound path itself does no decode and no main-thread work
+(buffers are decoded at load; a trigger only creates a source + gain
+and schedules it, and the context already runs with
+`latencyHint: 'interactive'`). What reads as lag is: (1) pads fired on
+`click` (pointer-up) instead of pointer-down, and (2) with QUANTIZE
+on and a master grid running, every first hit waits for the next
+master beat — up to a full beat (~480ms at 124 BPM) — by design, but
+it feels like the pad is ignoring the tap. Both are fixed without
+changing the default sync behavior:
+
+- Pads now trigger on pointer-down (primary button only; right-click
+  still clears). Keyboard (`1`–`8`) and MIDI were already immediate.
+- Per-pad LIVE (quick menu, persisted): when on, the pad's first hit
+  starts at once, bypassing the quantize wait; loop iterations after
+  the first still lock to the live master grid via the existing
+  lookahead scheduler. Default off — the quantized behavior is
+  unchanged unless Tim arms LIVE on a pad. The global QUANTIZE
+  checkbox still defeats quantize for all pads.
+- The menu itself stays off the audio path: menu state is local to
+  the pad, pads are memoized, and settings saves keep the existing
+  400ms debounce — tweaking never blocks or re-renders the grid.
+
+Quick menu (the fast path; the EDIT editor stays the precise path):
+- ⋯ button on every loaded pad, or Shift+1–8 (physical key, via
+  `e.code`). Opens an inline popover anchored to the pad, instantly.
+  Stays open while tweaking and while pads keep playing — taps on
+  pads don't close it; only an outside tap, Escape, or ⋯/✕ does.
+  One menu at a time; never covers all 8 pads.
+- Contents, all live, no Apply button: per-pad 3-band EQ (below),
+  trim start/end numeric fields (same trim model as the editor —
+  seconds, clamped, 10ms minimum, non-destructive, applies next
+  trigger / next loop pass) + RESET + FINE-TUNE (opens the expanded
+  editor), volume slider (same binding as the vol knob — single
+  state), LIVE toggle.
+
+Per-pad EQ:
+- Lowshelf 200 Hz / peaking 1000 Hz Q1 / highshelf 3000 Hz — same
+  frequencies/Q as the shared sampler EQ — ±12 dB, flat 0, knobs
+  with double-click-to-flat. One persistent filter chain per pad,
+  ahead of `samplerBus`, so EQ tweaks apply to voices already
+  sounding as well as new ones. Chain order: voice gain → per-pad EQ
+  → samplerBus → sampler trim → shared sampler EQ → filter → master
+  (+ FX send / cue tap). A new sample resets its pad to flat EQ and
+  LIVE off; clearing does the same.
+- Persistence: EQ values + LIVE choice travel with the pad record in
+  `velz-dj-sampler` (optional fields — records saved before EQ
+  existed restore flat/off). "Clear saved" still never wipes pads;
+  seeding never clobbers user-edited pads.
+- MIDI: no new bindings in this pass (existing `sampler.pad[N]`,
+  `.volume`, `.loop` scheme untouched) — EQ/LIVE MIDI mapping is a
+  follow-up, not half-wired.
 
 ### Pad persistence + seeded loops (implemented 2026-10-27)
 - Pads persist across reloads in their own IndexedDB database
@@ -180,5 +236,7 @@ setFxEnabled(enabled: boolean): void                     // bypass
 - [ ] Filters: sweep full range on a playing track, confirm no clicks/pops at extremes
 - [ ] Cue: PFL a deck, confirm cue bus isolation (master unaffected)
 - [ ] Sampler: trigger all 8 pads rapidly, confirm no dropouts; test quantize on/off
+- [ ] Sampler quick menu: ⋯ opens instantly, EQ knobs audible on a sounding pad, trim fields + LIVE toggle live, menu stays open while other pads play, Escape/outside-tap closes; reload restores EQ + LIVE; old saved pads (no EQ fields) restore flat/off
+- [ ] Sampler feel: pad tap with a master playing, QUANTIZE on, LIVE off = waits for the next beat (by design); LIVE on = first hit at once, loop locks to the grid after; pointer-down trigger (no pointer-up wait)
 - [ ] FX delay: confirm delay time tracks tempo changes (pitch bend the deck, delay follows)
 - [ ] MIDI: map S8 knobs to filter + FX params, confirm smooth response

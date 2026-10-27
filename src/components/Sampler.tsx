@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useRef, useState } from 'react';
 import { engine } from '../audio/engine';
 import { midi } from '../midi';
 import { Knob } from './Mixer';
@@ -24,6 +24,10 @@ interface PadUIState {
   looping: boolean; // loop currently playing
   trimStart: number; // seconds
   trimEnd: number; // seconds (full duration when untrimmed)
+  eqLow: number; // dB, ±12, flat 0
+  eqMid: number; // dB, ±12, flat 0
+  eqHigh: number; // dB, ±12, flat 0
+  live: boolean; // LIVE trigger: first hit starts at once
 }
 
 function renderMiniWaveform(buffer: AudioBuffer, canvas: HTMLCanvasElement, trimStart = 0, trimEnd?: number) {
@@ -308,17 +312,168 @@ function TrimEditor({ index, state, onTrim, onReset, onClose }: {
   );
 }
 
-function Pad({ index, state, onTrigger, onLoad, onClear, onVolume, onToggleLoop, onEdit, editing }: {
+/** Per-pad quick menu: EQ + trim + volume + LIVE, for on-the-fly
+ * tweaks while playing. Everything is live — no Apply button, no
+ * reload. The menu is menu-scoped state inside the pad, so opening or
+ * tweaking it never re-renders the other pads, and it stays open
+ * while the pad keeps playing: taps on pads don't close it (only an
+ * outside tap, Escape, or the ⋯/✕ button does). The expanded EDIT
+ * editor stays the precise path for waveform trim work; the menu is
+ * the fast path. */
+function PadMenu({ index, state, onEq, onLive, onTrim, onResetTrim, onVolume, onOpenEditor, onClose }: {
   index: number;
   state: PadUIState;
-  onTrigger: () => void;
-  onLoad: (file: File) => void;
-  onClear: () => void;
+  onEq: (low: number, mid: number, high: number) => void;
+  onLive: (on: boolean) => void;
+  onTrim: (start: number, end: number) => void;
+  onResetTrim: () => void;
   onVolume: (v: number) => void;
-  onToggleLoop: () => void;
-  onEdit: () => void;
-  editing: boolean;
+  onOpenEditor: () => void;
+  onClose: () => void;
 }) {
+  const buffer = engine.pads[index].buffer;
+  const duration = buffer?.duration ?? 0;
+  const { trimStart, trimEnd } = state;
+
+  // Numeric drafts: local text while focused (same pattern as the
+  // trim editor — typing "1." isn't fought by live clamping).
+  const [startDraft, setStartDraft] = useState(trimStart.toFixed(2));
+  const [endDraft, setEndDraft] = useState(trimEnd.toFixed(2));
+  const [focused, setFocused] = useState<'start' | 'end' | null>(null);
+  useEffect(() => { if (focused !== 'start') setStartDraft(trimStart.toFixed(2)); }, [trimStart, focused]);
+  useEffect(() => { if (focused !== 'end') setEndDraft(trimEnd.toFixed(2)); }, [trimEnd, focused]);
+
+  const commitStart = () => {
+    const v = parseFloat(startDraft);
+    if (Number.isFinite(v)) onTrim(v, trimEnd);
+  };
+  const commitEnd = () => {
+    const v = parseFloat(endDraft);
+    if (Number.isFinite(v)) onTrim(trimStart, v);
+  };
+
+  const eqKnob = (label: string, value: number, set: (v: number) => void) => (
+    <span key={label} className="flex flex-col items-center">
+      <Knob label={label} value={value} min={-12} max={12} size={30} onChange={set} />
+      <span className="text-[9px] font-mono text-zinc-400">
+        {value > 0 ? `+${value.toFixed(1)}` : value.toFixed(1)} dB
+      </span>
+    </span>
+  );
+
+  return (
+    <div
+      className="absolute left-0 right-0 top-full z-30 mt-1 rounded-lg border border-cyan-500/50 bg-zinc-900/95 p-2 shadow-xl"
+      onPointerDown={(e) => e.stopPropagation()}
+      onClick={(e) => e.stopPropagation()}
+    >
+      <div className="flex items-center justify-between">
+        <span className="text-[10px] font-mono text-cyan-200 truncate">
+          PAD {index + 1} · {state.name}
+        </span>
+        <button onClick={onClose} className="text-[11px] font-mono text-zinc-400 hover:text-zinc-100 px-1" title="Close menu (Esc)">✕</button>
+      </div>
+      <div className="flex items-center justify-between mt-1.5">
+        <span className="text-[9px] font-mono text-zinc-500">EQ ±12 dB · double-click a knob for flat</span>
+        <button
+          onClick={() => onEq(0, 0, 0)}
+          className="text-[9px] font-mono text-zinc-400 hover:text-cyan-200 border border-zinc-700 rounded px-1.5 py-0.5"
+          title="Reset EQ to flat"
+        >
+          FLAT
+        </button>
+      </div>
+      <div className="flex items-start justify-around mt-1">
+        {eqKnob('low', state.eqLow, (v) => onEq(v, state.eqMid, state.eqHigh))}
+        {eqKnob('mid', state.eqMid, (v) => onEq(state.eqLow, v, state.eqHigh))}
+        {eqKnob('high', state.eqHigh, (v) => onEq(state.eqLow, state.eqMid, v))}
+      </div>
+      <div className="flex flex-wrap items-center gap-2 mt-2">
+        <span className="text-[9px] font-mono text-zinc-500">TRIM</span>
+        <label className="flex items-center gap-1 text-[10px] font-mono text-zinc-300">
+          <input
+            type="number" min={0} max={duration} step={0.01} value={startDraft}
+            className="w-16 rounded border border-zinc-700 bg-zinc-900 px-1 py-0.5 text-zinc-100"
+            onFocus={() => setFocused('start')}
+            onBlur={() => { setFocused(null); commitStart(); }}
+            onKeyDown={(e) => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur(); }}
+            onChange={(e) => setStartDraft(e.target.value)}
+          />
+          s
+        </label>
+        <label className="flex items-center gap-1 text-[10px] font-mono text-zinc-300">
+          <input
+            type="number" min={0} max={duration} step={0.01} value={endDraft}
+            className="w-16 rounded border border-zinc-700 bg-zinc-900 px-1 py-0.5 text-zinc-100"
+            onFocus={() => setFocused('end')}
+            onBlur={() => { setFocused(null); commitEnd(); }}
+            onKeyDown={(e) => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur(); }}
+            onChange={(e) => setEndDraft(e.target.value)}
+          />
+          s
+        </label>
+        <span className="text-[9px] font-mono text-zinc-400">kept {(trimEnd - trimStart).toFixed(2)}s</span>
+        <button
+          onClick={onResetTrim}
+          className="text-[9px] font-mono text-zinc-400 hover:text-amber-200 border border-zinc-700 rounded px-1.5 py-0.5"
+          title="Reset trim to the full sample"
+        >
+          RESET
+        </button>
+        <button
+          onClick={onOpenEditor}
+          className="text-[9px] font-mono text-zinc-400 hover:text-amber-200 border border-zinc-700 rounded px-1.5 py-0.5"
+          title="Open the large waveform editor for drag-handle fine-tuning"
+        >
+          FINE-TUNE ↗
+        </button>
+      </div>
+      <div className="flex items-center gap-2 mt-2">
+        <span className="text-[9px] font-mono text-zinc-500">VOL</span>
+        <input
+          type="range" min={0} max={1} step={0.01} value={state.volume}
+          onChange={(e) => onVolume(parseFloat(e.target.value))}
+          className="flex-1 accent-cyan-400"
+        />
+        <span className="text-[9px] font-mono text-zinc-400 w-8 text-right">{Math.round(state.volume * 100)}%</span>
+      </div>
+      <label className="flex items-start gap-1.5 mt-2 cursor-pointer">
+        <input
+          type="checkbox" checked={state.live}
+          onChange={(e) => onLive(e.target.checked)}
+          className="accent-cyan-400 mt-0.5"
+        />
+        <span className="text-[10px] font-mono text-zinc-300">
+          LIVE — first hit starts at once
+          <span className="block text-[9px] text-zinc-500">
+            Off: waits for the next beat (synced). Loop passes after the first still lock to the grid either way.
+          </span>
+        </span>
+      </label>
+    </div>
+  );
+}
+
+interface PadProps {
+  index: number;
+  state: PadUIState;
+  onTrigger: (index: number) => void;
+  onLoad: (index: number, file: File) => void;
+  onClear: (index: number) => void;
+  onVolume: (index: number, v: number) => void;
+  onToggleLoop: (index: number) => void;
+  onEdit: (index: number) => void;
+  onToggleMenu: (index: number) => void;
+  onEq: (index: number, low: number, mid: number, high: number) => void;
+  onLive: (index: number, on: boolean) => void;
+  onTrim: (index: number, start: number, end: number) => void;
+  onResetTrim: (index: number) => void;
+  onOpenEditor: (index: number) => void;
+  menuOpen: boolean;
+  editing: boolean;
+}
+
+const Pad = memo(function Pad({ index, state, onTrigger, onLoad, onClear, onVolume, onToggleLoop, onEdit, onToggleMenu, onEq, onLive, onTrim, onResetTrim, onOpenEditor, menuOpen, editing }: PadProps) {
   const fileRef = useRef<HTMLInputElement>(null);
   const waveRef = useRef<HTMLCanvasElement>(null);
   const [showVol, setShowVol] = useState(false);
@@ -343,8 +498,16 @@ function Pad({ index, state, onTrigger, onLoad, onClear, onVolume, onToggleLoop,
                 ? 'bg-zinc-800 border-zinc-600 hover:border-cyan-400 cursor-pointer'
                 : 'bg-zinc-900 border-zinc-700 border-dashed hover:border-zinc-500 cursor-pointer'
       }`}
-      onClick={() => (state.loaded ? onTrigger() : fileRef.current?.click())}
-      onContextMenu={(e) => { e.preventDefault(); if (state.loaded) onClear(); }}
+      data-sampler-pad={index}
+      onPointerDown={(e) => {
+        // Primary button only: a right-click must clear, never fire.
+        // Pointer-down, not click: click waits for pointer-up, which
+        // is dead time on a drum pad.
+        if (e.pointerType === 'mouse' && e.button !== 0) return;
+        if (state.loaded) onTrigger(index);
+        else fileRef.current?.click();
+      }}
+      onContextMenu={(e) => { e.preventDefault(); if (state.loaded) onClear(index); }}
       title={state.loaded
         ? state.looping
           ? `${state.name} — looping in sync, click to stop (finishes the pass)`
@@ -360,7 +523,7 @@ function Pad({ index, state, onTrigger, onLoad, onClear, onVolume, onToggleLoop,
         className="hidden"
         onChange={(e) => {
           const f = e.target.files?.[0];
-          if (f) onLoad(f);
+          if (f) onLoad(index, f);
           e.target.value = '';
         }}
       />
@@ -375,7 +538,7 @@ function Pad({ index, state, onTrigger, onLoad, onClear, onVolume, onToggleLoop,
       <div className="flex items-center justify-between mt-1">
         <span className="text-[9px] text-zinc-500 font-mono">key {PAD_KEYS[index]}</span>
         {state.loaded && (
-          <span className="flex items-center gap-1">
+          <span className="flex items-center gap-1" onPointerDown={(e) => e.stopPropagation()}>
             <button
               className={`text-[9px] font-mono px-1 rounded border ${
                 state.looping
@@ -384,7 +547,7 @@ function Pad({ index, state, onTrigger, onLoad, onClear, onVolume, onToggleLoop,
                     ? 'text-cyan-300 border-cyan-500/60 bg-cyan-500/10'
                     : 'text-zinc-500 border-zinc-700 hover:text-cyan-300'
               }`}
-              onClick={(e) => { e.stopPropagation(); onToggleLoop(); }}
+              onClick={(e) => { e.stopPropagation(); onToggleLoop(index); }}
               title="Loop mode: the pad repeats in sync with the master grid. Tap the pad to start, tap again to stop (finishes the pass)."
             >
               LOOP
@@ -395,10 +558,21 @@ function Pad({ index, state, onTrigger, onLoad, onClear, onVolume, onToggleLoop,
                   ? 'text-amber-200 border-amber-400 bg-amber-500/20'
                   : 'text-zinc-500 border-zinc-700 hover:text-amber-200'
               }`}
-              onClick={(e) => { e.stopPropagation(); onEdit(); }}
+              onClick={(e) => { e.stopPropagation(); onEdit(index); }}
               title="Edit trim: drag the start/end handles on the large waveform, or type exact seconds."
             >
               EDIT
+            </button>
+            <button
+              className={`text-[9px] font-mono px-1 rounded border ${
+                menuOpen
+                  ? 'text-cyan-200 border-cyan-400 bg-cyan-500/20'
+                  : 'text-zinc-500 border-zinc-700 hover:text-cyan-200'
+              }`}
+              onClick={(e) => { e.stopPropagation(); onToggleMenu(index); }}
+              title="Quick menu: per-pad EQ, trim, volume, LIVE trigger (Shift+1–8 opens it)"
+            >
+              ⋯
             </button>
             <button
               className="text-[9px] text-zinc-500 hover:text-cyan-300 font-mono"
@@ -409,18 +583,31 @@ function Pad({ index, state, onTrigger, onLoad, onClear, onVolume, onToggleLoop,
           </span>
         )}
       </div>
+      {menuOpen && state.loaded && (
+        <PadMenu
+          index={index}
+          state={state}
+          onEq={(l, m, h) => onEq(index, l, m, h)}
+          onLive={(on) => onLive(index, on)}
+          onTrim={(s, e) => onTrim(index, s, e)}
+          onResetTrim={() => onResetTrim(index)}
+          onVolume={(v) => onVolume(index, v)}
+          onOpenEditor={() => onOpenEditor(index)}
+          onClose={() => onToggleMenu(index)}
+        />
+      )}
       {showVol && state.loaded && (
-        <div className="flex justify-center mt-1" onClick={(e) => e.stopPropagation()}>
-          <Knob label="vol" value={state.volume} min={0} max={1} size={36} onChange={onVolume} />
+        <div className="flex justify-center mt-1" onClick={(e) => e.stopPropagation()} onPointerDown={(e) => e.stopPropagation()}>
+          <Knob label="vol" value={state.volume} min={0} max={1} size={36} onChange={(v) => onVolume(index, v)} />
         </div>
       )}
     </div>
   );
-}
+});
 
 export default function Sampler() {
   const [pads, setPads] = useState<PadUIState[]>(
-    Array.from({ length: 8 }, () => ({ name: '', loaded: false, volume: 0.8, flashing: false, loop: false, looping: false, trimStart: 0, trimEnd: 0 }))
+    Array.from({ length: 8 }, () => ({ name: '', loaded: false, volume: 0.8, flashing: false, loop: false, looping: false, trimStart: 0, trimEnd: 0, eqLow: 0, eqMid: 0, eqHigh: 0, live: false }))
   );
   // Quantize defaults ON (EDM sync feature): pads drop on the next master
   // beat. The checkbox defeats it for manual triggering.
@@ -451,9 +638,11 @@ export default function Sampler() {
         cur.name === p.name && cur.loaded === !!p.buffer && cur.volume === p.volume
         && cur.loop === p.loop && cur.looping === p.looping
         && cur.trimStart === p.trimStart && cur.trimEnd === p.trimEnd
+        && cur.eqLow === p.eq.low && cur.eqMid === p.eq.mid && cur.eqHigh === p.eq.high
+        && cur.live === p.live
       ) return prev;
       const next = [...prev];
-      next[i] = { ...next[i], name: p.name, loaded: !!p.buffer, volume: p.volume, loop: p.loop, looping: p.looping, trimStart: p.trimStart, trimEnd: p.trimEnd };
+      next[i] = { ...next[i], name: p.name, loaded: !!p.buffer, volume: p.volume, loop: p.loop, looping: p.looping, trimStart: p.trimStart, trimEnd: p.trimEnd, eqLow: p.eq.low, eqMid: p.eq.mid, eqHigh: p.eq.high, live: p.live };
       return next;
     });
   }, []);
@@ -499,6 +688,8 @@ export default function Sampler() {
       trimStart: p.trimStart,
       trimEnd: p.trimEnd,
       loop: p.loop,
+      eq: { ...p.eq },
+      live: p.live,
       savedAt: new Date().toISOString(),
     }).catch((e) => console.warn('Sampler pad save failed', e));
   }, []);
@@ -522,6 +713,7 @@ export default function Sampler() {
     window.clearTimeout(padSaveTimers.current[i] ?? undefined);
     void deleteSamplerPad(i).catch((e) => console.warn('Sampler pad delete failed', e));
     setEditPad((cur) => (cur === i ? null : cur));
+    setMenuPad((cur) => (cur === i ? null : cur));
     refreshPad(i);
   }, [refreshPad]);
 
@@ -537,9 +729,50 @@ export default function Sampler() {
     refreshPad(i);
   }, [refreshPad, schedulePadSave]);
 
+  const setEq = useCallback((i: number, low: number, mid: number, high: number) => {
+    engine.setPadEq(i, low, mid, high);
+    schedulePadSave(i);
+    refreshPad(i);
+  }, [refreshPad, schedulePadSave]);
+
+  const setLive = useCallback((i: number, on: boolean) => {
+    engine.setPadLive(i, on);
+    schedulePadSave(i);
+    refreshPad(i);
+  }, [refreshPad, schedulePadSave]);
+
   // Trim editing: which pad's editor is open (null = none). Zoom state
   // lives inside the editor and resets when switching pads (keyed).
   const [editPad, setEditPad] = useState<number | null>(null);
+
+  // Quick menu: which pad's popover is open (null = none). One at a
+  // time — opening another pad's menu closes this one.
+  const [menuPad, setMenuPad] = useState<number | null>(null);
+
+  const toggleMenu = useCallback((i: number) => {
+    setMenuPad((cur) => (cur === i ? null : i));
+  }, []);
+
+  const toggleEditPad = useCallback((i: number) => {
+    setEditPad((cur) => (cur === i ? null : i));
+  }, []);
+
+  const openEditor = useCallback((i: number) => {
+    setEditPad(i);
+    setMenuPad(null);
+  }, []);
+
+  // The quick menu stays open while playing (taps on pads don't close
+  // it); only a tap outside every pad, Escape, or ⋯/✕ does.
+  useEffect(() => {
+    if (menuPad === null) return;
+    const onDocPointerDown = (e: PointerEvent) => {
+      const t = e.target as Element | null;
+      if (!t?.closest || !t.closest('[data-sampler-pad]')) setMenuPad(null);
+    };
+    document.addEventListener('pointerdown', onDocPointerDown);
+    return () => document.removeEventListener('pointerdown', onDocPointerDown);
+  }, [menuPad]);
 
   const setTrim = useCallback((i: number, start: number, end: number) => {
     engine.setPadTrim(i, start, end);
@@ -582,6 +815,10 @@ export default function Sampler() {
             engine.setPadVolume(rec.padIndex, rec.volume);
             if (rec.trimEnd > 0) engine.setPadTrim(rec.padIndex, rec.trimStart, rec.trimEnd);
             engine.setPadLoop(rec.padIndex, rec.loop);
+            // Records saved before per-pad EQ / LIVE existed have no
+            // fields — they restore flat/off.
+            engine.setPadEq(rec.padIndex, rec.eq?.low ?? 0, rec.eq?.mid ?? 0, rec.eq?.high ?? 0);
+            engine.setPadLive(rec.padIndex, rec.live ?? false);
             refreshPad(rec.padIndex);
           } catch (e) {
             console.warn('Sampler pad restore failed', rec.padIndex, e);
@@ -620,6 +857,8 @@ export default function Sampler() {
             trimStart: 0,
             trimEnd: buffer.duration,
             loop: true,
+            eq: { low: 0, mid: 0, high: 0 },
+            live: false,
             savedAt: new Date().toISOString(),
           });
         } catch (e) {
@@ -696,10 +935,24 @@ export default function Sampler() {
     return () => window.clearInterval(timer);
   }, [recording, finishRecToPad]);
 
-  // Keyboard triggers 1-8
+  // Keyboard triggers 1-8; Shift+1-8 toggles the pad's quick menu;
+  // Escape closes it. (e.code is the physical key, so Shift+1 works
+  // regardless of what character the layout produces.)
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if ((e.target as HTMLElement)?.tagName === 'INPUT') return;
+      if (e.key === 'Escape') {
+        setMenuPad(null);
+        return;
+      }
+      if (e.shiftKey && e.code.startsWith('Digit')) {
+        const n = Number(e.code.slice(5));
+        if (n >= 1 && n <= 8) {
+          e.preventDefault();
+          setMenuPad((cur) => (cur === n - 1 ? null : n - 1));
+        }
+        return;
+      }
       const i = PAD_KEYS.indexOf(e.key);
       if (i >= 0) trigger(i);
     };
@@ -800,7 +1053,7 @@ export default function Sampler() {
           </label>
           {/* Channel volume + mute live on the sampler strip in the
               mixer now (single control, no competing VOL here). */}
-          <span className="text-[10px] font-mono text-zinc-600">VOL + MUTE on mixer strip · LOOP on a pad: tap pad to start, tap again to stop · EDIT on a pad: trim start/end with zoom</span>
+          <span className="text-[10px] font-mono text-zinc-600">VOL + MUTE on mixer strip · LOOP on a pad: tap pad to start, tap again to stop · EDIT on a pad: trim start/end with zoom · ⋯ on a pad: quick menu (EQ, trim, LIVE) — Shift+1–8</span>
         </div>
       </div>
       {/* Record from a playing deck into a pad. Tap is parallel to the
@@ -864,12 +1117,19 @@ export default function Sampler() {
             <Pad
               index={i}
               state={p}
-              onTrigger={() => trigger(i)}
-              onLoad={(f) => load(i, f)}
-              onClear={() => clear(i)}
-              onVolume={(v) => setVol(i, v)}
-              onToggleLoop={() => toggleLoop(i)}
-              onEdit={() => setEditPad((cur) => (cur === i ? null : i))}
+              onTrigger={trigger}
+              onLoad={load}
+              onClear={clear}
+              onVolume={setVol}
+              onToggleLoop={toggleLoop}
+              onEdit={toggleEditPad}
+              onToggleMenu={toggleMenu}
+              onEq={setEq}
+              onLive={setLive}
+              onTrim={setTrim}
+              onResetTrim={resetTrim}
+              onOpenEditor={openEditor}
+              menuOpen={menuPad === i}
               editing={editPad === i}
             />
           </div>
