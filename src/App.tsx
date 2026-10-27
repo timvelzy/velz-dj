@@ -228,6 +228,11 @@ export default function App() {
   const [libraryError, setLibraryError] = useState<string | null>(null);
   const [editingGrid, setEditingGrid] = useState<'A' | 'B' | null>(null);
   const [midiOpen, setMidiOpen] = useState(false);
+  // First-run DJ workflow help: a dismissible strip under the header, so
+  // a working DJ opening the mixer for the first time sees the intended
+  // workflow (SYNC, grid check, SET 1.1, QTZ) instead of guessing. It
+  // changes nothing about audio or state; it only explains the UI.
+  const [helpOpen, setHelpOpen] = useState(false);
   const [devices, setDevices] = useState<MediaDeviceInfo[]>([]);
   const [aiLoop, setAiLoop] = useState<GeneratedLoop | null>(null);
   const [aiBuffer, setAiBuffer] = useState<AudioBuffer | null>(null);
@@ -3646,6 +3651,13 @@ export default function App() {
             🎛 MIDI
           </button>
           <button
+            onClick={() => setHelpOpen((o) => !o)}
+            className={`rounded px-3 py-1.5 text-xs font-bold ${helpOpen ? 'bg-sky-600 text-white' : 'bg-zinc-800 text-zinc-300 hover:bg-zinc-700'}`}
+            title="How to mix on these decks"
+          >
+            ? How to mix
+          </button>
+          <button
             onClick={() => setDebugOpen((o) => !o)}
             className={`rounded px-3 py-1.5 text-xs font-bold ${debugOpen ? 'bg-amber-600 text-black' : 'bg-zinc-800 text-zinc-300 hover:bg-zinc-700'}`}
             title="View / copy / download the debug log — paste it to us after a dropout"
@@ -3693,6 +3705,28 @@ export default function App() {
         </div>
       </header>
 
+      {helpOpen && (
+        <div className="border-b border-zinc-800 bg-zinc-950 px-4 py-3">
+          <div className="mb-2 flex items-center justify-between">
+            <span className="text-sm font-bold text-zinc-100">How to mix on these decks</span>
+            <button
+              onClick={() => setHelpOpen(false)}
+              className="rounded bg-zinc-800 px-2 py-0.5 text-xs text-zinc-300 hover:bg-zinc-700"
+            >
+              Close ✕
+            </button>
+          </div>
+          <ol className="grid list-decimal gap-x-6 gap-y-1 pl-5 text-xs leading-relaxed text-zinc-400 md:grid-cols-2">
+            <li><span className="text-zinc-200">Load a track on each deck</span> with Add music, or drag a track from the library onto a deck.</li>
+            <li><span className="text-zinc-200">Press SYNC on the deck that joins.</span> The MASTER deck sets the tempo; the other deck follows it and holds phase.</li>
+            <li><span className="text-zinc-200">Watch the PHASE meter</span> in the sync view. Near zero means the downbeats line up. If it walks, the beat grids disagree.</li>
+            <li><span className="text-zinc-200">Beats still drifting?</span> Check the grid confidence under the waveform. If the downbeat is off, pause on a downbeat and hit the 1.1 button to re-anchor the grid.</li>
+            <li><span className="text-zinc-200">QTZ on means Play and CUE drop on the next bar.</span> Turn QTZ off for manual, off-grid starts.</li>
+            <li><span className="text-zinc-200">Blend with the crossfader and the EQs.</span> Cut the bass on the incoming deck, swap the basses at the drop, then move the crossfader across. Loops: pick a bar size, and Loop out keeps playing from the playhead.</li>
+          </ol>
+        </div>
+      )}
+
       {apOn && (
         <AutoPilot
           status={apStatus}
@@ -3725,6 +3759,7 @@ export default function App() {
             label: 'A', deckId: 'deckA', color: '#38bdf8',
             title: deckA.track?.title ?? 'No track',
             syncActive: deckA.syncActive,
+            isMaster: masterDeck === 'deckA',
             artist: deckA.track?.artist,
             fileSize: deckA.track?.file?.size,
             format: fileExt(deckA.track?.file),
@@ -3748,6 +3783,7 @@ export default function App() {
             label: 'B', deckId: 'deckB', color: '#fb923c',
             title: deckB.track?.title ?? 'No track',
             syncActive: deckB.syncActive,
+            isMaster: masterDeck === 'deckB',
             artist: deckB.track?.artist,
             fileSize: deckB.track?.file?.size,
             format: fileExt(deckB.track?.file),

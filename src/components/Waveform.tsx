@@ -52,6 +52,19 @@ export default function Waveform({
     [buffer],
   );
 
+  // Perf: this loop redrew the full canvas at 60fps even with the deck
+  // paused and nothing on screen changing (two decks x main + overview
+  // + top view = six always-on rAF loops). Skip the draw when paused
+  // and every input to the frame is identical to the last drawn frame;
+  // any change (seek, zoom, drag, loop, hotcue, resize, grid edit)
+  // changes the signature and redraws immediately. While playing the
+  // position moves every frame, so playback rendering is untouched.
+  // Input identity (new track, fresh peaks, edited grid) invalidates
+  // the cached frame outright, so a load while paused can never reuse
+  // the previous track's pixels.
+  const lastSig = useRef<string | null>(null);
+  useEffect(() => { lastSig.current = null; }, [buffer, bandPeaks, grid]);
+
   // Keep the playhead roughly centered while playing
   useEffect(() => {
     let raf = 0;
@@ -73,14 +86,25 @@ export default function Waveform({
       const pos = engine.position(deckId); // tempo-aware — no drift
       const dur = buffer.duration;
       const pxPerSec = zoom;
+      const playing = engine.isPlaying(deckId);
 
       let viewStart: number;
-      if (follow && engine.isPlaying(deckId)) {
+      if (follow && playing) {
         viewStart = Math.max(0, pos - w / pxPerSec / 2);
         viewRef.current.start = viewStart;
       } else {
         viewStart = viewRef.current.start;
       }
+
+      const sig = [
+        playing, Math.round(pos * 1000), Math.round(viewStart * 1000), w, h, zoom, follow,
+        color, loop?.start ?? -1, loop?.end ?? -1, hotcues.join(','), hotcueAuto?.join(',') ?? '',
+        grid?.bpm ?? -1, grid?.downbeatOffset ?? -1, grid?.barPhase ?? -1, grid?.beats.length ?? -1,
+        bandPeaks ? 'peaks' : 'mono',
+      ].join('|');
+      if (!playing && sig === lastSig.current) return;
+      lastSig.current = sig;
+
       const viewEnd = viewStart + w / pxPerSec;
 
       // Background
@@ -265,11 +289,28 @@ export default function Waveform({
           Follow
         </button>
         <span>Zoom</span>
+        <button
+          className="rounded bg-zinc-800 px-1.5 py-0.5 text-zinc-300 hover:bg-zinc-700"
+          onClick={() => setZoom((z) => Math.max(15, Math.round(z / 1.5)))}
+          title="Zoom out"
+          aria-label="Zoom waveform out"
+        >
+          −
+        </button>
         <input
           type="range" min={15} max={240} value={zoom}
           onChange={(e) => setZoom(Number(e.target.value))}
           className="h-1 w-28 accent-sky-500"
+          aria-label="Waveform zoom"
         />
+        <button
+          className="rounded bg-zinc-800 px-1.5 py-0.5 text-zinc-300 hover:bg-zinc-700"
+          onClick={() => setZoom((z) => Math.min(240, Math.round(z * 1.5)))}
+          title="Zoom in"
+          aria-label="Zoom waveform in"
+        >
+          +
+        </button>
         {grid && (
           <span className={grid.confidence < 0.4 ? 'text-amber-400' : 'text-zinc-500'}>
             {grid.bpm.toFixed(1)} BPM
@@ -310,6 +351,13 @@ export function OverviewWaveform({ deckId, buffer, peaks, grid, color, loop, hot
     [buffer, peaks],
   );
 
+  // Perf: same idle-frame skip as the main waveform. The overview is a
+  // 30px strip, so the playhead position is quantized to 50ms in the
+  // signature: ~20fps while playing (invisible at this size), zero
+  // redraws while paused. Input identity invalidates the cached frame.
+  const lastSig = useRef<string | null>(null);
+  useEffect(() => { lastSig.current = null; }, [buffer, small, mono, grid]);
+
   useEffect(() => {
     let raf = 0;
     const draw = () => {
@@ -327,6 +375,14 @@ export function OverviewWaveform({ deckId, buffer, peaks, grid, color, loop, hot
       ctx.setTransform(2, 0, 0, 2, 0, 0);
       const dur = buffer.duration;
       const pos = engine.position(deckId);
+      const playing = engine.isPlaying(deckId);
+      const sig = [
+        playing, Math.round(pos * 20), w, height, color,
+        loop?.start ?? -1, loop?.end ?? -1, hotcues.join(','), hotcueAuto?.join(',') ?? '',
+        grid?.bpm ?? -1, grid?.downbeatOffset ?? -1, grid?.barPhase ?? -1,
+      ].join('|');
+      if (!playing && sig === lastSig.current) return;
+      lastSig.current = sig;
       const t2x = (t: number) => (t / dur) * w;
       const midY = height / 2;
 

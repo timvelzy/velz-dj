@@ -116,6 +116,10 @@ export default function Deck(props: DeckProps) {
   const { deckKey, state, isMaster, accent } = props;
   const deckId = `deck${deckKey}` as 'deckA' | 'deckB';
   const [elapsed, setElapsed] = useState('0:00');
+  // Remaining time + end-of-track urgency. Same 10fps tick as elapsed;
+  // display-only, derived from the engine position and track duration.
+  const [remaining, setRemaining] = useState<string | null>(null);
+  const [endingSoon, setEndingSoon] = useState(false);
   const [lock, setLock] = useState<{ errMs: number; locked: boolean } | null>(null);
   const [queued, setQueued] = useState(false);
   // Round 5: smoothed copy of the raw phase readout. The engine's errMs
@@ -125,6 +129,11 @@ export default function Deck(props: DeckProps) {
   // smoothing. A >500ms jump snaps straight to the raw value (bar-wrap
   // or a real phase jump must never be averaged through zero).
   const errMsSm = useRef<number | null>(null);
+  // Perf: the 10fps tick used to setLock/setQueued with a fresh object
+  // every tick, re-rendering the whole deck 10x/sec even when nothing
+  // changed. Only publish when the visible values actually move.
+  const lastPub = useRef<{ errMs: number; locked: boolean } | null>(null);
+  const lastQueued = useRef<boolean | null>(null);
 
   // 10fps ticker for time display (waveform has its own rAF)
   useEffect(() => {
@@ -134,19 +143,36 @@ export default function Deck(props: DeckProps) {
       const m = Math.floor(pos / 60);
       const s = Math.floor(pos % 60).toString().padStart(2, '0');
       setElapsed(`${m}:${s}`);
+      const left = Math.max(0, state.buffer.duration - pos);
+      const lm = Math.floor(left / 60);
+      const ls = Math.floor(left % 60).toString().padStart(2, '0');
+      setRemaining(`-${lm}:${ls}`);
+      setEndingSoon(left <= 30 && engine.isPlaying(deckId));
       const s2 = engine.syncStatus(deckId);
+      const q = engine.pendingLaunchAt(deckId) !== null;
+      if (lastQueued.current !== q) {
+        lastQueued.current = q;
+        setQueued(q);
+      }
       if (s2) {
         const prev = errMsSm.current;
         const sm = prev === null || Math.abs(s2.errMs - prev) > 500
           ? s2.errMs
           : prev + (s2.errMs - prev) * 0.3;
         errMsSm.current = sm;
-        setLock({ errMs: sm, locked: s2.locked });
+        const rounded = Math.round(sm);
+        const prevPub = lastPub.current;
+        if (!prevPub || prevPub.errMs !== rounded || prevPub.locked !== s2.locked) {
+          lastPub.current = { errMs: rounded, locked: s2.locked };
+          setLock({ errMs: sm, locked: s2.locked });
+        }
       } else {
         errMsSm.current = null;
-        setLock(null);
+        if (lastPub.current !== null) {
+          lastPub.current = null;
+          setLock(null);
+        }
       }
-      setQueued(engine.pendingLaunchAt(deckId) !== null);
     }, 100);
     return () => window.clearInterval(id);
   }, [state.buffer, deckId]);
@@ -313,6 +339,11 @@ export default function Deck(props: DeckProps) {
           )}
           <div className="font-mono">
             {elapsed} / {state.track ? fmtDur(state.track.duration) : '—'}
+            {remaining !== null && (
+              <span className={endingSoon ? 'font-bold text-amber-400' : 'text-zinc-500'}>
+                {' '}· {remaining} left
+              </span>
+            )}
           </div>
           {state.track?.key && (
             <div className="text-amber-300">
@@ -376,6 +407,7 @@ export default function Deck(props: DeckProps) {
           {/* TEMPO column */}
           <div className="flex shrink-0 flex-col items-center gap-1">
             <span className="text-[11px] font-bold tracking-widest text-zinc-300">TEMPO</span>
+            <span className="font-mono text-[9px] text-zinc-500">+16%</span>
             <input
               type="range"
               min={0.84}
@@ -395,6 +427,7 @@ export default function Deck(props: DeckProps) {
             <span className="font-mono text-sm text-emerald-400">
               {((displayTempo - 1) * 100).toFixed(1)}%
             </span>
+            <span className="font-mono text-[9px] text-zinc-500">−16%</span>
             {syncedFollower && (
               <span className="rounded bg-emerald-900 px-1 text-[9px] font-bold text-emerald-300">SYNC</span>
             )}
@@ -432,17 +465,19 @@ export default function Deck(props: DeckProps) {
                 onPointerCancel={cueUpIfPressed}
                 onContextMenu={(e) => e.preventDefault()}
                 title="CUE: hold to preview from cue point (release returns to it)"
-                className="h-14 w-14 shrink-0 touch-none select-none rounded-full border-2 border-zinc-500 text-xl font-bold text-amber-300 hover:bg-zinc-800 active:bg-amber-600 active:text-black"
+                aria-label="CUE: hold to preview from the cue point"
+                className="h-14 w-14 shrink-0 touch-none select-none rounded-full border-2 border-zinc-500 text-xs font-bold text-amber-300 hover:bg-zinc-800 active:bg-amber-600 active:text-black"
               >
-                ▢
+                CUE
               </button>
               <button
                 onClick={props.onSetOneOne}
                 disabled={!state.buffer}
                 title="Phase align (SET 1.1): re-anchor the beat grid at the playhead — the beat nearest the playhead becomes bar 1 beat 1 (grid phase only, no re-analysis, saved with the track)"
-                className="h-14 w-14 shrink-0 rounded-full border border-sky-500 text-xl font-bold text-sky-400 hover:bg-sky-950 disabled:opacity-40"
+                aria-label="Set 1.1: re-anchor the beat grid phase at the playhead"
+                className="h-14 w-14 shrink-0 rounded-full border border-sky-500 text-xs font-bold text-sky-400 hover:bg-sky-950 disabled:opacity-40"
               >
-                ↻
+                1.1
               </button>
               <button
                 onClick={props.onSync}
@@ -474,12 +509,17 @@ export default function Deck(props: DeckProps) {
               MASTER
             </button>
           </div>
-          <JogWheel
-            deckId={deckId}
-            paused={!isPlaying}
-            onBend={(a) => { if (a === 0) engine.clearNudge(deckId); else engine.setNudge(deckId, a); }}
-            onScratch={(d) => engine.seek(deckId, engine.position(deckId) + d)}
-          />
+          <div className="flex shrink-0 flex-col items-center gap-1">
+            <JogWheel
+              deckId={deckId}
+              paused={!isPlaying}
+              onBend={(a) => { if (a === 0) engine.clearNudge(deckId); else engine.setNudge(deckId, a); }}
+              onScratch={(d) => engine.seek(deckId, engine.position(deckId) + d)}
+            />
+            <span className="max-w-28 text-center text-[9px] uppercase leading-tight tracking-wide text-zinc-500">
+              Jog · drag to bend, scratch when paused
+            </span>
+          </div>
         </div>
         {(lock || queued) && (
           <div className="mt-2 flex items-center gap-2 font-mono text-[10px]">
@@ -547,10 +587,11 @@ export default function Deck(props: DeckProps) {
         </button>
         <button
           onClick={props.onToggleQuantize}
-          className={`h-8 rounded px-2 text-xs font-bold ${state.quantize ? 'bg-violet-600 text-white' : 'bg-zinc-800 text-zinc-500'}`}
+          className={`h-8 rounded px-2.5 text-xs font-bold ${state.quantize ? 'bg-violet-600 text-white' : 'bg-zinc-800 text-zinc-500'}`}
           title="Quantize: Play/CUE launches drop on the master bar, hotcue jumps and loop points snap to the beat grid (off = manual control)"
+          aria-label="Quantize on or off"
         >
-          Q
+          QTZ
         </button>
       </div>
 

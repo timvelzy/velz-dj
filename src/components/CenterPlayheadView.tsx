@@ -97,6 +97,11 @@ export interface TopDeckView {
   /** Groove DualOverviewWaveform logic: SYNC when the deck follows the
    *  master tempo, LEAD when it leads. Omitted for the AI row. */
   syncActive?: boolean;
+  /** True when this deck is the sync master clock. The row badge reads
+   *  MASTER (amber) for the master, SYNC (cyan) for a synced follower,
+   *  and no badge for a free deck — Traktor wording, not groove's LEAD,
+   *  which read as a claim about a deck that was neither. */
+  isMaster?: boolean;
   /** Track-card info (screenshot deck panels). Omitted for the AI row. */
   artist?: string;
   fileSize?: number;
@@ -163,7 +168,9 @@ function fmtSize(bytes: number): string {
 }
 
 /** Isolated time readout: its own 250 ms tick re-renders only this span,
- *  never the waveform row or its canvas loop. */
+ *  never the waveform row or its canvas loop. Shows elapsed / total plus
+ *  remaining time, which turns amber in the last 30 seconds so the end
+ *  of a track never surprises a DJ mid-blend. */
 function TimeReadout({ deckId, duration, isPlaying }: { deckId: TopDeckView['deckId']; duration: number; isPlaying: boolean }) {
   const [, setTick] = useState(0);
   useEffect(() => {
@@ -171,9 +178,88 @@ function TimeReadout({ deckId, duration, isPlaying }: { deckId: TopDeckView['dec
     const id = window.setInterval(() => setTick((t) => t + 1), 250);
     return () => window.clearInterval(id);
   }, [isPlaying]);
+  const pos = engine.position(deckId);
+  const left = Math.max(0, duration - pos);
+  const endingSoon = isPlaying && duration > 0 && left <= 30;
   return (
     <span className="font-mono text-[11px] text-zinc-500">
-      {fmtTime(engine.position(deckId))} / {fmtTime(duration)}
+      {fmtTime(pos)} / {fmtTime(duration)}
+      {duration > 0 && (
+        <span className={endingSoon ? 'font-bold text-amber-400' : undefined}>
+          {' '}· −{fmtTime(left)} left
+        </span>
+      )}
+    </span>
+  );
+}
+
+/**
+ * Beat-phase meter for the sync view header. Read-only: it compares each
+ * deck's position inside its own bar (from the beat grid both decks
+ * already carry) and shows the offset in milliseconds plus a marker on
+ * a ±150ms scale. Near zero means the downbeats line up; a meter that
+ * walks means the grids or tempos disagree, which is exactly the
+ * trainwreck a DJ needs to see before it is audible. Ticks at 4fps and
+ * only re-renders when the rounded value moves, so it costs nothing
+ * next to the canvas loops.
+ */
+function PhaseMeter({ decks }: { decks: [TopDeckView, TopDeckView] }) {
+  const [errMs, setErrMs] = useState<number | null>(null);
+  const decksRef = useRef(decks);
+  decksRef.current = decks;
+  const lastShown = useRef<number | null>(null);
+  useEffect(() => {
+    const id = window.setInterval(() => {
+      const [a, b] = decksRef.current;
+      const ga = a.grid;
+      const gb = b.grid;
+      let next: number | null = null;
+      if (a.buffer && b.buffer && ga && gb && ga.bpm > 0 && gb.bpm > 0) {
+        const barSec = (4 * 60) / ga.bpm;
+        const anchorOf = (g: BeatGrid) => {
+          const off = g.downbeatOffset >= 0 ? g.downbeatOffset : g.firstBeat;
+          return off >= 0 ? off : 0;
+        };
+        const inBar = (pos: number, g: BeatGrid) => {
+          const r = (pos - anchorOf(g)) % barSec;
+          return r < 0 ? r + barSec : r;
+        };
+        let err = inBar(engine.position(a.deckId), ga) - inBar(engine.position(b.deckId), gb);
+        if (err > barSec / 2) err -= barSec;
+        if (err < -barSec / 2) err += barSec;
+        next = Math.round(err * 1000);
+      }
+      if (next !== lastShown.current) {
+        lastShown.current = next;
+        setErrMs(next);
+      }
+    }, 250);
+    return () => window.clearInterval(id);
+  }, []);
+  if (errMs === null) return null;
+  const clamped = Math.max(-150, Math.min(150, errMs));
+  const dotPct = 50 + (clamped / 150) * 50;
+  const tone = Math.abs(errMs) <= 40
+    ? 'text-emerald-400'
+    : Math.abs(errMs) <= 100
+      ? 'text-amber-400'
+      : 'text-red-400';
+  const barTone = Math.abs(errMs) <= 40 ? 'bg-emerald-400' : Math.abs(errMs) <= 100 ? 'bg-amber-400' : 'bg-red-400';
+  return (
+    <span
+      className="flex items-center gap-2"
+      title="Beat-phase offset between the decks at the playhead, in milliseconds. Near zero means the downbeats line up. A meter that walks means the grids or tempos disagree."
+    >
+      <span className={`font-mono text-[11px] font-bold ${tone}`}>
+        PHASE {errMs >= 0 ? '+' : ''}{errMs}ms
+      </span>
+      <span className="relative h-1.5 w-24 overflow-visible rounded bg-zinc-800">
+        <span className="absolute left-1/2 top-0 h-full w-px bg-zinc-500" />
+        <span
+          className={`absolute top-1/2 h-2.5 w-2.5 -translate-x-1/2 -translate-y-1/2 rounded-full ${barTone}`}
+          style={{ left: `${dotPct}%` }}
+        />
+      </span>
     </span>
   );
 }
@@ -252,6 +338,15 @@ function TopWaveformRow({ deck, pxPerSec, height }: RowProps) {
   const monoRef = useRef(mono);
   monoRef.current = mono;
 
+  // Perf: idle-frame skip, same rule as Waveform.tsx. The row is static
+  // while its deck is paused, so a paused row redraws only when its
+  // inputs change (new track, fresh peaks, edited grid, seek, zoom).
+  // Input identity is tracked by reference across renders; the draw
+  // loop itself still depends only on zoom/height and never restarts
+  // on App re-renders.
+  const lastSig = useRef<string | null>(null);
+  const lastInputs = useRef({ buffer: deck.buffer, peaks: deck.peaks, grid: deck.grid, mono });
+
   useEffect(() => {
     let raf = 0;
     const draw = () => {
@@ -272,6 +367,20 @@ function TopWaveformRow({ deck, pxPerSec, height }: RowProps) {
       ctx.setTransform(2, 0, 0, 2, 0, 0);
 
       const pos = engine.position(deck.deckId);
+      const playing = engine.isPlaying(deck.deckId);
+      const prev = lastInputs.current;
+      if (prev.buffer !== deck.buffer || prev.peaks !== deck.peaks || prev.grid !== deck.grid || prev.mono !== mono) {
+        lastInputs.current = { buffer: deck.buffer, peaks: deck.peaks, grid: deck.grid, mono };
+        lastSig.current = null;
+      }
+      const sig = [
+        playing, Math.round(pos * 1000), w, h,
+        deck.grid?.bpm ?? -1, deck.grid?.downbeatOffset ?? -1, deck.grid?.barPhase ?? -1,
+        deck.grid?.beats.length ?? -1, deck.peaks ? 'peaks' : 'mono',
+      ].join('|');
+      if (!playing && sig === lastSig.current) return;
+      lastSig.current = sig;
+
       const dur = deck.buffer.duration;
       const centerX = w / 2;
       // Fixed center playhead, groove ScrollingWaveformRenderer math:
@@ -493,11 +602,15 @@ function TopWaveformRow({ deck, pxPerSec, height }: RowProps) {
           <div className="flex items-center gap-1.5">
             <span className="h-3 w-3 rounded-full" style={{ background: deck.color }} />
             <span className="text-xs font-bold text-zinc-100">DECK {deck.label}</span>
-            {deck.syncActive !== undefined && (
-              <span className={`rounded px-1.5 py-px text-[10px] font-bold ${deck.syncActive ? 'bg-cyan-500/20 text-cyan-300' : 'bg-orange-500/20 text-orange-300'}`}>
-                {deck.syncActive ? 'SYNC' : 'LEAD'}
+            {deck.isMaster ? (
+              <span className="rounded bg-amber-500/20 px-1.5 py-px text-[10px] font-bold text-amber-300">
+                MASTER
               </span>
-            )}
+            ) : deck.syncActive ? (
+              <span className="rounded bg-cyan-500/20 px-1.5 py-px text-[10px] font-bold text-cyan-300">
+                SYNC
+              </span>
+            ) : null}
             {deck.bpm > 0 && (
               <span className="rounded border border-zinc-700 px-1.5 py-px font-mono text-[10px] text-zinc-300">
                 {deck.bpm.toFixed(1)} BPM
@@ -608,6 +721,7 @@ export default function CenterPlayheadView({ decks, ai }: { decks: [TopDeckView,
             </button>
           </span>
           <span className="text-xs font-bold tracking-wide text-zinc-400">SYNC VIEW — both decks past the center playhead</span>
+          <PhaseMeter decks={decks} />
           <span className="ml-auto flex items-center gap-2">
             {decks.map((d) => (
               <span key={d.deckId} className="rounded bg-black/80 px-2 py-1 text-[11px] font-bold" style={{ color: d.color }}>
