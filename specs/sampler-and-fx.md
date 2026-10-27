@@ -136,6 +136,44 @@ getPadState(padIndex: number): { loaded: boolean; name: string; volume: number }
   stops and wipes the pad. Only the tap-again stop and the STOP
   surfaces cut immediately.
 
+### Retrigger modifier (implemented 2026-10-27)
+
+Tim's call after the tap-again-stop trade-off (re-tapping for fills
+silenced instead of retriggering): both behaviors, via a modifier —
+plain tap stops, modified tap retriggers. Alt (Option) was picked
+because Shift+`1`–`8` already opens the quick menu and right-click
+clears the pad; no double-tap detection, so the pointer-down +
+immediate-stop latency work is untouched.
+
+- Modifier: hold Alt (Option) at the moment of the gesture — read
+  at pointer-down / keydown time only, never tracked. Alt+pointer
+  tap on a pad, or Alt+`1`–`8` on the keyboard, retriggers it.
+- Semantics (one engine path, `triggerSample` with
+  `opts.retrigger`): the sounding voice is cut with the same 5ms
+  fade as the stop (source stops ~50ms later, so the restart never
+  clicks — a brief crossfade, not a gap), then the pad starts
+  fresh from the trim start. A sounding one-shot restarts from the
+  top; a sounding loop is cancelled and re-armed from the top of
+  its pass (fresh period from the current trim, same quantize/LIVE
+  rules for the first hit as a fresh trigger, iterations grid-locked
+  after). A silent pad plays exactly as a plain tap would; a voice
+  still waiting out a quantize delay is cancelled and rescheduled.
+  Trim/EQ/volume/loop-arm state untouched.
+- Plain tap on a sounding pad still stops immediately (a388dcf
+  semantics, unchanged). The STOP surfaces stay stop-only: the
+  quick-menu ■ STOP, the trim editor's AUDITION/STOP button, and
+  ■ STOP ALL (button + `0` key). The editor's AUDITION button is a
+  plain trigger, so Alt+click on it does not retrigger.
+- Precedence: Shift wins — Shift+Alt+digit still opens the quick
+  menu. Ctrl/Meta combos are left alone. The INPUT guard applies:
+  Alt+digit while typing in a field does nothing. Keyboard uses
+  `e.code` (physical key), because on macOS Option+digit produces
+  a special character as `e.key` and the digit lookup would miss
+  it; top-row digits and numpad digits both work.
+- MIDI limitation: pad triggers over MIDI keep the stop behavior —
+  there is no modifier on a hardware pad, and none was invented.
+  A MIDI retrigger binding is a possible follow-up, not built.
+
 ### Quick menu + per-pad EQ + LIVE trigger (implemented 2026-10-27)
 
 Tim's feel report: pads "didn't feel as responsive as [they] should" —
@@ -295,5 +333,6 @@ setFxEnabled(enabled: boolean): void                     // bypass
 - [ ] Sampler feel: pad tap with a master playing, QUANTIZE on, LIVE off = waits for the next beat (by design); LIVE on = first hit at once, loop locks to the grid after; pointer-down trigger (no pointer-up wait)
 - [ ] Sampler playhead: open EDIT on a sounding loop, playhead tracks the trim region; zoom in and confirm it stays mapped; zoom so the playhead leaves the window and confirm the edge arrow; AUDITION from the editor, STOP cuts at once; close the editor and confirm no stray CPU use
 - [ ] Sampler stop: start a long one-shot, tap the pad again mid-play and confirm immediate silence (no finish-the-pass, no retrigger); start a loop, tap again and confirm it stops at once; STOP ALL (`0` key) with several pads sounding; stop from the quick menu and from the editor; confirm pads keep samples, trim, EQ, and loop-arm state after stopping
+- [ ] Sampler retrigger: start a long one-shot, Alt+tap the pad mid-play and confirm it restarts from the trim start (no gap, no click); start a loop, Alt+tap and confirm the pass restarts from the top and stays grid-locked; Alt+tap a silent pad and confirm it plays normally; plain tap still stops; Shift+pad still opens the menu; Alt+digit while typing in a trim field does nothing
 - [ ] FX delay: confirm delay time tracks tempo changes (pitch bend the deck, delay follows)
 - [ ] MIDI: map S8 knobs to filter + FX params, confirm smooth response

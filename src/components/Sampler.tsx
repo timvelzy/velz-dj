@@ -598,7 +598,7 @@ function PadMenu({ index, state, onEq, onLive, onTrim, onResetTrim, onVolume, on
 interface PadProps {
   index: number;
   state: PadUIState;
-  onTrigger: (index: number) => void;
+  onTrigger: (index: number, retrigger?: boolean) => void;
   onLoad: (index: number, file: File) => void;
   onClear: (index: number) => void;
   onVolume: (index: number, v: number) => void;
@@ -646,16 +646,19 @@ const Pad = memo(function Pad({ index, state, onTrigger, onLoad, onClear, onVolu
         // Pointer-down, not click: click waits for pointer-up, which
         // is dead time on a drum pad.
         if (e.pointerType === 'mouse' && e.button !== 0) return;
-        if (state.loaded) onTrigger(index);
+        // Alt (Option) held at pointer-down = retrigger: a sounding
+        // pad restarts from the trim start instead of stopping.
+        // Modifier state is read here only, never tracked.
+        if (state.loaded) onTrigger(index, e.altKey);
         else fileRef.current?.click();
       }}
       onContextMenu={(e) => { e.preventDefault(); if (state.loaded) onClear(index); }}
       title={state.loaded
         ? state.looping
-          ? `${state.name} — looping in sync, click to stop (finishes the pass)`
+          ? `${state.name} — looping in sync, click to stop, Alt+click to restart from the top`
           : state.loop
             ? `${state.name} — loop armed, click to start the loop; right-click to clear`
-            : `${state.name} — right-click to clear`
+            : `${state.name} — click to stop when sounding, Alt+click to restart; right-click to clear`
         : 'Click to load sample'}
     >
       <input
@@ -690,7 +693,7 @@ const Pad = memo(function Pad({ index, state, onTrigger, onLoad, onClear, onVolu
                     : 'text-zinc-500 border-zinc-700 hover:text-cyan-300'
               }`}
               onClick={(e) => { e.stopPropagation(); onToggleLoop(index); }}
-              title="Loop mode: the pad repeats in sync with the master grid. Tap the pad to start, tap again to stop (finishes the pass)."
+              title="Loop mode: the pad repeats in sync with the master grid. Tap the pad to start, tap again to stop at once, Alt+tap to restart the pass."
             >
               LOOP
             </button>
@@ -806,8 +809,8 @@ export default function Sampler() {
     }, 150);
   }, []);
 
-  const trigger = useCallback((i: number) => {
-    if (engine.triggerSample(i)) flash(i);
+  const trigger = useCallback((i: number, retrigger = false) => {
+    if (engine.triggerSample(i, { retrigger })) flash(i);
   }, [flash]);
 
   // Editor / menu STOP: cut the pad's voice immediately via the same
@@ -1093,9 +1096,11 @@ export default function Sampler() {
   }, [recording, finishRecToPad]);
 
   // Keyboard triggers 1-8; Shift+1-8 toggles the pad's quick menu;
+  // Alt+1-8 retriggers (a sounding pad restarts instead of stopping);
   // 0 stops every sounding pad; Escape closes the menu. (e.code is
   // the physical key, so Shift+1 works regardless of what character
-  // the layout produces.)
+  // the layout produces — and Alt+digit must use e.code too, because
+  // on macOS Option+digit produces a special character as e.key.)
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if ((e.target as HTMLElement)?.tagName === 'INPUT') return;
@@ -1113,6 +1118,18 @@ export default function Sampler() {
         if (n >= 1 && n <= 8) {
           e.preventDefault();
           setMenuPad((cur) => (cur === n - 1 ? null : n - 1));
+        }
+        return;
+      }
+      // Alt+digit retriggers. Shift takes precedence (handled above),
+      // so Shift+Alt+digit still opens the menu. Ctrl/Meta combos are
+      // left alone — they belong to the OS/layout, not the pads.
+      // Modifier state is read at keydown time only.
+      if (e.altKey && !e.ctrlKey && !e.metaKey) {
+        const m = /^(?:Digit|Numpad)([1-8])$/.exec(e.code);
+        if (m) {
+          e.preventDefault();
+          trigger(Number(m[1]) - 1, true);
         }
         return;
       }

@@ -2267,11 +2267,27 @@ export class DJEngine {
    * repeating loop (first hit quantized like a one-shot); triggering
    * again STOPS it immediately — the sounding voice is faded out, no
    * further iterations are scheduled. Loop mode off = one-shot,
-   * exactly as before, except the tap-again stop above. */
-  triggerSample(padIndex: number): boolean {
+   * exactly as before, except the tap-again stop above.
+   *
+   * Retrigger (`opts.retrigger`, Alt+tap / Alt+pad-key): cut whatever
+   * is sounding first, then start fresh from the trim start through
+   * the normal path below — a loop re-arms from the top of its pass
+   * (fresh period from the current trim, same quantize/LIVE rules for
+   * the first hit), a one-shot restarts. A silent pad plays exactly
+   * as a plain tap would. The old voice fades out over ~50ms while
+   * the new one starts, so the restart never clicks. */
+  triggerSample(padIndex: number, opts?: { retrigger?: boolean }): boolean {
     if (!this.ctx || padIndex < 0 || padIndex > 7) return false;
     const pad = this.pads[padIndex];
     if (!pad.buffer) return false;
+
+    // Retrigger: stop the sounding voice (loop scheduler included —
+    // stopPadVoice clears pad.looping, so a loop pad falls through to
+    // startPadLoop below), then start fresh. Skipped when nothing is
+    // sounding, so Alt+tap on a silent pad is a plain play.
+    if (opts?.retrigger && this.padHasLiveVoice(padIndex)) {
+      this.stopPadVoice(padIndex);
+    }
 
     if (pad.loop) {
       if (pad.looping) {
