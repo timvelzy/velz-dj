@@ -18,7 +18,7 @@ import {
 import { DemoSynthBackend, GEMINI_KEY_STORAGE, LoopQueue, LyriaLoopBackend, resolveGeminiApiKey, type GeneratedLoop } from './audio/ai';
 import { SetRecorder, downloadBlob, formatElapsed, type TracklistEntry } from './audio/recorder';
 import { computeBandPeaks, peaksKey } from './audio/peaks';
-import { computeBarLoop, doubleLoop, halveLoop } from './audio/loop';
+import { computeBarLoop, doubleLoop, extendBeatsBackward, halveLoop } from './audio/loop';
 import { loadPeaks, savePeaks } from './audio/peaksStore';
 import {
   autoGainDb,
@@ -1002,9 +1002,13 @@ export default function App() {
   // Traktor-style Set 1.1: re-anchor the beat grid at the playhead. The
   // beat nearest the playhead becomes the new bar-phase origin (that
   // beat's index mod 4 becomes the grid's barPhase, and its time becomes
-  // downbeatOffset). beats[] is never rewritten — only the phase label
-  // moves — so it is instant, and it persists with the grid in the
-  // library record like a hand-fixed grid edit.
+  // downbeatOffset). Existing beat times are never rewritten; the map
+  // is additionally extended BACKWARD from its first beat to 0 at the
+  // first section's tempo, so the intro leads in on the same grid and
+  // play-from-0 does not jump to the first mapped beat. The anchor's
+  // index shifts by the prepend count, so its residue shifts too.
+  // Persisted with the grid in the library record like a hand-fixed
+  // grid edit.
   const setOneOne = useCallback((deckKey: 'A' | 'B') => {
     const deckId = `deck${deckKey}` as 'deckA' | 'deckB';
     const st = deckState(deckKey);
@@ -1034,14 +1038,21 @@ export default function App() {
       j = Math.round((pos - off) / spb);
       anchorTime = off + j * spb;
     }
-    const barPhase = ((j % 4) + 4) % 4;
-    const newGrid: BeatGrid = { ...grid, barPhase, downbeatOffset: Math.max(0, anchorTime) };
+    const ext = extendBeatsBackward(grid.beats, grid.bpmCurve, grid.bpm);
+    const barPhase = (((j + ext.prependCount) % 4) + 4) % 4;
+    const newGrid: BeatGrid = {
+      ...grid,
+      beats: ext.beats,
+      bpmCurve: ext.bpmCurve,
+      barPhase,
+      downbeatOffset: Math.max(0, anchorTime),
+    };
     const d = engine.decks.get(deckId);
     if (d) d.grid = newGrid;
     const next = { ...track, beatGrid: newGrid };
     setDeckState(deckKey, { ...st, track: next });
     setTracks((ts) => ts.map((t) => (t.id === track.id ? next : t)));
-    debugLog('transport', 'grid 1.1 set', deckId, { at: newGrid.downbeatOffset, barPhase });
+    debugLog('transport', 'grid 1.1 set', deckId, { at: newGrid.downbeatOffset, barPhase, prepended: ext.prependCount });
     if (next.fileKey) {
       void saveLibraryRecord(next).catch((e) => console.warn('Could not persist grid anchor', e));
     }

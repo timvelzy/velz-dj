@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { engine } from '../audio/engine';
+import { extendBeatsBackward } from '../audio/loop';
 import type { BeatGrid } from '../types';
 
 interface GridEditorModalProps {
@@ -61,9 +62,17 @@ export default function GridEditorModal({ deckId, deckLabel, grid, onSave, onClo
     // in place would keep syncing to the pre-edit grid (stale beat-map bug).
     const duration = engine.decks.get(deckId)?.buffer?.duration ?? 600;
     const newSpb = 60 / Math.max(1, newBpm);
-    const beats: number[] = [];
-    for (let t = newFirst; t < duration; t += newSpb) beats.push(t);
-    const bpmCurve = beats.map(() => newBpm).slice(0, Math.max(0, beats.length - 1));
+    const forward: number[] = [];
+    for (let t = newFirst; t < duration; t += newSpb) forward.push(t);
+    // Extend backward to 0 so the intro is gridded at the edited tempo
+    // (the old forward-only rebuild left launches snapping to newFirst).
+    const ext = extendBeatsBackward(
+      forward,
+      new Array(Math.max(0, forward.length - 1)).fill(newBpm),
+      newBpm,
+    );
+    const beats = ext.beats;
+    const bpmCurve = ext.bpmCurve;
     // A hand edit rebuilds beats[], so the old barPhase residue is
     // meaningless against the new map: drop it and let barPhaseOf()
     // derive the phase from the NEW downbeatOffset (nearest mapped beat

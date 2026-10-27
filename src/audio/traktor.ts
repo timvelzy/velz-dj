@@ -21,6 +21,7 @@
  */
 
 import type { BeatGrid } from '../types';
+import { barPhaseAfterPrepend, extendBeatsBackward } from './loop';
 
 export interface TraktorHotcue {
   /** Hotcue slot 0-7 */
@@ -107,6 +108,24 @@ function buildGridFromAnchors(
   }
   if (bpmCurve.length >= beats.length) bpmCurve.length = Math.max(0, beats.length - 1);
 
+  // Backward extension: Traktor grids start at the first anchor, so a
+  // quiet intro before it had no mapped beats. Extend at the first
+  // span's tempo (the first curve entry) so the intro is on the grid.
+  // The downbeat anchor time is unchanged; only its index shifts, so
+  // an explicit barPhase must be set or barPhaseOf() would move the
+  // downbeat when it re-derives the residue from the shifted index.
+  const ext = extendBeatsBackward(beats, bpmCurve, bpm);
+  const preGrid: BeatGrid = {
+    bpm,
+    confidence: 0.95,
+    downbeatOffset: firstBeat,
+    firstBeat,
+    tempoStability: anchors.length > 1 ? 0.85 : 1,
+    beats,
+    bpmCurve,
+    method: 'traktor',
+  };
+
   // Downbeat = first anchor (Traktor grid markers sit on bar starts)
   return {
     bpm,
@@ -114,8 +133,11 @@ function buildGridFromAnchors(
     downbeatOffset: firstBeat,
     firstBeat,
     tempoStability: anchors.length > 1 ? 0.85 : 1,
-    beats,
-    bpmCurve,
+    beats: ext.beats,
+    bpmCurve: ext.bpmCurve,
+    ...(ext.prependCount > 0
+      ? { barPhase: barPhaseAfterPrepend(preGrid, ext.prependCount) }
+      : {}),
   };
 }
 
@@ -223,5 +245,17 @@ export function refineTraktorGrid(track: TraktorTrack, duration: number): BeatGr
       t += spb;
     }
   }
-  return { ...track.grid, beats, bpmCurve, firstBeat: anchors[0] ?? track.grid.firstBeat };
+  // Backward extension (idempotent when the grid was already extended
+  // at parse time). Legacy persisted grids get gridded intros here.
+  const preGrid: BeatGrid = { ...track.grid, beats, bpmCurve };
+  const ext = extendBeatsBackward(beats, bpmCurve, track.grid.bpm);
+  return {
+    ...track.grid,
+    beats: ext.beats,
+    bpmCurve: ext.bpmCurve,
+    firstBeat: anchors[0] ?? track.grid.firstBeat,
+    ...(ext.prependCount > 0
+      ? { barPhase: barPhaseAfterPrepend(preGrid, ext.prependCount) }
+      : {}),
+  };
 }

@@ -12,6 +12,7 @@
 
 import type { BeatGrid, SpectralData } from '../types';
 import { debugLog } from './debugLog';
+import { extendBeatsBackward } from './loop';
 
 const MIN_BPM = 60;
 const MAX_BPM = 200;
@@ -189,9 +190,15 @@ async function buildBeatMap(
   }
 
   if (sections.length === 0) {
-    // No usable sections — fall back to flat extrapolation
-    const beats = generateBeats(baseBpm, duration, firstBeat);
-    return { beats, bpmCurve: new Array(Math.max(0, beats.length - 1)).fill(baseBpm), stability: 0.3 };
+    // No usable sections — fall back to flat extrapolation, extended
+    // backward to 0 so the intro is gridded like the walked map below.
+    const forward = generateBeats(baseBpm, duration, firstBeat);
+    const ext = extendBeatsBackward(
+      forward,
+      new Array(Math.max(0, forward.length - 1)).fill(baseBpm),
+      baseBpm,
+    );
+    return { beats: ext.beats, bpmCurve: ext.bpmCurve, stability: 0.3 };
   }
 
   // Walk the track, emitting beats using each section's local BPM,
@@ -225,6 +232,13 @@ async function buildBeatMap(
   }
   if (bpmCurve.length > 0) bpmCurve.pop(); // one fewer intervals than beats
 
+  // Backward extension: the walk starts at firstBeat, so a quiet intro
+  // before it had no mapped beats and launches snapped forward to it.
+  // Extend at the first section's tempo so the intro is on the grid.
+  // analyzeStructure runs against this map, so its anchor index/phase
+  // are computed in the extended indexing and stay consistent.
+  const ext = extendBeatsBackward(beats, bpmCurve, baseBpm);
+
   // Stability = agreement between sections
   const bpms = sections.map((s) => s.bpm);
   const mean = bpms.reduce((a, b) => a + b, 0) / bpms.length;
@@ -232,7 +246,7 @@ async function buildBeatMap(
   const stability = Math.max(0.1, 1 - Math.sqrt(variance) / mean);
 
   onProgress?.(0.85);
-  return { beats, bpmCurve, stability };
+  return { beats: ext.beats, bpmCurve: ext.bpmCurve, stability };
 }
 
 /**

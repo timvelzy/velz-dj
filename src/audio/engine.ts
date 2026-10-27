@@ -113,11 +113,39 @@ export function nextBoundaryWaitBeats(mBeats: number, cycleBeats: number, minAhe
  * phase convention: beat indices i with (i - barPhase) % 4 === 0 are
  * downbeats, where barPhase comes from barPhaseOf() — explicit anchor or
  * derived from downbeatOffset — so a manual Set 1.1 or auto-1.1 anchor
- * moves every downbeat computation together). Falls back to flat
- * downbeatOffset/firstBeat math when the map is thin. Pure.
+ * moves every downbeat computation together). For cue points in the
+ * intro (before the first mapped beat) downbeats are extrapolated
+ * backward from the first downbeat-phase mapped beat, so a cue there
+ * lands on a downbeat-phase time instead of jumping forward past the
+ * intro. Falls back to flat downbeatOffset/firstBeat math when the map
+ * is thin. Pure.
  */
 export function downbeatOffsetFor(grid: BeatGrid, cuePoint: number, duration: number): number {
+  const spb = grid.bpm > 0 ? 60 / grid.bpm : 0;
+  const barDur = 4 * spb;
   if (grid.beats.length > 0) {
+    const phase = barPhaseOf(grid);
+    if (cuePoint < grid.beats[0]) {
+      // Intro region: first downbeat-phase mapped beat, then step
+      // backward by whole bars to the first downbeat at/after the cue.
+      let j0 = 0;
+      while (j0 < grid.beats.length && (((j0 - phase) % 4) + 4) % 4 !== 0) j0++;
+      if (j0 < grid.beats.length) {
+        const curveBpm =
+          grid.bpmCurve[Math.min(j0, Math.max(0, grid.bpmCurve.length - 1))] ?? grid.bpm;
+        const localSpb = curveBpm > 0 ? 60 / curveBpm : spb;
+        const localBarDur = 4 * localSpb;
+        if (localBarDur > 0 && Number.isFinite(localBarDur)) {
+          const k = Math.ceil((cuePoint - grid.beats[j0]) / localBarDur - 1e-9);
+          let target = grid.beats[j0] + k * localBarDur;
+          let guard = 0;
+          while (target < 0 && guard++ < 100000) target += localBarDur;
+          if (duration > 0 && target >= duration) return Math.max(0, target % duration);
+          return Math.max(0, target);
+        }
+      }
+      // No downbeat-phase beat in the map: fall through to flat math.
+    }
     let lo = 0, hi = grid.beats.length - 1, first = grid.beats.length;
     while (lo <= hi) {
       const mid = (lo + hi) >> 1;
@@ -125,16 +153,19 @@ export function downbeatOffsetFor(grid: BeatGrid, cuePoint: number, duration: nu
       else lo = mid + 1;
     }
     if (first < grid.beats.length) {
-      const phase = barPhaseOf(grid);
       const j = first + (((phase - first) % 4) + 4) % 4;
       if (j < grid.beats.length) return grid.beats[j];
     }
   }
   const off = grid.downbeatOffset >= 0 ? grid.downbeatOffset : grid.firstBeat >= 0 ? grid.firstBeat : 0;
-  const spb = 60 / grid.bpm;
-  const barDur = 4 * spb;
-  const k = Math.ceil(Math.max(0, cuePoint - off) / barDur);
-  const target = off + k * barDur;
+  if (!(barDur > 0) || !Number.isFinite(barDur)) return Math.max(0, off);
+  // Flat math, extrapolated both ways: a cue before the offset lands on
+  // the downbeat-phase time at/after it (stepping backward), not on the
+  // offset itself, so intros lead in instead of jumping forward.
+  const k = Math.ceil((cuePoint - off) / barDur - 1e-9);
+  let target = off + k * barDur;
+  let guard = 0;
+  while (target < 0 && guard++ < 100000) target += barDur;
   if (duration > 0 && target >= duration) return Math.max(0, target % duration);
   return Math.max(0, target);
 }
@@ -1145,11 +1176,18 @@ export class DJEngine {
     const dur = d.buffer?.duration ?? time;
     let snapped = time;
     if (g.beats.length > 0) {
-      // Binary search for the insertion point, then pick the nearer neighbor
+      // Binary search for the insertion point, then pick the nearer neighbor.
+      // Before the first mapped beat, extrapolate beats backward at the
+      // first section's tempo (the intro grid) instead of snapping
+      // forward to beats[0] — that forward snap is the play-from-0 jerk.
       let lo = 0;
       let hi = g.beats.length - 1;
-      if (time <= g.beats[0]) snapped = g.beats[0];
-      else if (time >= g.beats[hi]) snapped = g.beats[hi];
+      if (time <= g.beats[0]) {
+        const curveBpm = g.bpmCurve[0] ?? g.bpm;
+        const localSpb = curveBpm > 0 ? 60 / curveBpm : 60 / g.bpm;
+        const k = Math.round((g.beats[0] - time) / localSpb);
+        snapped = g.beats[0] - k * localSpb;
+      } else if (time >= g.beats[hi]) snapped = g.beats[hi];
       else {
         while (hi - lo > 1) {
           const mid = (lo + hi) >> 1;
@@ -1233,9 +1271,20 @@ export class DJEngine {
       this.play(id, { offset });
       return this.ctx.currentTime;
     }
-    const startOffset = mode === 'bar'
-      ? this.downbeatOffset(id, offset)
-      : this.quantizeToBeat(id, offset);
+    // Intro lead-in rule (bar mode): when the requested offset sits
+    // before the first downbeat-phase beat, starting at that downbeat
+    // would skip the intro (the jerk). Start at the offset exactly at
+    // the next master bar boundary instead: the backward-extended grid
+    // defines the offset's phase, and the PLL locks during the lead-in,
+    // so the drop lands in phase. At/after the first downbeat, keep
+    // the existing downbeat jump so drops stay phrase-aligned.
+    let startOffset: number;
+    if (mode === 'bar') {
+      const firstDownbeat = this.downbeatOffset(id, 0);
+      startOffset = offset < firstDownbeat ? offset : this.downbeatOffset(id, offset);
+    } else {
+      startOffset = this.quantizeToBeat(id, offset);
+    }
     this.play(id, { offset: startOffset, startAt });
     debugLog('transport', 'quantized launch queued', id, { mode, at: startAt, offset: startOffset });
     return startAt;

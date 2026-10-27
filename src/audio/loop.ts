@@ -61,6 +61,72 @@ export interface BarLoop {
   end: number;
 }
 
+/**
+ * Backward grid extension ("grid the other way"): step the beat map
+ * backward from beats[0] to the start of the track so a quiet intro
+ * leads in on the same grid as the first kick, instead of the launch
+ * paths snapping forward to the first mapped beat (the audible jerk).
+ * Existing beat times are never changed; only new beats are prepended,
+ * spaced by the first section's tempo (bpmCurve[0] ?? bpm). This is the
+ * same constant-tempo-in-the-intro assumption beatsAtPosition already
+ * makes when it extrapolates before beats[0]; it is exact for steady
+ * grids and approximate where the intro genuinely drifts.
+ *
+ * bpmCurve: the incoming length relationship is preserved. When the
+ * curve holds one entry per interval (beats.length - 1, the usual
+ * buildBeatMap/GridEditor shape) it grows by prependCount so it still
+ * holds one entry per interval; when it holds one entry per beat it
+ * grows by the same amount. An empty curve stays empty (flat fallback).
+ */
+export function extendBeatsBackward(
+  beats: readonly number[],
+  bpmCurve: readonly number[],
+  bpm: number,
+): { beats: number[]; bpmCurve: number[]; prependCount: number } {
+  const unchanged = { beats: [...beats], bpmCurve: [...bpmCurve], prependCount: 0 };
+  if (beats.length === 0 || !(bpm > 0)) return unchanged;
+  const first = beats[0];
+  if (!(first > 0)) return unchanged;
+  const firstCurve = bpmCurve.length > 0 ? bpmCurve[0] : undefined;
+  const sectionBpm =
+    firstCurve !== undefined && Number.isFinite(firstCurve) && firstCurve > 0 ? firstCurve : bpm;
+  const spb = 60 / sectionBpm;
+  if (!(spb > 0) || !Number.isFinite(spb)) return unchanged;
+  // Whole steps back that land at >= 0. The 1e-6 slack absorbs float
+  // dust when firstBeat is an exact multiple of spb; a step that lands
+  // a hair below 0 is clamped to 0 below.
+  const count = Math.min(100000, Math.floor(first / spb + 1e-6));
+  if (count <= 0) return unchanged;
+  const prepended: number[] = [];
+  for (let k = count; k >= 1; k--) {
+    let t = first - k * spb;
+    if (t < 0) t = 0;
+    if (prepended.length > 0 && t <= prepended[prepended.length - 1] + 1e-9) continue;
+    if (t >= first - 1e-9) continue; // never duplicate beats[0]
+    prepended.push(t);
+  }
+  if (prepended.length === 0) return unchanged;
+  const prependCount = prepended.length;
+  const newCurve =
+    bpmCurve.length === 0
+      ? []
+      : [...new Array(prependCount).fill(sectionBpm), ...bpmCurve];
+  return { beats: [...prepended, ...beats], bpmCurve: newCurve, prependCount };
+}
+
+/**
+ * Bar-phase residue after beats were prepended: the downbeat beat keeps
+ * its TIME, so its index shifts by prependCount and the residue must
+ * shift by the same amount, or barPhaseOf() would move the downbeat.
+ * Uses barPhaseOf() so grids with no explicit barPhase (phase derived
+ * from downbeatOffset) are handled the same way. Use this only when
+ * the downbeat anchor itself is unchanged; Set 1.1 re-anchors to a
+ * different beat and computes its residue from the new index directly.
+ */
+export function barPhaseAfterPrepend(grid: BeatGrid, prependCount: number): number {
+  return (((barPhaseOf(grid) + prependCount) % 4) + 4) % 4;
+}
+
 function clamp(v: number, lo: number, hi: number): number {
   return Math.min(hi, Math.max(lo, v));
 }
