@@ -43,6 +43,50 @@ Arming also re-matches the tempo against the slave's local BPM at the
 launch position (the same snap `setSync` does) and resets the lock
 streak, so LOCKED is never claimed on a stale ratio.
 
+## Glitch fix (2026-10-27, Tim's live test: "lots of audio glitches")
+
+Tim heard glitches most right after Play, but still after the first
+bar. Four mechanisms, all verified in code (two harnesses: a worklet
+A/B driving the slew tempo trajectory, and a closed-loop simulation
+of the exact `syncTick` math against synthetic snapped beat maps):
+
+1. **Handover jump.** The holding-PLL branch assigned `syncCorr`
+   directly — a ~1.5% instant tempo step at every catch-up disarm.
+   Fix: EVERY `syncCorr` change goes through `slewSyncCorr`
+   (0.5%/tick), slew and PLL alike.
+2. **Arm snap.** `armCatchup` reset `syncCorr = 1`, jumping the tempo
+   on relaunch with a stale correction. Fix: `syncCorr` is left at
+   its value; the slew limiter moves it.
+3. **WSOLA bypass flapping + FIFO starvation.** Bypass engaged at
+   |tempo−1| < 0.0005 with a hard state reset per crossing, and the
+   step-availability check demanded the full forward search window,
+   zero-filling whole quanta (silence) when the read pointer sat on
+   the knife's edge at tempo ≈ 1. The slew forces tempo through 1.0,
+   so every launch crossed the band repeatedly. Fix: hysteresis
+   (exit at 0.002, enter at 0.0005 after a 12-quanta dwell),
+   128-sample crossfades across transitions, and a clamped search
+   window (only fail when no full grain fits). Worklet A/B: 88
+   clicks / 53 big / 8 silent quanta (old) → 16 / 0 / 0 (new).
+4. **Phase-counter sawtooth (the persistent component).** The beat
+   map snaps each beat to the nearest transient (±60ms), but
+   `beatsAtPosition` interpolated segments at the flat section BPM,
+   so the counter JUMPED by up to the snap delta at every beat
+   boundary. The loop chased that sawtooth forever — the jumps do
+   not shrink as the press error converges, which is why glitches
+   continued after the first bar. Fix: interpolate at the actual
+   snapped interval rate, making the counter continuous and
+   monotonic (bpmCurve still drives tempo follow). Closed-loop sim:
+   max per-tick error jump 40ms+ (old) → 4–7ms (new); limiter
+   pegging 15–19% of ticks (old) → 5% (new, initial convergence
+   only); post-disarm hold ~13–20ms at realistic ±10ms snap.
+
+Disarm verified, not assumed: the closed-loop sim disarms in 1–6s
+for typical errors (≤1 beat) and ~12s at the ±2-beat wrap boundary,
+inside the 16s deadline, in all grid variants. The holding PLL does
+not generate artifacts itself — it was chasing the jumping
+measurement. No persistent WSOLA/buffer disturbance exists beyond
+the first bar; worklet state is self-healing (sliding ring window).
+
 ## Phase meter during convergence
 
 The meter reads `syncStatus()`, which measures the *sounding*
@@ -81,3 +125,11 @@ intro instead of skipping it), sampler behavior, autopilot, FX strip.
 4. SYNC off + QTZ on: still waits for the bar (unchanged).
 5. CUE hold with QTZ on + SYNC on: still drops on the bar.
 6. QTZ off: unchanged immediate start.
+7. CLEAN AUDIO (the glitch fix — listen, don't just watch the
+   meter): SYNC on, press off-beat, and listen through convergence
+   AND for a full minute after: no clicks, dropouts, pumping, or
+   warble at any point, including on the second and third bars.
+   Large phase error (press ~a bar off): still converges with no
+   artifacts. If any click remains, note whether it is at the press,
+   during convergence, or steady-state — that discriminates the
+   remaining cause.

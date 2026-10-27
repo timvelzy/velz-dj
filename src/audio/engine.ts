@@ -1068,6 +1068,20 @@ export class DJEngine {
    * Fractional beat position at a track time, using the beat map when
    * available (Traktor import or analyzed beat map) and falling back to
    * straight extrapolation from bpm + firstBeat.
+   *
+   * CONTINUITY CONTRACT: the returned counter is continuous and
+   * monotonic in posSec. Within a mapped segment it advances at the
+   * ACTUAL snapped interval rate (beats[lo+1] - beats[lo]), NOT at
+   * the section BPM from bpmCurve. The beat map is built by snapping
+   * each beat to the nearest transient (±60ms), so the section BPM
+   * generally does not equal 60/interval — interpolating at the
+   * section rate made the counter JUMP by up to the snap delta at
+   * every beat boundary, and the sync loop chased that sawtooth
+   * forever (the catch-up slew's gain 0.5 turns a 60ms jump into a
+   * 6% tempo yank, every beat, long after convergence). bpmCurve
+   * still drives the tempo-follow ratio (bpmAtPosition); only the
+   * phase counter uses interval rates. Head/tail extrapolations use
+   * the flat BPM and meet the mapped counter exactly at the ends.
    */
   private beatsAtPosition(d: DeckNodes, posSec: number): number {
     const g = d.grid!;
@@ -1088,7 +1102,11 @@ export class DJEngine {
         const mid = (lo + hi) >> 1;
         if (g.beats[mid] <= posSec) lo = mid; else hi = mid;
       }
-      const spb = 60 / (g.bpmCurve[lo] ?? g.bpm);
+      // Interval rate (see continuity contract above). Beats are
+      // strictly increasing (snap windows never overlap), so the
+      // interval is positive; the fallback only guards corrupt maps.
+      const interval = g.beats[hi] - g.beats[lo];
+      const spb = interval > 0 ? interval : 60 / (g.bpmCurve[lo] ?? g.bpm);
       return lo + (posSec - g.beats[lo]) / spb;
     }
     const off = g.downbeatOffset >= 0 ? g.downbeatOffset : g.firstBeat;
@@ -1182,6 +1200,25 @@ export class DJEngine {
    * the integral clamp is 1% with a 2%/s slew limit, and the LOCKED
    * claim moved to syncStatus as a sustained + grid-trusted criterion.
    */
+  /**
+   * Move a deck's sync correction toward a target by at most 0.5% per
+   * 50ms tick (10%/s), with the 0.02% no-op deadband. EVERY syncCorr
+   * change goes through here — the catch-up slew and the holding PLL
+   * alike. A direct assignment (the old PLL branch) steps the tempo in
+   * one tick: at catch-up handover that is a ~1.5% instant jump, and
+   * on a section-boundary error step it can be larger. Rate-limiting
+   * keeps the worklet's tempo trajectory continuous, so convergence
+   * and handover are click-free. Returns whether syncCorr changed.
+   */
+  private slewSyncCorr(d: DeckNodes, target: number): boolean {
+    const next = d.syncCorr + clamp(target - d.syncCorr, -0.005, 0.005);
+    if (Math.abs(next - d.syncCorr) > 0.0002) {
+      d.syncCorr = next;
+      return true;
+    }
+    return false;
+  }
+
   private syncTick(): void {
     // Nudge anti-latch enforcement (runs even without a master)
     const now = this.ctx.currentTime;
@@ -1250,13 +1287,10 @@ export class DJEngine {
       }
       if (d.catchupUntil > 0 && now < d.catchupUntil) {
         const target = catchupCorrection(errCtl);
-        // Slew limit: 0.5% per 50ms tick (10%/s) — full ±8% authority
-        // in 0.8s, gentle for the worklet, far inside a bar at any tempo.
-        const next = d.syncCorr + clamp(target - d.syncCorr, -0.005, 0.005);
-        if (Math.abs(next - d.syncCorr) > 0.0002) {
-          d.syncCorr = next;
-          changed = true;
-        }
+        // Slew limit shared with the holding PLL (see slewSyncCorr):
+        // 0.5% per 50ms tick (10%/s) — full ±8% authority in 0.8s,
+        // gentle for the worklet, far inside a bar at any tempo.
+        if (this.slewSyncCorr(d, target)) changed = true;
       } else {
         if (d.catchupUntil > 0) d.catchupUntil = 0; // deadline passed
         // Integral term: absorbs steady-state rate mismatch so it dies
@@ -1270,10 +1304,11 @@ export class DJEngine {
         const dInt = clamp(errCtl * 0.004, -0.001, 0.001);
         d.syncInt = clamp(d.syncInt + dInt, -0.01, 0.01);
         const corr = pllCorrection(errCtl, d.syncInt);
-        if (Math.abs(corr - d.syncCorr) > 0.0002) {
-          d.syncCorr = corr;
-          changed = true;
-        }
+        // Rate-limited like the slew (see slewSyncCorr): a direct
+        // assignment steps the tempo at catch-up handover and on
+        // section-boundary error jumps. The limiter only binds on
+        // sudden jumps; steady-state tracking moves far slower.
+        if (this.slewSyncCorr(d, corr)) changed = true;
       }
       // Lock streak (round 5): LOCKED is a sustained claim, not one
       // lucky poll. 10 consecutive ticks (500ms) inside ±30ms — the
@@ -1381,7 +1416,13 @@ export class DJEngine {
     }
     d.syncFollowSm = d.syncBaseTempo;
     d.syncInt = 0;
-    d.syncCorr = 1;
+    // NOTE: syncCorr is deliberately NOT reset to 1 here. A relaunch
+    // with a stale correction (e.g. 0.97 from a previous synced play)
+    // would jump the tempo on the first applyTempo after play() — an
+    // audible lurch at the exact moment the deck starts. The slew's
+    // per-tick limiter (see slewSyncCorr) moves syncCorr from wherever
+    // it is toward the catch-up target instead, so the launch itself
+    // is click-free.
     d.syncLockStreak = 0;
     const spb = mBpm > 0 ? 60 / mBpm : 0.5;
     d.catchupUntil = this.ctx.currentTime + clamp(32 * spb, 2, 16);

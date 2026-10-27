@@ -25,7 +25,16 @@ const HS = 256; // synthesis hop → 75% overlap
 const TOL = 192; // correlation search tolerance (samples)
 const SEARCH_STEP = 8;
 const RING_SIZE = 32768; // input ring buffer (plenty for TOL + N + jitter)
-const BYPASS_EPS = 0.0005;
+// Bypass hysteresis (see processInner): engaging/disengaging the
+// bit-transparent bypass is a discontinuity — WSOLA output lags the
+// input by ~N+TOL samples, so a hard switch jumps time and clicks.
+// The exit band is 4x the enter band and entry needs a sustained stay,
+// so PLL dither around 1.0 cannot flap the switch; transitions
+// crossfade over BLEND_SAMPLES instead of cutting.
+const BYPASS_ENTER_EPS = 0.0005;
+const BYPASS_EXIT_EPS = 0.002;
+const BYPASS_DWELL_QUANTA = 12; // ~35ms inside the band before engaging
+const BLEND_SAMPLES = 128; // ~3ms crossfade across a bypass transition
 
 function hann(n: number, i: number): number {
   return 0.5 * (1 - Math.cos((2 * Math.PI * i) / (n - 1)));
@@ -37,6 +46,17 @@ for (let i = 0; i < N; i++) WIN[i] = hann(N, i);
 class WsolaProcessor extends AudioWorkletProcessor {
   private tempoTarget = 1;
   private tempoSmooth = 1;
+
+  // Bypass hysteresis + transition blends (see processInner). The
+  // bypass band is a discontinuity: stretched output lags the input
+  // by ~N+TOL samples, so a hard switch jumps time and clicks, and
+  // every switch resets the stretch state. Hysteresis keeps tempo
+  // dither around 1.0 from flapping the switch; the blends crossfade
+  // across it instead of cutting.
+  private bypass = true; // tempo starts at 1: direct until proven otherwise
+  private bypassDwell = 0; // consecutive quanta inside the enter band
+  private enterBlend = 0; // samples left of stretched -> direct crossfade
+  private exitBlend = 0; // samples left of direct -> stretched crossfade
 
   // Input ring buffers (stereo)
   private inBuf: Float32Array[] = [new Float32Array(RING_SIZE), new Float32Array(RING_SIZE)];
@@ -108,8 +128,19 @@ class WsolaProcessor extends AudioWorkletProcessor {
       if (aStar < 0) return false; // not enough input buffered yet
     } else {
       const aNom = this.lastA + Ha;
-      // Do we have enough input? need [aNom - TOL, aNom + TOL + N)
-      if (aNom + TOL + N > this.inWrite) return false;
+      // Availability: a full grain must fit in the buffered input, but
+      // the search window does NOT need to fit in full. The old check
+      // (aNom + TOL + N > inWrite -> fail) demanded the entire forward
+      // search room be buffered; at tempo ~= 1 the read pointer
+      // advances exactly as fast as the write pointer, so the check
+      // lands on a knife's edge and fails for a quantum at a time —
+      // the emit path then zero-fills a whole quantum (silence) and
+      // the next quantum resumes with a jump. That is the dropout
+      // heard 1-2 quanta after every bypass re-engage. Clamp the
+      // search to the input actually available instead: only fail
+      // when not even the earliest candidate leaves a full grain.
+      const maxD = Math.min(TOL, this.inWrite - N - aNom);
+      if (maxD < -TOL) return false; // no full grain fits yet (cold start)
       if (aNom - TOL < this.inWrite - RING_SIZE) {
         // OVERRUN (dropout hardening): the read pointer fell more than a
         // full ring behind the write pointer — sustained tempo < 1, or a
@@ -133,20 +164,21 @@ class WsolaProcessor extends AudioWorkletProcessor {
         tailEnergy += s * s;
       }
       if (tailEnergy < 1e-7) {
-        aStar = Math.round(aNom);
+        // No search: still clamp to the available input (see above).
+        aStar = Math.min(Math.round(aNom), this.inWrite - N);
       } else {
         let best = -2;
         let bestD = 0;
-        for (let d = -TOL; d <= TOL; d += SEARCH_STEP) {
+        for (let d = -TOL; d <= maxD; d += SEARCH_STEP) {
           const s = this.correlate(Math.round(aNom + d));
           if (s > best) {
             best = s;
             bestD = d;
           }
         }
-        // refine around best
+        // refine around best (staying inside the available window)
         for (let d = bestD - SEARCH_STEP; d <= bestD + SEARCH_STEP; d += 2) {
-          if (Math.abs(d) > TOL) continue;
+          if (Math.abs(d) > TOL || d > maxD) continue;
           const s = this.correlate(Math.round(aNom + d));
           if (s > best) {
             best = s;
@@ -237,27 +269,8 @@ class WsolaProcessor extends AudioWorkletProcessor {
     this.tempoSmooth += (this.tempoTarget - this.tempoSmooth) * k;
     const r = this.tempoSmooth;
 
-    if (Math.abs(r - 1) < BYPASS_EPS) {
-      // Bit-transparent bypass; reset stretch state so re-engage is clean
-      for (let ch = 0; ch < this.channels; ch++) {
-        output[ch].set(input[ch].subarray(0, frames));
-      }
-      for (let ch = this.channels; ch < output.length; ch++) output[ch].fill(0);
-      this.lastA = -1;
-      this.ola[0].fill(0);
-      this.ola[1].fill(0);
-      this.outCount = 0;
-      // keep ring fresh anyway (cheap) so engage has history
-      for (let i = 0; i < frames; i++) {
-        for (let ch = 0; ch < this.channels; ch++) {
-          this.inBuf[ch][this.inWrite & (RING_SIZE - 1)] = input[ch][i];
-        }
-        this.inWrite++;
-      }
-      return true;
-    }
-
-    // 1. Push input into ring
+    // 1. Push input into the ring on every path (bypass keeps it fresh
+    // so re-engage has history to grain from).
     for (let i = 0; i < frames; i++) {
       const w = this.inWrite & (RING_SIZE - 1);
       for (let ch = 0; ch < this.channels; ch++) {
@@ -266,13 +279,111 @@ class WsolaProcessor extends AudioWorkletProcessor {
       this.inWrite++;
     }
 
-    // 2. Run WSOLA steps until we can fill this quantum
+    // 2. Bypass hysteresis: enter only after a sustained stay inside
+    // the narrow band; leave as soon as clearly outside it. Without
+    // this, tempo dither around 1.0 flips the switch every few quanta,
+    // and every flip resets the stretch state — the click/stutter
+    // heard through every sync convergence once the catch-up slew
+    // started driving tempo through 1.0 and back.
+    if (this.bypass) {
+      if (Math.abs(r - 1) > BYPASS_EXIT_EPS) {
+        this.bypass = false;
+        this.bypassDwell = 0;
+        this.exitBlend = BLEND_SAMPLES;
+      }
+    } else if (Math.abs(r - 1) < BYPASS_ENTER_EPS) {
+      if (++this.bypassDwell >= BYPASS_DWELL_QUANTA) {
+        this.bypass = true;
+        this.bypassDwell = 0;
+        this.enterBlend = BLEND_SAMPLES;
+      }
+    } else {
+      this.bypassDwell = 0;
+    }
+
+    // 3. Steady bypass: bit-transparent direct copy, stretch state
+    // parked (resetting it every quantum is harmless — it is already
+    // zero — and protects against stale state).
+    if (this.bypass && this.enterBlend === 0) {
+      for (let ch = 0; ch < this.channels; ch++) {
+        output[ch].set(input[ch].subarray(0, frames));
+      }
+      for (let ch = this.channels; ch < output.length; ch++) output[ch].fill(0);
+      this.lastA = -1;
+      this.ola[0].fill(0);
+      this.ola[1].fill(0);
+      this.outCount = 0;
+      return true;
+    }
+
+    // 4. Run WSOLA steps until we can fill this quantum (on the exit
+    // quantum this primes the FIFO from the fresh ring before the
+    // blend below; on the enter quantum it tops up the FIFO we are
+    // blending out of).
     let guard = 0;
     while (this.outCount < frames && guard++ < 16) {
       if (!this.step(r)) break;
     }
 
-    // 3. Emit
+    // 5a. Entering bypass: crossfade the remaining stretched FIFO into
+    // the direct signal, then park the stretch state. The blend absorbs
+    // the WSOLA lookahead time jump instead of cutting across it.
+    if (this.enterBlend > 0) {
+      const n = Math.min(frames, this.outCount);
+      const blend = Math.min(this.enterBlend, n);
+      const done = BLEND_SAMPLES - this.enterBlend;
+      for (let ch = 0; ch < this.channels; ch++) {
+        const out = output[ch];
+        const fifo = this.outFifo[ch];
+        const inp = input[ch];
+        for (let i = 0; i < blend; i++) {
+          const t = (done + i + 1) / BLEND_SAMPLES; // 0 -> 1: stretched weight falls
+          out[i] = fifo[i] * (1 - t) + inp[i] * t;
+        }
+        for (let i = blend; i < n; i++) out[i] = fifo[i];
+        for (let i = n; i < frames; i++) out[i] = inp[i];
+      }
+      for (let ch = this.channels; ch < output.length; ch++) output[ch].fill(0);
+      this.enterBlend = 0;
+      this.lastA = -1;
+      this.ola[0].fill(0);
+      this.ola[1].fill(0);
+      this.outCount = 0;
+      return true;
+    }
+
+    // 5b. Leaving bypass: crossfade the direct signal into the primed
+    // FIFO. If the FIFO could not prime yet (cold start — not enough
+    // input buffered), fall back to the direct signal for the shortfall
+    // and stay armed: the next quantum re-primes and blends then.
+    // Direct fallback, never silence, while a transition is pending.
+    if (this.exitBlend > 0) {
+      const n = Math.min(frames, this.outCount);
+      const blend = Math.min(this.exitBlend, n);
+      const done = BLEND_SAMPLES - this.exitBlend;
+      for (let ch = 0; ch < this.channels; ch++) {
+        const out = output[ch];
+        const fifo = this.outFifo[ch];
+        const inp = input[ch];
+        for (let i = 0; i < blend; i++) {
+          const t = (done + i + 1) / BLEND_SAMPLES; // 0 -> 1: stretched weight rises
+          out[i] = inp[i] * (1 - t) + fifo[i] * t;
+        }
+        for (let i = blend; i < n; i++) out[i] = fifo[i];
+        for (let i = n; i < frames; i++) out[i] = inp[i];
+      }
+      for (let ch = this.channels; ch < output.length; ch++) output[ch].fill(0);
+      if (n > 0) {
+        for (let ch = 0; ch < this.channels; ch++) {
+          this.outFifo[ch].copyWithin(0, n, this.outCount);
+        }
+        this.outCount -= n;
+      }
+      this.exitBlend -= blend;
+      return true;
+    }
+
+    // 6. Steady stretched emit (unchanged).
     const n = Math.min(frames, this.outCount);
     for (let ch = 0; ch < this.channels; ch++) {
       output[ch].set(this.outFifo[ch].subarray(0, n));
