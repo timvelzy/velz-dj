@@ -27,7 +27,13 @@ setPadQuantize(quantize: boolean): void                  // global toggle
 getPadState(padIndex: number): { loaded: boolean; name: string; volume: number }
 ```
 - **Quantize:** when enabled, pad triggers align to the next beat using the playing deck's beat map (reuse the beat-grid infrastructure from the sync engine). If no beat map, trigger immediately.
-- **Retrigger:** triggering a pad while its sample is playing restarts it (standard one-shot behavior).
+- **Tap-again stop (changed 2026-10-27):** tapping a sounding pad
+  again stops it immediately with a quick fade — one-shots and loops
+  alike. Previously a tap retriggered a one-shot and a loop tap let
+  the sounding pass finish. To play a stopped pad again, tap once
+  more. Disarming LOOP mid-loop and loading a new sample keep the
+  old finish-the-pass semantics; only the explicit tap-again stop
+  (and the STOP surfaces below) cut immediately.
 - **Persistence:** store pad assignments (name + volume, not audio data) in IndexedDB alongside the Traktor collection. Audio buffers reload from the library on startup; prompt to re-link missing files.
 
 ### Sample sources
@@ -49,8 +55,9 @@ getPadState(padIndex: number): { loaded: boolean; name: string; volume: number }
 ### Loop mode (implemented 2026-10-27)
 - Per-pad LOOP arm/disarm (UI button, keyboard via pad key, MIDI-learnable
   `sampler.pad[N].loop`). Tapping a loop-armed pad starts the loop;
-  tapping again stops it — the sounding pass finishes, nothing new is
-  scheduled. One-shot behavior is unchanged when loop is off.
+  tapping again stops it immediately with a quick fade (changed
+  2026-10-27 — previously the sounding pass finished). One-shot
+  behavior is unchanged when loop is off, except the tap-again stop.
 - Sync: the loop period is the sample duration rounded to the nearest
   whole master beats (1–32). Iteration starts land on master beat
   boundaries (first hit uses the existing next-beat quantize; each
@@ -80,6 +87,54 @@ getPadState(padIndex: number): { loaded: boolean; name: string; volume: number }
   Handle dragging maps to the zoomed time scale; dragging the
   waveform background pans the zoomed view. Zoom is view-only state,
   not persisted.
+
+### Playhead + audition (implemented 2026-10-27)
+
+- A white playhead line overlays the editor waveform while the pad
+  sounds, so trim edits can be judged against what is playing. It is
+  a DOM line positioned imperatively by requestAnimationFrame
+  reading the audio clock through `engine.padPlaybackPosition`
+  (scheduled start time + `AudioContext.currentTime`, per voice, so
+  loop iterations wrap naturally) — never React state per frame, so
+  it cannot stall the pads. rAF runs only while a voice is sounding;
+  when idle the check backs off to a 250ms timer so a later pad tap
+  wakes it; everything cancels on editor close/unmount.
+- The line maps through the same zoomed/panned time scale as the
+  waveform. A position outside the visible window pins the line to
+  the near edge with a ◀/▶ arrow instead of vanishing. With nothing
+  sounding the line parks at the trim start, dimmed. A trim edit
+  mid-voice does not move the sounding voice's record, so the line
+  may sit in the newly shaded-out region until the next trigger —
+  that is what is actually heard.
+- AUDITION button in the editor plays the current trim region
+  through the existing trigger path (same gain/EQ/trim; looped when
+  loop-armed, one-shot otherwise). While the pad sounds the button
+  reads STOP and cuts the voice immediately. The pad's mini waveform
+  deliberately has no playhead: it shares none of the editor's
+  machinery, and duplicating it was not worth it — FINE-TUNE jumps
+  to the editor where the playhead lives.
+
+### Stop semantics (implemented 2026-10-27)
+
+- One engine method, `engine.stopPadVoice`, serves every surface:
+  it cancels loop scheduling and fades the sounding voice out with
+  the 5ms fade shape (source stops ~50ms later, once the fade has
+  landed), so the cut never clicks. Voices still waiting out a
+  quantize delay or a lookahead slot cancel outright. Trim, EQ,
+  volume, and loop-arm state are untouched; the pad keeps its
+  sample. No persistence changes.
+- Surfaces: (1) tap a sounding pad again — mouse pointer-down, pad
+  key `1`–`8`, or MIDI pad trigger — stops it immediately; tap once
+  more to play again. (2) ■ STOP ALL in the sampler header (keyboard
+  `0`, free: pad keys are `1`–`8`, Shift+`1`–`8` opens menus, Escape
+  closes them) stops every sounding pad at once; decks are
+  untouched. (3) ■ STOP in the per-pad quick menu. (4) the trim
+  editor's AUDITION/STOP button, which reads STOP while the pad
+  sounds however playback started.
+- Explicitly unchanged: disarming LOOP mid-loop and loading a new
+  sample still let the sounding voice finish its pass; Clear still
+  stops and wipes the pad. Only the tap-again stop and the STOP
+  surfaces cut immediately.
 
 ### Quick menu + per-pad EQ + LIVE trigger (implemented 2026-10-27)
 
@@ -238,5 +293,7 @@ setFxEnabled(enabled: boolean): void                     // bypass
 - [ ] Sampler: trigger all 8 pads rapidly, confirm no dropouts; test quantize on/off
 - [ ] Sampler quick menu: ⋯ opens instantly, EQ knobs audible on a sounding pad, trim fields + LIVE toggle live, menu stays open while other pads play, Escape/outside-tap closes; reload restores EQ + LIVE; old saved pads (no EQ fields) restore flat/off
 - [ ] Sampler feel: pad tap with a master playing, QUANTIZE on, LIVE off = waits for the next beat (by design); LIVE on = first hit at once, loop locks to the grid after; pointer-down trigger (no pointer-up wait)
+- [ ] Sampler playhead: open EDIT on a sounding loop, playhead tracks the trim region; zoom in and confirm it stays mapped; zoom so the playhead leaves the window and confirm the edge arrow; AUDITION from the editor, STOP cuts at once; close the editor and confirm no stray CPU use
+- [ ] Sampler stop: start a long one-shot, tap the pad again mid-play and confirm immediate silence (no finish-the-pass, no retrigger); start a loop, tap again and confirm it stops at once; STOP ALL (`0` key) with several pads sounding; stop from the quick menu and from the editor; confirm pads keep samples, trim, EQ, and loop-arm state after stopping
 - [ ] FX delay: confirm delay time tracks tempo changes (pitch bend the deck, delay follows)
 - [ ] MIDI: map S8 knobs to filter + FX params, confirm smooth response

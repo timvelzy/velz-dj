@@ -133,6 +133,13 @@ function TrimEditor({ index, state, onTrim, onReset, onClose, onAudition, onStop
   const [auditioning, setAuditioning] = useState(false);
   const auditioningRef = useRef(false);
   auditioningRef.current = auditioning;
+  // Sounding state: true while any voice of this pad is audible (or
+  // the loop is between iterations) — drives the AUDITION/STOP label
+  // whether playback started from the editor or from a pad tap. The
+  // playhead loop below keeps it fresh without re-rendering per
+  // frame (it only sets state when the value flips).
+  const [sounding, setSounding] = useState(false);
+  const soundingRef = useRef(false);
   // True once the auditioned voice has actually been heard; guards the
   // natural-end detection so a quantize wait doesn't clear AUDITION
   // before the first hit lands.
@@ -192,6 +199,14 @@ function TrimEditor({ index, state, onTrim, onReset, onClose, onAudition, onStop
         heardRef.current = false;
         setAuditioning(false);
       }
+      // The AUDITION/STOP label follows real sounding state, not just
+      // editor presses: a loop is "sounding" even in the silent gap
+      // between iterations, so the button still offers STOP there.
+      const isSounding = pos !== null || engine.pads[index].looping;
+      if (isSounding !== soundingRef.current) {
+        soundingRef.current = isSounding;
+        setSounding(isSounding);
+      }
       if (line && wrap) {
         const { viewStart: vs, viewDur: vd, trimStart: ts } = viewRef.current;
         const target = pos ?? ts;
@@ -232,11 +247,13 @@ function TrimEditor({ index, state, onTrim, onReset, onClose, onAudition, onStop
 
   // Audition: hear the current trim region from the editor, through
   // the existing pad trigger path (same gain/EQ/trim semantics — loop
-  // when the pad is loop-armed, one-shot otherwise). STOP cuts the
-  // voice immediately via engine.stopPadVoice; closing the editor
-  // leaves playback running, exactly like tapping a pad and closing.
+  // when the pad is loop-armed, one-shot otherwise). While anything
+  // is sounding the same button is STOP: it cuts the voice
+  // immediately via engine.stopPadVoice, whether playback started
+  // here or from a pad tap. Closing the editor leaves playback
+  // running, exactly like tapping a pad and closing.
   const handleAudition = () => {
-    if (state.looping || auditioning) {
+    if (sounding) {
       onStop();
       heardRef.current = false;
       setAuditioning(false);
@@ -418,9 +435,9 @@ function TrimEditor({ index, state, onTrim, onReset, onClose, onAudition, onStop
         <button
           onClick={handleAudition}
           className="text-[11px] font-mono text-zinc-100 hover:text-white border border-cyan-700 bg-cyan-900/40 rounded px-2 py-0.5"
-          title="Hear the current trim region from the editor (looped when the pad is loop-armed, one-shot otherwise). STOP cuts the voice immediately."
+          title="Hear the current trim region from the editor (looped when the pad is loop-armed, one-shot otherwise). While the pad is sounding this button stops it immediately."
         >
-          {state.looping || auditioning ? '■ STOP' : '▶ AUDITION'}
+          {sounding ? '■ STOP' : '▶ AUDITION'}
         </button>
         <span className="text-[10px] font-mono text-zinc-500">drag amber handles (10px grab) · drag background to pan when zoomed · mouse wheel zooms at the pointer · type exact seconds · 5ms fades · trim is non-destructive</span>
       </div>
@@ -436,7 +453,7 @@ function TrimEditor({ index, state, onTrim, onReset, onClose, onAudition, onStop
  * outside tap, Escape, or the ⋯/✕ button does). The expanded EDIT
  * editor stays the precise path for waveform trim work; the menu is
  * the fast path. */
-function PadMenu({ index, state, onEq, onLive, onTrim, onResetTrim, onVolume, onOpenEditor, onClose }: {
+function PadMenu({ index, state, onEq, onLive, onTrim, onResetTrim, onVolume, onOpenEditor, onStop, onClose }: {
   index: number;
   state: PadUIState;
   onEq: (low: number, mid: number, high: number) => void;
@@ -445,6 +462,7 @@ function PadMenu({ index, state, onEq, onLive, onTrim, onResetTrim, onVolume, on
   onResetTrim: () => void;
   onVolume: (v: number) => void;
   onOpenEditor: () => void;
+  onStop: () => void;
   onClose: () => void;
 }) {
   const buffer = engine.pads[index].buffer;
@@ -543,6 +561,13 @@ function PadMenu({ index, state, onEq, onLive, onTrim, onResetTrim, onVolume, on
         >
           FINE-TUNE ↗
         </button>
+        <button
+          onClick={onStop}
+          className="text-[9px] font-mono text-red-300 hover:text-red-100 border border-red-900 rounded px-1.5 py-0.5"
+          title="Stop this pad immediately (sample, trim, EQ, volume, and loop-arm state kept). Same as tapping the pad again while it sounds."
+        >
+          ■ STOP
+        </button>
       </div>
       <div className="flex items-center gap-2 mt-2">
         <span className="text-[9px] font-mono text-zinc-500">VOL</span>
@@ -585,11 +610,12 @@ interface PadProps {
   onTrim: (index: number, start: number, end: number) => void;
   onResetTrim: (index: number) => void;
   onOpenEditor: (index: number) => void;
+  onStop: (index: number) => void;
   menuOpen: boolean;
   editing: boolean;
 }
 
-const Pad = memo(function Pad({ index, state, onTrigger, onLoad, onClear, onVolume, onToggleLoop, onEdit, onToggleMenu, onEq, onLive, onTrim, onResetTrim, onOpenEditor, menuOpen, editing }: PadProps) {
+const Pad = memo(function Pad({ index, state, onTrigger, onLoad, onClear, onVolume, onToggleLoop, onEdit, onToggleMenu, onEq, onLive, onTrim, onResetTrim, onOpenEditor, onStop, menuOpen, editing }: PadProps) {
   const fileRef = useRef<HTMLInputElement>(null);
   const waveRef = useRef<HTMLCanvasElement>(null);
   const [showVol, setShowVol] = useState(false);
@@ -709,6 +735,7 @@ const Pad = memo(function Pad({ index, state, onTrigger, onLoad, onClear, onVolu
           onResetTrim={() => onResetTrim(index)}
           onVolume={(v) => onVolume(index, v)}
           onOpenEditor={() => onOpenEditor(index)}
+          onStop={() => onStop(index)}
           onClose={() => onToggleMenu(index)}
         />
       )}
@@ -783,11 +810,18 @@ export default function Sampler() {
     if (engine.triggerSample(i)) flash(i);
   }, [flash]);
 
-  // Editor audition STOP: cut the pad's voice immediately (the pad-tap
-  // stop lets the pass finish; the editor button is an explicit stop).
+  // Editor / menu STOP: cut the pad's voice immediately via the same
+  // engine call the tap-again stop uses.
   const stopVoice = useCallback((i: number) => {
     engine.stopPadVoice(i);
     refreshPad(i);
+  }, [refreshPad]);
+
+  // STOP ALL: cut every sounding pad immediately (quick fade each).
+  // Pads keep their samples, trim, EQ, volume, and loop-arm state.
+  const stopAll = useCallback(() => {
+    engine.stopAllPadVoices();
+    for (let i = 0; i < 8; i++) refreshPad(i);
   }, [refreshPad]);
 
   // ─── Pad persistence ──────────────────────────────────────────────────
@@ -1059,13 +1093,19 @@ export default function Sampler() {
   }, [recording, finishRecToPad]);
 
   // Keyboard triggers 1-8; Shift+1-8 toggles the pad's quick menu;
-  // Escape closes it. (e.code is the physical key, so Shift+1 works
-  // regardless of what character the layout produces.)
+  // 0 stops every sounding pad; Escape closes the menu. (e.code is
+  // the physical key, so Shift+1 works regardless of what character
+  // the layout produces.)
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if ((e.target as HTMLElement)?.tagName === 'INPUT') return;
       if (e.key === 'Escape') {
         setMenuPad(null);
+        return;
+      }
+      if (e.key === '0') {
+        e.preventDefault();
+        stopAll();
         return;
       }
       if (e.shiftKey && e.code.startsWith('Digit')) {
@@ -1081,7 +1121,7 @@ export default function Sampler() {
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [trigger]);
+  }, [trigger, stopAll]);
 
   // MIDI triggers + per-pad volumes
   useEffect(() => {
@@ -1174,9 +1214,16 @@ export default function Sampler() {
             />
             QUANTIZE
           </label>
+          <button
+            onClick={stopAll}
+            className="text-[10px] font-mono text-red-300 hover:text-red-100 border border-red-900 rounded px-2 py-0.5"
+            title="Stop every sounding pad immediately (pads keep their samples, trim, EQ, and loop-arm state). Keyboard: 0."
+          >
+            ■ STOP ALL
+          </button>
           {/* Channel volume + mute live on the sampler strip in the
               mixer now (single control, no competing VOL here). */}
-          <span className="text-[10px] font-mono text-zinc-600">VOL + MUTE on mixer strip · LOOP on a pad: tap pad to start, tap again to stop · EDIT on a pad: trim start/end with zoom · ⋯ on a pad: quick menu (EQ, trim, LIVE) — Shift+1–8</span>
+          <span className="text-[10px] font-mono text-zinc-600">VOL + MUTE on mixer strip · LOOP on a pad: tap pad to start, tap again to stop at once · EDIT on a pad: trim start/end with zoom · ⋯ on a pad: quick menu (EQ, trim, LIVE) — Shift+1–8 · 0: STOP ALL</span>
         </div>
       </div>
       {/* Record from a playing deck into a pad. Tap is parallel to the
@@ -1252,6 +1299,7 @@ export default function Sampler() {
               onTrim={setTrim}
               onResetTrim={resetTrim}
               onOpenEditor={openEditor}
+              onStop={stopVoice}
               menuOpen={menuPad === i}
               editing={editPad === i}
             />

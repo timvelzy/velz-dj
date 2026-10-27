@@ -203,9 +203,11 @@ interface PadLoopState {
   spb: number; // last reference seconds-per-beat (fallback when no grid)
   // Scheduled voices: `at` is the absolute start time, `offset` the
   // buffer position the voice starts at, `dur` the audible length
-  // (period-cut for loops). The playhead accessor reads these to
-  // locate the sounding voice; entries leave the list on `ended`.
-  pending: { src: AudioBufferSourceNode; at: number; offset: number; dur: number }[];
+  // (period-cut for loops), `gain` the voice's gain node (kept so a
+  // stop can fade it out instead of cutting it). The playhead
+  // accessor reads these to locate the sounding voice; entries leave
+  // the list on `ended`.
+  pending: { src: AudioBufferSourceNode; gain: GainNode; at: number; offset: number; dur: number }[];
 }
 
 /** Pads are one-shots: deck→sampler recordings cap at 30s with auto-stop. */
@@ -293,12 +295,13 @@ export class DJEngine {
   }));
 
   /** One-shot voice timing per pad (parallel to `pads`): the sounding
-   * one-shot's absolute start time, buffer offset, and audible length,
-   * so the trim-editor playhead can locate it. Null when no one-shot
-   * voice is live. Cleared by the voice's `onended` (guarded by
-   * source identity, so a retrigger never clears the new voice) and
-   * by load/clear/stop. Runtime-only, never persisted. */
-  private padVoice: ({ src: AudioBufferSourceNode; at: number; offset: number; dur: number } | null)[] =
+   * one-shot's absolute start time, buffer offset, audible length, and
+   * gain node (kept so a stop can fade it out instead of cutting it).
+   * Null when no one-shot voice is live. Cleared by the voice's
+   * `onended` (guarded by source identity, so a retrigger never
+   * clears the new voice) and by load/clear/stop. Runtime-only,
+   * never persisted. */
+  private padVoice: ({ src: AudioBufferSourceNode; gain: GainNode; at: number; offset: number; dur: number } | null)[] =
     Array.from({ length: 8 }, () => null);
 
   // Quantized launch (EDM sync feature): decks wait for the master grid.
@@ -2252,17 +2255,19 @@ export class DJEngine {
     return buffer;
   }
 
-/** Trigger a pad. Retriggers if already playing. Quantize snaps to the
-   * next master beat through the shared quantization hook (pads use beats
-   * so one-shots stay snappy; decks use bars). Default ON. A pad with
-   * LIVE on skips the quantize wait and starts at once (loop
-   * iterations after the first still lock to the grid).
+/** Trigger a pad. Tapping a SOUNDING pad stops it immediately (quick
+   * fade) instead of retriggering or finishing the pass — one-shots
+   * and loops alike; tap once more to play it again. Quantize snaps
+   * to the next master beat through the shared quantization hook
+   * (pads use beats so one-shots stay snappy; decks use bars).
+   * Default ON. A pad with LIVE on skips the quantize wait and starts
+   * at once (loop iterations after the first still lock to the grid).
    *
    * Loop mode: when the pad's loop flag is armed, triggering STARTS a
    * repeating loop (first hit quantized like a one-shot); triggering
-   * again STOPS it — the voice already sounding finishes its pass and
-   * no further iterations are scheduled. Loop mode off = one-shot,
-   * exactly as before. */
+   * again STOPS it immediately — the sounding voice is faded out, no
+   * further iterations are scheduled. Loop mode off = one-shot,
+   * exactly as before, except the tap-again stop above. */
   triggerSample(padIndex: number): boolean {
     if (!this.ctx || padIndex < 0 || padIndex > 7) return false;
     const pad = this.pads[padIndex];
@@ -2270,14 +2275,20 @@ export class DJEngine {
 
     if (pad.loop) {
       if (pad.looping) {
-        this.stopPadLoop(padIndex);
+        // Tap-again stop: cut immediately instead of letting the
+        // sounding pass finish (the pre-2026-10-27 behavior).
+        this.stopPadVoice(padIndex);
         return true;
       }
       return this.startPadLoop(padIndex);
     }
 
-    // Retrigger: stop current voice
-    try { pad.source?.stop(); } catch { /* already stopped */ }
+    // Tap-again stop: a sounding one-shot stops immediately (quick
+    // fade) instead of retriggering. Tap once more to play it again.
+    if (this.padHasLiveVoice(padIndex)) {
+      this.stopPadVoice(padIndex);
+      return true;
+    }
 
     let when = this.ctx.currentTime;
     // LIVE pads start at once; everything else waits for the next
@@ -2299,7 +2310,7 @@ export class DJEngine {
     // record holds the region as scheduled: a trim edit mid-voice
     // never rewrites it, so the playhead keeps tracking what is
     // actually heard until the next trigger.
-    const voice = { src, at: when, offset: region.offset, dur: region.duration };
+    const voice = { src, gain: g, at: when, offset: region.offset, dur: region.duration };
     src.onended = () => {
       if (pad.source === src) pad.source = null;
       if (this.padVoice[padIndex] === voice) this.padVoice[padIndex] = null;
@@ -2402,7 +2413,7 @@ export class DJEngine {
     const g = this.ctx.createGain();
     this.fadeVoiceGain(g, at, pad.volume, playDur);
     this.connectPadVoice(padIndex, src, g);
-    const entry = { src, at, offset: region.offset, dur: playDur };
+    const entry = { src, gain: g, at, offset: region.offset, dur: playDur };
     src.onended = () => {
       const i = state.pending.indexOf(entry);
       if (i >= 0) state.pending.splice(i, 1);
@@ -2522,24 +2533,68 @@ export class DJEngine {
     return Math.min(pad.buffer.duration, Math.max(0, best.offset + (now - best.at)));
   }
 
+  /** True while a pad has a voice sounding or scheduled (quantize
+   * wait / loop lookahead included): the tap-again-stop test. A voice
+   * that has reached its end time reads as not-live even if its
+   * `onended` cleanup hasn't run yet. */
+  private padHasLiveVoice(padIndex: number): boolean {
+    if (!this.ctx) return false;
+    const now = this.ctx.currentTime;
+    const voice = this.padVoice[padIndex];
+    if (voice && now < voice.at + voice.dur) return true;
+    return this.padLoops[padIndex].pending.some((e) => now < e.at + e.dur);
+  }
+
   /**
    * Stop a pad's playback immediately: cancel loop scheduling AND cut
-   * the sounding voice now (unlike stopPadLoop, which lets the
-   * current pass finish). Used by the trim editor's audition STOP so
-   * Tim can silence the pad from the editor without reaching for the
-   * pad itself. Audio-only; trim/EQ/loop-arm state is untouched.
+   * the sounding voice now with a quick fade (unlike stopPadLoop,
+   * which lets the current pass finish). The fade reuses the 5ms
+   * shape of the boundary fades, so the cut never clicks; the source
+   * stops once the fade has landed (~50ms). Voices still waiting out
+   * a quantize delay or a lookahead slot never started, so they
+   * cancel outright. Used by the tap-again stop, the editor's
+   * audition STOP, the quick-menu STOP, and STOP ALL — one engine
+   * method for every surface. Audio-only; trim/EQ/volume/loop-arm
+   * state is untouched, and the pad keeps its sample.
    */
   stopPadVoice(padIndex: number): void {
     if (padIndex < 0 || padIndex > 7) return;
     const pad = this.pads[padIndex];
+    const state = this.padLoops[padIndex];
+    // Cancel the scheduler first: no new iterations.
     this.stopPadLoop(padIndex);
-    for (const entry of this.padLoops[padIndex].pending) {
-      try { entry.src.stop(); } catch { /* already stopped */ }
+    if (!this.ctx) {
+      state.pending.length = 0;
+      this.padVoice[padIndex] = null;
+      pad.source = null;
+      return;
     }
-    this.padLoops[padIndex].pending.length = 0;
-    try { pad.source?.stop(); } catch { /* already stopped */ }
-    pad.source = null;
+    const now = this.ctx.currentTime;
+    const cut = (src: AudioBufferSourceNode, gain: GainNode, at: number, dur: number) => {
+      if (now >= at + dur) return; // already ended
+      try {
+        if (now >= at) {
+          gain.gain.cancelScheduledValues(now);
+          gain.gain.setTargetAtTime(0, now, 0.005);
+          src.stop(now + 0.05);
+        } else {
+          src.stop();
+        }
+      } catch { /* already stopped */ }
+    };
+    for (const entry of [...state.pending]) cut(entry.src, entry.gain, entry.at, entry.dur);
+    state.pending.length = 0;
+    const voice = this.padVoice[padIndex];
+    if (voice) cut(voice.src, voice.gain, voice.at, voice.dur);
     this.padVoice[padIndex] = null;
+    pad.source = null;
+  }
+
+  /** Stop every sounding pad immediately (quick fade each). Pads keep
+   * their samples, trim, EQ, volume, and loop-arm state. Decks are
+   * untouched. */
+  stopAllPadVoices(): void {
+    for (let i = 0; i < 8; i++) this.stopPadVoice(i);
   }
 
   // ─── Devices ──────────────────────────────────────────────────────────────
