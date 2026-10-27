@@ -201,7 +201,11 @@ interface PadLoopState {
   nextAt: number | null; // audio time of the next iteration start
   beats: number; // loop period, in master beats
   spb: number; // last reference seconds-per-beat (fallback when no grid)
-  pending: { src: AudioBufferSourceNode; at: number }[]; // scheduled voices
+  // Scheduled voices: `at` is the absolute start time, `offset` the
+  // buffer position the voice starts at, `dur` the audible length
+  // (period-cut for loops). The playhead accessor reads these to
+  // locate the sounding voice; entries leave the list on `ended`.
+  pending: { src: AudioBufferSourceNode; at: number; offset: number; dur: number }[];
 }
 
 /** Pads are one-shots: deck→sampler recordings cap at 30s with auto-stop. */
@@ -287,6 +291,15 @@ export class DJEngine {
   private padLoops: PadLoopState[] = Array.from({ length: 8 }, () => ({
     timer: null, nextAt: null, beats: 4, spb: 60 / 124, pending: [],
   }));
+
+  /** One-shot voice timing per pad (parallel to `pads`): the sounding
+   * one-shot's absolute start time, buffer offset, and audible length,
+   * so the trim-editor playhead can locate it. Null when no one-shot
+   * voice is live. Cleared by the voice's `onended` (guarded by
+   * source identity, so a retrigger never clears the new voice) and
+   * by load/clear/stop. Runtime-only, never persisted. */
+  private padVoice: ({ src: AudioBufferSourceNode; at: number; offset: number; dur: number } | null)[] =
+    Array.from({ length: 8 }, () => null);
 
   // Quantized launch (EDM sync feature): decks wait for the master grid.
   // 'bar' = drop on the next master bar with the slave on a downbeat (the
@@ -1850,6 +1863,11 @@ export class DJEngine {
   loadSample(padIndex: number, buffer: AudioBuffer, name: string): boolean {
     if (padIndex < 0 || padIndex > 7 || !this.ctx) return false;
     this.stopPadLoop(padIndex);
+    // A voice from the old sample may still be finishing its pass
+    // (audio untouched); untrack it so the playhead parks on the new
+    // buffer instead of following stale timing.
+    this.padVoice[padIndex] = null;
+    this.padLoops[padIndex].pending.length = 0;
     const pad = this.pads[padIndex];
     pad.buffer = buffer;
     pad.name = name;
@@ -1882,6 +1900,7 @@ export class DJEngine {
     pad.name = name;
     pad.trimStart = 0;
     pad.trimEnd = buffer.duration;
+    this.padVoice[padIndex] = null;
     return true;
   }
 
@@ -1903,6 +1922,8 @@ export class DJEngine {
     this.stopPadLoop(padIndex);
     try { pad.source?.stop(); } catch { /* already stopped */ }
     pad.source = null;
+    this.padVoice[padIndex] = null;
+    this.padLoops[padIndex].pending.length = 0;
     pad.buffer = null;
     pad.name = '';
     pad.loop = false;
@@ -2274,8 +2295,17 @@ export class DJEngine {
     const g = this.ctx.createGain();
     this.fadeVoiceGain(g, when, pad.volume, region.duration);
     this.connectPadVoice(padIndex, src, g);
-    src.onended = () => { if (pad.source === src) pad.source = null; };
+    // Record the voice's timing for the trim-editor playhead. The
+    // record holds the region as scheduled: a trim edit mid-voice
+    // never rewrites it, so the playhead keeps tracking what is
+    // actually heard until the next trigger.
+    const voice = { src, at: when, offset: region.offset, dur: region.duration };
+    src.onended = () => {
+      if (pad.source === src) pad.source = null;
+      if (this.padVoice[padIndex] === voice) this.padVoice[padIndex] = null;
+    };
     pad.source = src;
+    this.padVoice[padIndex] = voice;
     try {
       src.start(when, region.offset, region.duration);
       return true;
@@ -2372,7 +2402,7 @@ export class DJEngine {
     const g = this.ctx.createGain();
     this.fadeVoiceGain(g, at, pad.volume, playDur);
     this.connectPadVoice(padIndex, src, g);
-    const entry = { src, at };
+    const entry = { src, at, offset: region.offset, dur: playDur };
     src.onended = () => {
       const i = state.pending.indexOf(entry);
       if (i >= 0) state.pending.splice(i, 1);
@@ -2457,6 +2487,59 @@ export class DJEngine {
       }
     }
     pad.looping = false;
+  }
+
+  /**
+   * Current playback position of a pad's sounding voice, in absolute
+   * buffer seconds — the trim-editor playhead's position source.
+   * Computed from the sounding voice's scheduled start time plus the
+   * audio clock, so it tracks loop iterations as they wrap (each
+   * iteration is its own scheduled voice) with no polling of the
+   * waveform. Returns null when nothing is sounding: while a first
+   * hit waits out the quantize delay, in the silent gap of a loop
+   * period shorter than its region, or after the voice ends. The
+   * caller parks the playhead at the trim start on null. A trim edit
+   * mid-voice does not move the record (the voice keeps its scheduled
+   * region), so the position may sit in the newly shaded-out area
+   * until the next trigger — that is what is actually heard.
+   */
+  padPlaybackPosition(padIndex: number): number | null {
+    if (!this.ctx || padIndex < 0 || padIndex > 7) return null;
+    const pad = this.pads[padIndex];
+    if (!pad.buffer) return null;
+    const now = this.ctx.currentTime;
+    // Newest sounding voice wins (a retriggered one-shot and a
+    // finishing loop pass can briefly overlap). The scan is inline,
+    // not a closure: assignments inside a closure don't update the
+    // flow type of `best`, and TS narrows it to `never` below.
+    let best: { at: number; offset: number; dur: number } | null = null;
+    for (const entry of this.padLoops[padIndex].pending) {
+      if (now >= entry.at && now < entry.at + entry.dur && (best === null || entry.at > best.at)) best = entry;
+    }
+    const voice = this.padVoice[padIndex];
+    if (voice && now >= voice.at && now < voice.at + voice.dur && (best === null || voice.at > best.at)) best = voice;
+    if (best === null) return null;
+    return Math.min(pad.buffer.duration, Math.max(0, best.offset + (now - best.at)));
+  }
+
+  /**
+   * Stop a pad's playback immediately: cancel loop scheduling AND cut
+   * the sounding voice now (unlike stopPadLoop, which lets the
+   * current pass finish). Used by the trim editor's audition STOP so
+   * Tim can silence the pad from the editor without reaching for the
+   * pad itself. Audio-only; trim/EQ/loop-arm state is untouched.
+   */
+  stopPadVoice(padIndex: number): void {
+    if (padIndex < 0 || padIndex > 7) return;
+    const pad = this.pads[padIndex];
+    this.stopPadLoop(padIndex);
+    for (const entry of this.padLoops[padIndex].pending) {
+      try { entry.src.stop(); } catch { /* already stopped */ }
+    }
+    this.padLoops[padIndex].pending.length = 0;
+    try { pad.source?.stop(); } catch { /* already stopped */ }
+    pad.source = null;
+    this.padVoice[padIndex] = null;
   }
 
   // ─── Devices ──────────────────────────────────────────────────────────────

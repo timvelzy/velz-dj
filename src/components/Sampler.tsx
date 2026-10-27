@@ -113,16 +113,30 @@ function drawEditorWaveform(buffer: AudioBuffer, canvas: HTMLCanvasElement, trim
   if (x1 >= -10 && x1 <= w + 10) ctx.fillText(`${trimEnd.toFixed(2)}s`, Math.max(0, Math.min(w - 40, x1 - 32)), 12);
 }
 
-function TrimEditor({ index, state, onTrim, onReset, onClose }: {
+function TrimEditor({ index, state, onTrim, onReset, onClose, onAudition, onStop }: {
   index: number;
   state: PadUIState;
   onTrim: (start: number, end: number) => void;
   onReset: () => void;
   onClose: () => void;
+  onAudition: () => void;
+  onStop: () => void;
 }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const wrapRef = useRef<HTMLDivElement>(null);
+  const playheadRef = useRef<HTMLDivElement>(null);
+  const edgeRef = useRef<HTMLDivElement>(null);
   const dragWhich = useRef<'start' | 'end' | null>(null);
   const panRef = useRef<{ startX: number; startView: number } | null>(null);
+  // Audition state: true from the AUDITION press until the voice ends
+  // naturally or STOP is pressed. Mirrored in a ref for the rAF loop.
+  const [auditioning, setAuditioning] = useState(false);
+  const auditioningRef = useRef(false);
+  auditioningRef.current = auditioning;
+  // True once the auditioned voice has actually been heard; guards the
+  // natural-end detection so a quantize wait doesn't clear AUDITION
+  // before the first hit lands.
+  const heardRef = useRef(false);
   const buffer = engine.pads[index].buffer;
   const duration = buffer?.duration ?? 0;
   const { trimStart, trimEnd } = state;
@@ -145,6 +159,92 @@ function TrimEditor({ index, state, onTrim, onReset, onClose }: {
     const s = anchor - (anchor - viewStart) * (newViewDur / viewDur);
     setZoom(z);
     setViewStart(clampView(z, s));
+  };
+
+  // The playhead reads the live view through this ref (updated every
+  // render) so the rAF loop below never goes stale on zoom/pan/trim.
+  const viewRef = useRef({ viewStart, viewDur, trimStart, trimEnd });
+  viewRef.current = { viewStart, viewDur, trimStart, trimEnd };
+
+  // Playhead: a DOM line over the waveform, driven by
+  // requestAnimationFrame reading the audio clock through
+  // engine.padPlaybackPosition — never React state per frame, so it
+  // can't stall the pads. rAF runs only while a voice is sounding;
+  // when idle the check backs off to a 250ms timer (the same cadence
+  // as the loop-state poll) so a later pad tap wakes the playhead.
+  // Everything is cancelled on close/unmount. The line maps through
+  // the SAME zoomed/panned time scale as the waveform; a position
+  // outside the visible window pins the line to the near edge with a
+  // ◀/▶ arrow instead of vanishing. With nothing sounding the line
+  // parks at the trim start, dimmed.
+  useEffect(() => {
+    let raf = 0;
+    let idleTimer = 0;
+    let cancelled = false;
+    const step = () => {
+      if (cancelled) return;
+      const line = playheadRef.current;
+      const edge = edgeRef.current;
+      const wrap = wrapRef.current;
+      const pos = engine.padPlaybackPosition(index);
+      if (pos !== null) heardRef.current = true;
+      else if (auditioningRef.current && heardRef.current && !engine.pads[index].looping) {
+        heardRef.current = false;
+        setAuditioning(false);
+      }
+      if (line && wrap) {
+        const { viewStart: vs, viewDur: vd, trimStart: ts } = viewRef.current;
+        const target = pos ?? ts;
+        const frac = vd > 0 ? (target - vs) / vd : 0;
+        const clamped = Math.min(1, Math.max(0, frac));
+        const w = wrap.getBoundingClientRect().width;
+        line.style.transform = `translateX(${(clamped * w).toFixed(1)}px)`;
+        line.style.opacity = pos !== null ? '1' : '0.35';
+        if (edge) {
+          if (frac < 0) {
+            edge.style.display = 'block';
+            edge.style.left = '2px';
+            edge.style.right = 'auto';
+            edge.textContent = '◀';
+          } else if (frac > 1) {
+            edge.style.display = 'block';
+            edge.style.left = 'auto';
+            edge.style.right = '2px';
+            edge.textContent = '▶';
+          } else {
+            edge.style.display = 'none';
+          }
+        }
+      }
+      if (pos !== null) {
+        raf = requestAnimationFrame(step);
+      } else {
+        idleTimer = window.setTimeout(step, 250);
+      }
+    };
+    step();
+    return () => {
+      cancelled = true;
+      cancelAnimationFrame(raf);
+      window.clearTimeout(idleTimer);
+    };
+  }, [index]);
+
+  // Audition: hear the current trim region from the editor, through
+  // the existing pad trigger path (same gain/EQ/trim semantics — loop
+  // when the pad is loop-armed, one-shot otherwise). STOP cuts the
+  // voice immediately via engine.stopPadVoice; closing the editor
+  // leaves playback running, exactly like tapping a pad and closing.
+  const handleAudition = () => {
+    if (state.looping || auditioning) {
+      onStop();
+      heardRef.current = false;
+      setAuditioning(false);
+    } else {
+      heardRef.current = false;
+      onAudition();
+      setAuditioning(true);
+    }
   };
 
   // Numeric drafts: local text while focused (so typing "1." isn't
@@ -234,11 +334,12 @@ function TrimEditor({ index, state, onTrim, onReset, onClose }: {
         </span>
         <button onClick={onClose} className="text-[11px] font-mono text-zinc-400 hover:text-zinc-100 px-1" title="Close trim editor">✕</button>
       </div>
+      <div ref={wrapRef} className="relative mt-1">
       <canvas
         ref={canvasRef}
         width={640}
         height={110}
-        className="w-full h-[110px] mt-1 rounded bg-black/40 cursor-ew-resize touch-none"
+        className="w-full h-[110px] rounded bg-black/40 cursor-ew-resize touch-none"
         onPointerDown={(e) => {
           const rect = canvasRef.current!.getBoundingClientRect();
           const x = e.clientX - rect.left;
@@ -274,6 +375,14 @@ function TrimEditor({ index, state, onTrim, onReset, onClose }: {
         onPointerUp={() => { dragWhich.current = null; panRef.current = null; }}
         onPointerCancel={() => { dragWhich.current = null; panRef.current = null; }}
       />
+        {/* Playhead overlay: a DOM line over the waveform, positioned
+            imperatively by the rAF loop. pointer-events-none so
+            handle drags and background pans pass straight through.
+            The line spans the waveform area only (the bottom 16px
+            holds the time labels). */}
+        <div ref={playheadRef} className="pointer-events-none absolute left-0 top-0 -ml-px h-[calc(100%-16px)] w-[2px] bg-white shadow-[0_0_4px_rgba(255,255,255,0.9)]" style={{ opacity: 0.35 }} />
+        <div ref={edgeRef} className="pointer-events-none absolute top-0 hidden text-[10px] leading-none text-white" />
+      </div>
       <div className="flex flex-wrap items-center gap-3 mt-2">
         <label className="flex items-center gap-1 text-[11px] font-mono text-zinc-300">
           start
@@ -305,6 +414,13 @@ function TrimEditor({ index, state, onTrim, onReset, onClose }: {
           title="Reset trim to the full sample"
         >
           RESET TO FULL
+        </button>
+        <button
+          onClick={handleAudition}
+          className="text-[11px] font-mono text-zinc-100 hover:text-white border border-cyan-700 bg-cyan-900/40 rounded px-2 py-0.5"
+          title="Hear the current trim region from the editor (looped when the pad is loop-armed, one-shot otherwise). STOP cuts the voice immediately."
+        >
+          {state.looping || auditioning ? '■ STOP' : '▶ AUDITION'}
         </button>
         <span className="text-[10px] font-mono text-zinc-500">drag amber handles (10px grab) · drag background to pan when zoomed · mouse wheel zooms at the pointer · type exact seconds · 5ms fades · trim is non-destructive</span>
       </div>
@@ -666,6 +782,13 @@ export default function Sampler() {
   const trigger = useCallback((i: number) => {
     if (engine.triggerSample(i)) flash(i);
   }, [flash]);
+
+  // Editor audition STOP: cut the pad's voice immediately (the pad-tap
+  // stop lets the pass finish; the editor button is an explicit stop).
+  const stopVoice = useCallback((i: number) => {
+    engine.stopPadVoice(i);
+    refreshPad(i);
+  }, [refreshPad]);
 
   // ─── Pad persistence ──────────────────────────────────────────────────
   // Pads survive reloads (IndexedDB, see samplerStore.ts): the encoded
@@ -1143,6 +1266,8 @@ export default function Sampler() {
           onTrim={(s, e) => setTrim(editPad, s, e)}
           onReset={() => resetTrim(editPad)}
           onClose={() => setEditPad(null)}
+          onAudition={() => trigger(editPad)}
+          onStop={() => stopVoice(editPad)}
         />
       )}
     </div>
