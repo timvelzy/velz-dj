@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { engine } from '../audio/engine';
 import { midi } from '../midi';
+import { Knob } from './Mixer';
 
 const PAD_KEYS = ['1', '2', '3', '4', '5', '6', '7', '8'];
 
@@ -399,12 +400,9 @@ function Pad({ index, state, onTrigger, onLoad, onClear, onVolume, onToggleLoop,
         )}
       </div>
       {showVol && state.loaded && (
-        <input
-          type="range" min={0} max={1} step={0.01} value={state.volume}
-          className="w-full h-1 mt-1"
-          onClick={(e) => e.stopPropagation()}
-          onChange={(e) => onVolume(parseFloat(e.target.value))}
-        />
+        <div className="flex justify-center mt-1" onClick={(e) => e.stopPropagation()}>
+          <Knob label="vol" value={state.volume} min={0} max={1} size={36} onChange={onVolume} />
+        </div>
       )}
     </div>
   );
