@@ -103,7 +103,7 @@ export default function Library({ tracks, masterKey, onAddFiles, onLoadToDeck, o
                   onDragStart={(e) => e.dataTransfer.setData('text/track-id', t.id)}
                   onClick={() => onSelectTrack?.(t.id)}
                   className={`cursor-grab border-t border-zinc-900 ${selectedTrackId === t.id ? 'bg-cyan-950/60' : 'hover:bg-zinc-900'}`}
-                  title="Drag onto a deck — click to select for hardware load"
+                  title="Drag onto a deck or a sampler pad — click to select for hardware load"
                 >
                   <td className="px-2 py-1.5 font-medium text-zinc-200">
                     {t.title}

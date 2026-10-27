@@ -39,6 +39,24 @@ getPadState(padIndex: number): { loaded: boolean; name: string; volume: number }
 ### Sample sources
 1. File picker / drag-drop onto pad (any audio file).
 2. "Capture from deck" — record the last N seconds of a deck's output into a pad (fun for live vocal chops). Implement via `MediaRecorder` on the deck's analyser tap or a `ScriptProcessor` ring buffer. V1: file/drop only; capture is V2.
+3. Library drag (implemented 2026-10-27): drag a track row from the
+   track library onto a pad. Rows already set `text/track-id` in the
+   drag data; the pad's drop handler resolves the id through the
+   `resolveTrack` prop App wires to its library state and stages the
+   track's own `File` — the same file a deck load decodes, so there
+   is no second decode or storage path. Loading is async: the pad
+   shows a loading state while the drop decodes, takes no input
+   until the buffer swaps in, and a second drop supersedes a
+   still-decoding first one. A drop with no audio (placeholder row,
+   removed record, failed decode) shows an inline sampler error and
+   leaves the pad's previous sample untouched. A drop is a
+   load-new-sample: loop scheduling stops (a sounding voice finishes
+   its pass, as for file drops), full trim, EQ flat, LIVE off; volume
+   and loop-arm carry over, exactly as for a dropped file. The pad
+   highlights (cyan ring) while a track drag is over it; file drags
+   keep their existing unhighlighted behavior. Click-to-load-to-deck
+   on library rows is unchanged. Mouse/trackpad HTML5 drag-and-drop
+   only — touch drag is out of scope for this pass.
 
 ### UI (`src/components/Sampler.tsx`)
 - 8 pads in a 4×2 grid, below the mixer or as a toggleable panel.
@@ -334,5 +352,6 @@ setFxEnabled(enabled: boolean): void                     // bypass
 - [ ] Sampler playhead: open EDIT on a sounding loop, playhead tracks the trim region; zoom in and confirm it stays mapped; zoom so the playhead leaves the window and confirm the edge arrow; AUDITION from the editor, STOP cuts at once; close the editor and confirm no stray CPU use
 - [ ] Sampler stop: start a long one-shot, tap the pad again mid-play and confirm immediate silence (no finish-the-pass, no retrigger); start a loop, tap again and confirm it stops at once; STOP ALL (`0` key) with several pads sounding; stop from the quick menu and from the editor; confirm pads keep samples, trim, EQ, and loop-arm state after stopping
 - [ ] Sampler retrigger: start a long one-shot, Alt+tap the pad mid-play and confirm it restarts from the trim start (no gap, no click); start a loop, Alt+tap and confirm the pass restarts from the top and stays grid-locked; Alt+tap a silent pad and confirm it plays normally; plain tap still stops; Shift+pad still opens the menu; Alt+digit while typing in a trim field does nothing
+- [ ] Sampler library drag: drag a Velz seed track onto an empty pad and confirm it loads (loading state, then plays); drag onto an occupied pad and confirm replacement with fresh trim/flat EQ/LIVE off; drag an example loop onto a pad and confirm it loops; confirm click-to-deck still works after dragging; confirm dropping a file from outside the app still works; touch drag is not supported in this pass
 - [ ] FX delay: confirm delay time tracks tempo changes (pitch bend the deck, delay follows)
 - [ ] MIDI: map S8 knobs to filter + FX params, confirm smooth response

@@ -980,6 +980,15 @@ export default function App() {
     else void loadTrack(deckKey, t.file);
   }, [tracks, loadTrack, loadRestoredTrack]);
 
+  // Library → sampler drag: resolve a dragged row's id to the same
+  // File a deck load decodes (placeholder rows carry no file, so a
+  // drop of one resolves to null and the pad is left untouched).
+  const resolveSamplerTrack = useCallback((trackId: string) => {
+    const t = tracks.find((x) => x.id === trackId);
+    if (!t?.file) return null;
+    return { file: t.file, title: t.title };
+  }, [tracks]);
+
   const addFiles = useCallback((files: FileList) => {
     const audio = [...files].filter((f) => f.type.startsWith('audio/') || /\.(mp3|wav|flac|ogg|m4a|aac)$/i.test(f.name));
     if (!audio.length) {
@@ -4004,7 +4013,7 @@ export default function App() {
           </div>
           {/* Sampler — pads + REC FROM DECK, back under Deck B. Its
               channel VOL + MUTE now live on the mixer strip. */}
-          <Sampler />
+          <Sampler resolveTrack={resolveSamplerTrack} />
         </div>
       </main>
 

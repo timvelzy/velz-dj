@@ -18,6 +18,7 @@ const PAD_KEYS = ['1', '2', '3', '4', '5', '6', '7', '8'];
 interface PadUIState {
   name: string;
   loaded: boolean;
+  loading: boolean; // a library track drop is decoding into this pad
   volume: number;
   flashing: boolean;
   loop: boolean; // loop mode armed
@@ -642,6 +643,10 @@ const Pad = memo(function Pad({ index, state, onTrigger, onLoad, onClear, onVolu
       }`}
       data-sampler-pad={index}
       onPointerDown={(e) => {
+        // While a library drop is decoding, the pad takes no input:
+        // it must not fire the old sample or open the file picker
+        // for a pad that is about to be replaced.
+        if (state.loading) return;
         // Primary button only: a right-click must clear, never fire.
         // Pointer-down, not click: click waits for pointer-up, which
         // is dead time on a drum pad.
@@ -673,12 +678,12 @@ const Pad = memo(function Pad({ index, state, onTrigger, onLoad, onClear, onVolu
         }}
       />
       <div className="text-[10px] font-mono text-zinc-400 truncate">
-        {index + 1}. {state.loaded ? state.name : 'empty'}
+        {index + 1}. {state.loading ? 'loading…' : state.loaded ? state.name : 'empty'}
       </div>
       {state.loaded ? (
         <canvas ref={waveRef} width={72} height={28} className="w-full h-7 mt-1 rounded bg-black/40" />
       ) : (
-        <div className="w-full h-7 mt-1 rounded bg-black/20 flex items-center justify-center text-zinc-600 text-lg">+</div>
+        <div className={`w-full h-7 mt-1 rounded bg-black/20 flex items-center justify-center text-zinc-600 text-lg ${state.loading ? 'animate-pulse' : ''}`}>{state.loading ? '…' : '+'}</div>
       )}
       <div className="flex items-center justify-between mt-1">
         <span className="text-[9px] text-zinc-500 font-mono">key {PAD_KEYS[index]}</span>
@@ -751,9 +756,13 @@ const Pad = memo(function Pad({ index, state, onTrigger, onLoad, onClear, onVolu
   );
 });
 
-export default function Sampler() {
+export interface SamplerTrackResolver {
+  (trackId: string): { file: File; title: string } | null;
+}
+
+export default function Sampler({ resolveTrack }: { resolveTrack?: SamplerTrackResolver }) {
   const [pads, setPads] = useState<PadUIState[]>(
-    Array.from({ length: 8 }, () => ({ name: '', loaded: false, volume: 0.8, flashing: false, loop: false, looping: false, trimStart: 0, trimEnd: 0, eqLow: 0, eqMid: 0, eqHigh: 0, live: false }))
+    Array.from({ length: 8 }, () => ({ name: '', loaded: false, loading: false, volume: 0.8, flashing: false, loop: false, looping: false, trimStart: 0, trimEnd: 0, eqLow: 0, eqMid: 0, eqHigh: 0, live: false }))
   );
   // Quantize defaults ON (EDM sync feature): pads drop on the next master
   // beat. The checkbox defeats it for manual triggering.
@@ -1188,12 +1197,86 @@ export default function Sampler() {
     return unreg;
   }, [recording, startRec, stopRec]);
 
-  // Drag-drop onto pads
+  // Drag-drop onto pads: files from outside the app keep the original
+  // path (load); library rows carry a `text/track-id` and resolve to
+  // the track's file through the prop App wires to its library state —
+  // the same File a deck load would decode, so no second decode or
+  // storage path exists. Decoding is async: the pad shows a loading
+  // state until the buffer swaps in, and a per-pad token means a
+  // second drop supersedes a still-decoding first one (the stale
+  // decode never overwrites the newer sample, and a failed drop
+  // leaves the pad's previous sample untouched).
+  const [dropError, setDropError] = useState<string | null>(null);
+  const [dragOverPad, setDragOverPad] = useState<number | null>(null);
+  const dropTokens = useRef<number[]>(Array(8).fill(0));
+
+  const setPadLoading = useCallback((i: number, loading: boolean) => {
+    setPads((prev) => {
+      if (prev[i].loading === loading) return prev;
+      const next = [...prev];
+      next[i] = { ...next[i], loading };
+      return next;
+    });
+  }, []);
+
+  const loadTrackToPad = useCallback(async (i: number, trackId: string) => {
+    const resolved = resolveTrack?.(trackId) ?? null;
+    if (!resolved) {
+      setDropError('That track has no audio to load — it may have been removed from the library. The pad was left untouched.');
+      return;
+    }
+    const token = ++dropTokens.current[i];
+    setDropError(null);
+    setPadLoading(i, true);
+    try {
+      // Decode first, swap second: the engine state is only touched by
+      // the atomic loadSample call below, so a half-decoded drop can
+      // never sound and a superseded one never lands.
+      const raw = await resolved.file.arrayBuffer();
+      const buffer = await engine.ctx.decodeAudioData(raw);
+      if (dropTokens.current[i] !== token) return;
+      // Same staging as a file drop: loadSample stops loop scheduling
+      // (a sounding voice finishes its pass), sets full trim, and
+      // resets EQ flat + LIVE off. Volume and loop-arm carry over,
+      // exactly as they do for a dropped file.
+      if (engine.loadSample(i, buffer, resolved.title)) {
+        padBlobs.current[i] = resolved.file;
+        persistPad(i);
+      }
+    } catch {
+      if (dropTokens.current[i] !== token) return;
+      setDropError(`Could not load "${resolved.title}" into pad ${i + 1}. The pad was left untouched.`);
+    } finally {
+      if (dropTokens.current[i] === token) {
+        setPadLoading(i, false);
+        refreshPad(i);
+      }
+    }
+  }, [resolveTrack, persistPad, refreshPad, setPadLoading]);
+
   const onDrop = useCallback((e: React.DragEvent, i: number) => {
     e.preventDefault();
+    setDragOverPad(null);
     const f = e.dataTransfer.files?.[0];
-    if (f) load(i, f);
-  }, [load]);
+    if (f) {
+      load(i, f);
+      return;
+    }
+    const trackId = e.dataTransfer.getData('text/track-id');
+    if (trackId) void loadTrackToPad(i, trackId);
+  }, [load, loadTrackToPad]);
+
+  // Highlight only for library-track drags: the drag's type list is
+  // readable during dragover even though getData is not. File drags
+  // keep their existing (unhighlighted) behavior.
+  const onDragOverPad = useCallback((e: React.DragEvent, i: number) => {
+    e.preventDefault();
+    if (e.dataTransfer.types?.includes('text/track-id')) setDragOverPad(i);
+  }, []);
+
+  const onDragLeavePad = useCallback((e: React.DragEvent) => {
+    if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setDragOverPad(null);
+  }, []);
 
   if (!open) {
     return (
@@ -1243,6 +1326,14 @@ export default function Sampler() {
           <span className="text-[10px] font-mono text-zinc-600">VOL + MUTE on mixer strip · LOOP on a pad: tap pad to start, tap again to stop at once · EDIT on a pad: trim start/end with zoom · ⋯ on a pad: quick menu (EQ, trim, LIVE) — Shift+1–8 · 0: STOP ALL</span>
         </div>
       </div>
+      {dropError && (
+        <div className="mb-2 flex items-start gap-2 rounded-lg border border-amber-800 bg-amber-950/60 px-3 py-2 text-xs text-amber-200">
+          <span className="min-w-0 flex-1">{dropError}</span>
+          <button onClick={() => setDropError(null)} className="shrink-0 text-amber-400 hover:text-amber-200" title="Dismiss">
+            ✕
+          </button>
+        </div>
+      )}
       {/* Record from a playing deck into a pad. Tap is parallel to the
           deck output, so recording never interrupts the deck or master. */}
       <div className="flex flex-wrap items-center gap-2 mb-2 rounded border border-zinc-800 bg-black/30 px-2 py-1.5">
@@ -1300,7 +1391,13 @@ export default function Sampler() {
         onDragOver={(e) => e.preventDefault()}
       >
         {pads.map((p, i) => (
-          <div key={i} onDrop={(e) => onDrop(e, i)} onDragOver={(e) => e.preventDefault()}>
+          <div
+            key={i}
+            className={dragOverPad === i ? 'rounded-lg ring-2 ring-cyan-400 bg-cyan-950/30' : undefined}
+            onDrop={(e) => onDrop(e, i)}
+            onDragOver={(e) => onDragOverPad(e, i)}
+            onDragLeave={onDragLeavePad}
+          >
             <Pad
               index={i}
               state={p}
