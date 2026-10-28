@@ -47,6 +47,16 @@ class WsolaProcessor extends AudioWorkletProcessor {
   private tempoTarget = 1;
   private tempoSmooth = 1;
 
+  // Grain-rate latch (Mixxx-mapped idea, original code): the tempo
+  // used for grain advance is held constant across 512-sample
+  // windows and may move at most 2% per window. Rate changes take
+  // effect at window boundaries instead of re-centering the
+  // correlation search on every 128-sample quantum, which smeared
+  // transients while the rate glided. Bypass hysteresis still reads
+  // the smooth value, so engage/disengage timing is unchanged.
+  private tempoStep = 1;
+  private latchSamples = 0;
+
   // Bypass hysteresis + transition blends (see processInner). The
   // bypass band is a discontinuity: stretched output lags the input
   // by ~N+TOL samples, so a hard switch jumps time and clicks, and
@@ -269,6 +279,17 @@ class WsolaProcessor extends AudioWorkletProcessor {
     this.tempoSmooth += (this.tempoTarget - this.tempoSmooth) * k;
     const r = this.tempoSmooth;
 
+    // Latch the grain rate (see tempoStep): at most one bounded move
+    // per 512-sample window; step() runs on the latched value.
+    this.latchSamples += frames;
+    if (this.latchSamples >= 512) {
+      this.latchSamples -= 512;
+      const lo = -0.02;
+      const hi = 0.02;
+      this.tempoStep += Math.min(hi, Math.max(lo, this.tempoSmooth - this.tempoStep));
+    }
+    const rStep = this.tempoStep;
+
     // 1. Push input into the ring on every path (bypass keeps it fresh
     // so re-engage has history to grain from).
     for (let i = 0; i < frames; i++) {
@@ -303,7 +324,8 @@ class WsolaProcessor extends AudioWorkletProcessor {
 
     // 3. Steady bypass: bit-transparent direct copy, stretch state
     // parked (resetting it every quantum is harmless — it is already
-    // zero — and protects against stale state).
+    // zero — and protects against stale state). Track the latched
+    // grain rate to the bypass tempo so re-entry starts clean.
     if (this.bypass && this.enterBlend === 0) {
       for (let ch = 0; ch < this.channels; ch++) {
         output[ch].set(input[ch].subarray(0, frames));
@@ -313,16 +335,18 @@ class WsolaProcessor extends AudioWorkletProcessor {
       this.ola[0].fill(0);
       this.ola[1].fill(0);
       this.outCount = 0;
+      this.tempoStep = r;
+      this.latchSamples = 0;
       return true;
     }
 
     // 4. Run WSOLA steps until we can fill this quantum (on the exit
     // quantum this primes the FIFO from the fresh ring before the
     // blend below; on the enter quantum it tops up the FIFO we are
-    // blending out of).
+    // blending out of). Steps run on the latched grain rate.
     let guard = 0;
     while (this.outCount < frames && guard++ < 16) {
-      if (!this.step(r)) break;
+      if (!this.step(rStep)) break;
     }
 
     // 5a. Entering bypass: crossfade the remaining stretched FIFO into
@@ -349,6 +373,8 @@ class WsolaProcessor extends AudioWorkletProcessor {
       this.ola[0].fill(0);
       this.ola[1].fill(0);
       this.outCount = 0;
+      this.tempoStep = r;
+      this.latchSamples = 0;
       return true;
     }
 

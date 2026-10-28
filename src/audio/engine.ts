@@ -57,11 +57,21 @@ export interface DeckNodes {
   syncLockStreak: number;
   /** Catch-up slew deadline (ctx time; 0 = inactive). Armed by an
    *  immediate sync launch (see playQuantized): while armed, syncTick
-   *  slews the tempo harder than the holding PLL so a press-timing
+   *  slews the tempo harder than the holding trim so a press-timing
    *  phase error converges within about a bar instead of many seconds.
    *  Disarmed on pause, on sync-off, when the error reaches the lock
    *  window, or when the deadline passes — whichever comes first. */
   catchupUntil: number;
+  /** Mixxx-style user offset, in beats: phase error absorbed when the
+   *  DJ bends a synced deck, so the controller holds the nudged
+   *  position instead of fighting the human. Set to the measured
+   *  phase error when a bend ends, then decays to 0 (~4s time
+   *  constant) so the deck glides back to true grid phase. Reset on
+   *  sync engage, phase snap, and launch arm. */
+  syncUserOffset: number;
+  /** True while a manual bend (nudge) is active on this deck. Lets
+   *  syncTick detect the bend's end and fold it into syncUserOffset. */
+  syncNudgeActive: boolean;
   nudge: number; // momentary pitch bend, e.g. ±0.05
   nudgeDeadline: number; // ctx time after which a nudge auto-expires (anti-latch)
   keyLock: boolean;
@@ -87,36 +97,52 @@ export function phaseErrorBeats(masterBeats: number, slaveBeats: number, range =
 }
 
 /**
+ * Mixxx-mapped sync constants (IDEAS ONLY — original code; Mixxx is
+ * GPLv2, reference reading only, nothing copied).
+ * - Dead zone: phase errors under 1% of a beat draw no correction.
+ * - Holding authority: the holding trim caps at ±5% total.
+ * - Per-update change cap: the correction term moves at most 0.5% per
+ *   50ms tick. Mixxx caps 2 points per ~12ms audio callback; loosening
+ *   ours to 2 points per 50ms tick would reintroduce the handover
+ *   step the Oct 27 glitch fix removed, so the cap is scaled to our
+ *   tick while keeping the same role: no single update may yank tempo.
+ */
+const SYNC_DEAD_ZONE_BEATS = 0.01;
+const SYNC_HOLD_CAP = 0.05;
+const SYNC_CORR_MAX_STEP = 0.005;
+/** Time constant (seconds) for the user-offset decay back to grid phase. */
+const SYNC_USER_OFFSET_TAU = 4;
+
+/**
  * PLL correction multiplier from a phase error + integral term.
- * Proportional gain 0.25/beat with hard clamp ±3% (round 5: was 0.12).
- * What this does and doesn't do, measured on the loop equations (see
- * the round-5 report): large offsets are slew-limited by the ±3%
- * clamp in both versions (~13s from 0.8 beats either way), so the
- * retune is NOT a faster big-offset fix. What it improves is the
- * small-signal endgame: from a 49ms offset the loop settles inside
- * ±30ms in ~0.9s instead of ~1.4s, with comparable ~10ms overshoot.
- * The ±3% clamp is unchanged (audio-safe: no rate jumps), and
- * per-tick correction slew stays ≤ ~0.001, so setTargetAtTime/WSOLA
- * smoothing never sees a step. Pure.
+ * Proportional gain 0.25/beat, hard clamp ±5% (Mixxx-mapped holding
+ * authority; was ±3%). The gain itself is deliberately unchanged:
+ * the round-5 measurement showed 0.25 settles the small-signal
+ * endgame cleanly, and retuning gain is a listen-test decision, not
+ * a structural one. Per-tick correction slew stays ≤ ~0.001 via
+ * slewSyncCorr, so setTargetAtTime/WSOLA smoothing never sees a step.
+ * Pure.
  */
 export function pllCorrection(errBeats: number, integral: number): number {
-  return clamp(1 - errBeats * 0.25 - integral, 0.97, 1.03);
+  return clamp(1 - errBeats * 0.25 - integral, 1 - SYNC_HOLD_CAP, 1 + SYNC_HOLD_CAP);
 }
 
 /**
  * Catch-up slew correction for an immediate sync launch (see
- * playQuantized): a stronger proportional term than the holding PLL,
+ * playQuantized): a stronger proportional term than the holding trim,
  * so a phase error left by starting exactly where the DJ pressed
  * converges fast instead of lingering for many seconds. Gain
- * 0.5/beat with a hard ±8% cap — the same order as the manual jog
- * bend (±6%) and hold-to-bend (±5%), so the worklet never sees a
- * bigger step than a DJ nudge. Convergence: at the cap, phase closes
- * at 0.08 beats per master beat, so a typical press-timing error
- * (≤0.25 beats) is gone in about a bar; the proportional gain then
- * tails the correction smoothly to 1 as the error vanishes, so
- * handing back to the holding PLL is stepless. A full-bar error
- * (2 beats wrapped) takes as long as the cap allows — deliberately
- * never a position jump. Pure — extracted for reasoning/tests.
+ * 0.5/beat with a hard ±8% cap. The ±8% is a LAUNCH-ONLY transient
+ * (it disarms at the lock window or deadline) and deliberately
+ * exceeds the ±5% holding authority: the holding trim, not the
+ * launch slew, is what Mixxx's ±5% cap maps to. Convergence: at the
+ * cap, phase closes at 0.08 beats per master beat, so a typical
+ * press-timing error (≤0.25 beats) is gone in about a bar; the
+ * proportional gain then tails the correction smoothly to 1 as the
+ * error vanishes, so handing back to the holding trim is stepless.
+ * A full-bar error (2 beats wrapped) takes as long as the cap
+ * allows — deliberately never a position jump. Pure — extracted
+ * for reasoning/tests.
  */
 export function catchupCorrection(errBeats: number): number {
   return clamp(1 - errBeats * 0.5, 0.92, 1.08);
@@ -798,7 +824,7 @@ export class DJEngine {
       buffer: null,
       grid: null,
       posBase: 0, posBaseTime: ctx.currentTime, posRate: 1, pendingStartAt: null,
-      userTempo: 1, syncBaseTempo: 1, syncCorr: 1, syncInt: 0, syncFollowSm: 1, syncLockStreak: 0, catchupUntil: 0, nudge: 0, nudgeDeadline: 0,
+      userTempo: 1, syncBaseTempo: 1, syncCorr: 1, syncInt: 0, syncFollowSm: 1, syncLockStreak: 0, catchupUntil: 0, syncUserOffset: 0, syncNudgeActive: false, nudge: 0, nudgeDeadline: 0,
       keyLock: true,
       syncOn: false,
       loopStart: null, loopEnd: null,
@@ -1004,6 +1030,64 @@ export class DJEngine {
     debugLog('param', 'keyLock', id, { on });
   }
 
+  /**
+   * Time (seconds) of fractional beat count `beats` on this deck's
+   * grid — the inverse of beatsAtPosition, with matching head/tail
+   * extrapolation. Returns null without a usable grid.
+   */
+  private timeAtBeats(d: DeckNodes, beats: number): number | null {
+    const g = d.grid;
+    if (!g || g.bpm <= 0) return null;
+    if (g.beats.length >= 2) {
+      const hi = g.beats.length - 1;
+      if (beats <= 0) return g.beats[0] + beats * (60 / g.bpm);
+      if (beats >= hi) return g.beats[hi] + (beats - hi) * (60 / (g.bpmCurve[hi - 1] ?? g.bpm));
+      const i0 = Math.floor(beats);
+      const interval = g.beats[i0 + 1] - g.beats[i0];
+      const spb = interval > 0 ? interval : 60 / (g.bpmCurve[i0] ?? g.bpm);
+      return g.beats[i0] + (beats - i0) * spb;
+    }
+    const off = g.downbeatOffset >= 0 ? g.downbeatOffset : g.firstBeat;
+    return off + beats * (60 / g.bpm);
+  }
+
+  /**
+   * One-time phase snap (Mixxx-mapped idea, original code): seek the
+   * follower ONCE to the bar-phase-aligned position nearest its
+   * current position, then let the holding trim take over — the
+   * playhead is never nudged continuously afterward. Runs only
+   * when the deck is already playing against a playing master, with
+   * no active loop and a true error outside the ±30ms lock window;
+   * inside the window there is nothing worth jumping for. Never
+   * called from Play/CUE paths: launches keep the immediate-start
+   * + slew contract, and CUE keeps its bar wait.
+   */
+  private snapPhaseToMaster(d: DeckNodes): boolean {
+    if (!d.source || d.pendingStartAt !== null) return false;
+    if (d.loopStart !== null || d.loopEnd !== null) return false;
+    const mBeats = this.masterBeats();
+    const mBpm = this.masterEffectiveBpm();
+    if (mBeats === null || !mBpm || !d.grid || d.grid.bpm <= 0 || !d.buffer) return false;
+    const sBeats = this.beatsAtPosition(d, this.position(d.id));
+    const errRaw = phaseErrorBeats(mBeats, sBeats, 4);
+    const errMs = (errRaw * 60) / mBpm * 1000;
+    if (Math.abs(errMs) <= 30) return false;
+    const k = Math.round((sBeats - mBeats) / 4);
+    const target = this.timeAtBeats(d, mBeats + 4 * k);
+    if (target === null || !isFinite(target)) return false;
+    const clamped = clamp(target, 0, d.buffer.duration);
+    // Skip no-op snaps and snaps that would park the deck at the
+    // very end of the track.
+    if (Math.abs(clamped - this.position(d.id)) < 0.005) return false;
+    if (clamped >= d.buffer.duration - 0.05) return false;
+    this.seek(d.id, clamped);
+    d.syncInt = 0;
+    d.syncUserOffset = 0;
+    d.syncNudgeActive = false;
+    debugLog('transport', 'phase snap on sync engage', d.id, { errMs: Math.round(errMs), to: clamped });
+    return true;
+  }
+
   setSync(id: string, on: boolean): void {
     const d = this.decks.get(id);
     if (!d) return;
@@ -1023,13 +1107,21 @@ export class DJEngine {
       d.syncLockStreak = 0;
       d.syncCorr = 1;
       d.syncInt = 0;
+      d.syncUserOffset = 0;
+      d.syncNudgeActive = false;
       d.catchupUntil = 0;
+      // One-time phase snap when already playing against a playing
+      // master (see snapPhaseToMaster). Paused decks skip it: the
+      // launch path owns their phase. seek() re-applies tempo.
+      this.snapPhaseToMaster(d);
       this.applyTempo(d);
     } else {
       // Release: keep current effective tempo as the user tempo
       d.userTempo = clamp(this.effectiveTempo(d), 0.5, 2);
       d.syncCorr = 1;
       d.syncInt = 0;
+      d.syncUserOffset = 0;
+      d.syncNudgeActive = false;
       d.syncLockStreak = 0;
       d.catchupUntil = 0;
       this.applyTempo(d);
@@ -1048,7 +1140,12 @@ export class DJEngine {
     return this.decks.get(id)?.userTempo ?? 1;
   }
 
-  /** Master BPM including the master deck's tempo. 0 if no master. */
+  /** Master BPM including the master deck's tempo. 0 if no master.
+   *  This is the follower's tempo target and it is INSTANTANEOUS: the
+   *  grid BPM times the master's actual playback speed, including
+   *  user-tempo, bends (nudge), and any sync correction — not the
+   *  file's nominal BPM. Followers therefore track bends and
+   *  scratches on the leader instead of chasing a stale target. */
   masterEffectiveBpm(): number {
     if (!this.masterDeckId) return 0;
     const d = this.decks.get(this.masterDeckId);
@@ -1184,34 +1281,39 @@ export class DJEngine {
   }
 
   /**
-   * Continuous sync: phase-locked loop. Every 50ms, for each synced slave,
-   * tempo-follow the master and apply a proportional + integral correction
-   * toward zero bar-phase error. This is what keeps decks from drifting
-   * apart. Phase 5: applyTempo is now called whenever EITHER the follow
-   * tempo or the correction changed (previously a follow-only change never
-   * reached the audio rate), and the P-gain is a true proportional band.
-   * EDM retune: 50ms tick (was 100ms), deadband so sub-2.5ms error never
-   * churns the tempo, and a faster integral so steady-state offset dies
-   * instead of lingering. Launch quantization (playQuantized) does the
-   * big phase jumps at start time; this PLL only has to HOLD the lock.
-   * Round 5: the tempo-follow ratio is smoothed with a 2s glide (raw
-   * per-section BPM steps on walked grids used to yank the rate by
-   * tens of percent and the PLL could never hold phase against that),
-   * the integral clamp is 1% with a 2%/s slew limit, and the LOCKED
+   * Continuous sync (Mixxx-mapped design, original code). Every 50ms
+   * (~2205 samples at 44.1kHz — already coarser than the 512–1024
+   * sample cadence, so the correction cadence itself needed no
+   * change; the per-quantum work is throttled worklet-side in the
+   * grain-rate latch), for each synced slave: tempo-follow the
+   * master's INSTANTANEOUS speed (masterEffectiveBpm includes bends)
+   * and trim the rate with a proportional controller toward zero
+   * phase error. Phase is fixed exactly once, by a seek on sync
+   * engage (see snapPhaseToMaster); this tick never moves the
+   * playhead, it only trims rate. Dead zone 1% of a beat; holding
+   * authority ±5%; per-tick correction change capped; while the DJ
+   * bends, correction freezes and the bend folds into a decaying
+   * user offset. Launch quantization (playQuantized) does the big
+   * phase work at start time via the immediate-start + catch-up
+   * slew; this trim only has to HOLD the lock. Round 5: the
+   * tempo-follow ratio is smoothed with a 2s glide (raw per-section
+   * BPM steps on walked grids used to yank the rate by tens of
+   * percent and the trim could never hold phase against that), the
+   * integral clamp is 1% with a 2%/s slew limit, and the LOCKED
    * claim moved to syncStatus as a sustained + grid-trusted criterion.
    */
   /**
-   * Move a deck's sync correction toward a target by at most 0.5% per
-   * 50ms tick (10%/s), with the 0.02% no-op deadband. EVERY syncCorr
-   * change goes through here — the catch-up slew and the holding PLL
-   * alike. A direct assignment (the old PLL branch) steps the tempo in
-   * one tick: at catch-up handover that is a ~1.5% instant jump, and
-   * on a section-boundary error step it can be larger. Rate-limiting
-   * keeps the worklet's tempo trajectory continuous, so convergence
-   * and handover are click-free. Returns whether syncCorr changed.
+   * Move a deck's sync correction toward a target by at most
+   * SYNC_CORR_MAX_STEP per 50ms tick, with the 0.02% no-op deadband.
+   * EVERY syncCorr change goes through here — the catch-up slew and
+   * the holding trim alike. This is the per-update change cap: a
+   * direct assignment steps the tempo in one tick (at catch-up
+   * handover that was a ~1.5% instant jump). Rate-limiting keeps
+   * the worklet's tempo trajectory continuous, so convergence and
+   * handover are click-free. Returns whether syncCorr changed.
    */
   private slewSyncCorr(d: DeckNodes, target: number): boolean {
-    const next = d.syncCorr + clamp(target - d.syncCorr, -0.005, 0.005);
+    const next = d.syncCorr + clamp(target - d.syncCorr, -SYNC_CORR_MAX_STEP, SYNC_CORR_MAX_STEP);
     if (Math.abs(next - d.syncCorr) > 0.0002) {
       d.syncCorr = next;
       return true;
@@ -1266,18 +1368,45 @@ export class DJEngine {
       }
       // Phase correction from the beat counters (map-aware on both sides).
       // Bar-range wrap: being a whole bar ahead is alignment, not error.
+      // The position is NEVER nudged here: after the one-time snap on
+      // sync engage (see snapPhaseToMaster) only the tempo is trimmed.
       const sBeats = this.beatsAtPosition(d, this.position(d.id));
-      const err = phaseErrorBeats(mBeats, sBeats, 4); // + = slave ahead
-      const errMs = (err * 60) / mBpm * 1000;
-      // Deadband: sub-2.5ms error counts as locked, never churns tempo.
-      const errCtl = Math.abs(err) < 0.005 ? 0 : err;
+      const errRaw = phaseErrorBeats(mBeats, sBeats, 4); // + = slave ahead
+      // The lock meter reads the TRUE error; the controller reads the
+      // error shifted by the user offset (see below).
+      const errMs = (errRaw * 60) / mBpm * 1000;
+      // User-offset absorption (Mixxx-mapped): while the DJ bends this
+      // follower, freeze phase correction entirely — tempo follow
+      // above still runs — so the loop never fights the human. When
+      // the bend ends, fold the nudged position into syncUserOffset:
+      // the controller resumes from where the human left the deck,
+      // then the offset decays back to true grid phase (~4s tau) so
+      // the return is a glide, not a yank.
+      const nudging = d.nudge !== 0;
+      let folded = false;
+      if (nudging) {
+        d.syncNudgeActive = true;
+      } else if (d.syncNudgeActive) {
+        d.syncNudgeActive = false;
+        d.syncUserOffset = errRaw;
+        d.syncInt = 0;
+        folded = true;
+      }
+      if (!nudging && !folded && d.syncUserOffset !== 0) {
+        d.syncUserOffset *= Math.exp(-0.05 / SYNC_USER_OFFSET_TAU);
+        if (Math.abs(d.syncUserOffset) < 0.001) d.syncUserOffset = 0;
+      }
+      const err = errRaw - d.syncUserOffset;
+      // Dead zone (Mixxx-mapped): errors under 1% of a beat draw no
+      // correction at all — the loop stops hunting around zero.
+      const errCtl = Math.abs(err) < SYNC_DEAD_ZONE_BEATS ? 0 : err;
       // Catch-up slew (armed by an immediate sync launch): while armed,
       // the phase error is closed with a stronger bounded correction
-      // instead of the holding PLL's ±3% — a press-timing error is gone
+      // instead of the holding trim's ±5% — a press-timing error is gone
       // in about a bar. The integral stays frozen at 0 so it cannot
       // wind up during the slew, and the proportional gain tails the
       // correction to 1 as the error vanishes, so the handover back
-      // to the holding PLL is stepless. Disarm at the lock window or
+      // to the holding trim is stepless. Disarm at the lock window or
       // at the deadline; a huge error simply converges as fast as the
       // ±8% cap allows — the playhead is never jumped.
       const catchupArmed = d.catchupUntil > 0 && now < d.catchupUntil;
@@ -1285,30 +1414,37 @@ export class DJEngine {
         d.catchupUntil = 0;
         d.syncInt = 0;
       }
-      if (d.catchupUntil > 0 && now < d.catchupUntil) {
-        const target = catchupCorrection(errCtl);
-        // Slew limit shared with the holding PLL (see slewSyncCorr):
-        // 0.5% per 50ms tick (10%/s) — full ±8% authority in 0.8s,
-        // gentle for the worklet, far inside a bar at any tempo.
-        if (this.slewSyncCorr(d, target)) changed = true;
-      } else {
-        if (d.catchupUntil > 0) d.catchupUntil = 0; // deadline passed
-        // Integral term: absorbs steady-state rate mismatch so it dies
-        // instead of lingering. Round 5: clamp widened 0.5% → 1% (with the
-        // old 0.5% clamp and P = 0.25, a 1% residual mismatch still left
-        // ~10ms standing error — (1% − 0.5%) / 0.25 = 0.02 beats ≈ 10ms
-        // at 123 BPM — and 1.5% left ~20ms; mismatches up to 1% are now
-        // fully absorbed), with the per-tick step clamped so the
-        // integral can only slew 2%/s — no audible rate jumps from the
-        // integrator itself.
-        const dInt = clamp(errCtl * 0.004, -0.001, 0.001);
-        d.syncInt = clamp(d.syncInt + dInt, -0.01, 0.01);
-        const corr = pllCorrection(errCtl, d.syncInt);
-        // Rate-limited like the slew (see slewSyncCorr): a direct
-        // assignment steps the tempo at catch-up handover and on
-        // section-boundary error jumps. The limiter only binds on
-        // sudden jumps; steady-state tracking moves far slower.
-        if (this.slewSyncCorr(d, corr)) changed = true;
+      // While the DJ is bending, no phase branch runs at all: the
+      // correction term holds its value and the integral stays frozen.
+      if (!nudging) {
+        if (d.catchupUntil > 0 && now < d.catchupUntil) {
+          const target = catchupCorrection(errCtl);
+          // Slew limit shared with the holding trim (see slewSyncCorr):
+          // 0.5% per 50ms tick (10%/s) — full ±8% authority in 0.8s,
+          // gentle for the worklet, far inside a bar at any tempo.
+          if (this.slewSyncCorr(d, target)) changed = true;
+        } else {
+          if (d.catchupUntil > 0) d.catchupUntil = 0; // deadline passed
+          if (errCtl === 0) {
+            // Inside the dead zone: steer the correction back to 1 and
+            // freeze the integral — no hunting, no wind-up on noise.
+            if (this.slewSyncCorr(d, 1)) changed = true;
+          } else {
+            // Integral term: absorbs steady-state rate mismatch so it
+            // dies instead of lingering. Clamp 1%, per-tick step
+            // clamped so the integral can only slew 2%/s — no audible
+            // rate jumps from the integrator itself. Frozen while
+            // nudging (branch skipped above) and in the dead zone.
+            const dInt = clamp(errCtl * 0.004, -0.001, 0.001);
+            d.syncInt = clamp(d.syncInt + dInt, -0.01, 0.01);
+            const corr = pllCorrection(errCtl, d.syncInt);
+            // Rate-limited like the slew (see slewSyncCorr): a direct
+            // assignment steps the tempo at catch-up handover and on
+            // section-boundary error jumps. The limiter only binds on
+            // sudden jumps; steady-state tracking moves far slower.
+            if (this.slewSyncCorr(d, corr)) changed = true;
+          }
+        }
       }
       // Lock streak (round 5): LOCKED is a sustained claim, not one
       // lucky poll. 10 consecutive ticks (500ms) inside ±30ms — the
@@ -1416,6 +1552,8 @@ export class DJEngine {
     }
     d.syncFollowSm = d.syncBaseTempo;
     d.syncInt = 0;
+    d.syncUserOffset = 0;
+    d.syncNudgeActive = false;
     // NOTE: syncCorr is deliberately NOT reset to 1 here. A relaunch
     // with a stale correction (e.g. 0.97 from a previous synced play)
     // would jump the tempo on the first applyTempo after play() — an
