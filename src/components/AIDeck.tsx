@@ -68,7 +68,7 @@ export default function AIDeck({ queue, masterBpm, masterKey, onDropLoop, isPlay
   }, [targetBpm, bars, autoQueue, backend.name]);
 
   return (
-    <div className="rounded-xl border border-violet-900/60 bg-zinc-950 p-3">
+    <div className="flex flex-1 flex-col rounded-xl border border-violet-900/60 bg-zinc-950 p-3">
       <div className="mb-2 flex flex-wrap items-center gap-3">
         <span className="flex h-7 w-7 items-center justify-center rounded bg-violet-500 font-black text-black">AI</span>
         <span className="text-sm font-bold text-violet-200">AI Channel</span>
@@ -254,7 +254,7 @@ export default function AIDeck({ queue, masterBpm, masterKey, onDropLoop, isPlay
         {masterKey && <span className="font-mono text-amber-300"> · {masterKey}</span>}
         <span className="text-zinc-600"> · drops land on the next master bar</span>
       </div>
-      <div className="flex flex-wrap gap-2">
+      <div className="flex flex-1 flex-wrap content-start gap-2">
         {qs.loops.length === 0 && !qs.generating && (
           <span className="text-xs text-zinc-600">
             {backend.isConfigured

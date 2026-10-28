@@ -630,7 +630,7 @@ const Pad = memo(function Pad({ index, state, onTrigger, onLoad, onClear, onVolu
 
   return (
     <div
-      className={`relative rounded-lg border p-1.5 select-none transition-colors ${
+      className={`relative flex h-full flex-col rounded-lg border p-1.5 select-none transition-colors ${
         editing
           ? 'bg-zinc-800 border-amber-400'
           : state.looping
@@ -1290,7 +1290,7 @@ export default function Sampler({ resolveTrack }: { resolveTrack?: SamplerTrackR
   }
 
   return (
-    <div className="border border-zinc-700 rounded-lg p-2 bg-zinc-950/60">
+    <div className="flex flex-1 flex-col border border-zinc-700 rounded-lg p-2 bg-zinc-950/60">
       <div className="flex items-center justify-between mb-2">
         <div className="flex items-center gap-3">
           <span className="text-xs font-mono text-zinc-300 tracking-widest">SAMPLER</span>
@@ -1387,7 +1387,7 @@ export default function Sampler({ resolveTrack }: { resolveTrack?: SamplerTrackR
         )}
       </div>
       <div
-        className="grid grid-cols-4 gap-1.5"
+        className="grid flex-1 auto-rows-fr grid-cols-4 gap-1.5"
         onDragOver={(e) => e.preventDefault()}
       >
         {pads.map((p, i) => (

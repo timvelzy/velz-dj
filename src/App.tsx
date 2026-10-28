@@ -3949,7 +3949,7 @@ export default function App() {
           Deck A, sampler back under Deck B. The center column is
           wider now so the 4-channel mixer (A, AI, B, sampler) fits
           in one row. */}
-      <main className="grid items-start gap-3 p-3 lg:grid-cols-[1fr_460px_1fr]">
+      <main className="grid items-stretch gap-3 p-3 lg:grid-cols-[1fr_460px_1fr]">
         {/* Left column: Deck A, then the AI deck underneath it. */}
         <div className="flex flex-col gap-3">
           <div
