@@ -65,6 +65,15 @@ class WsolaProcessor extends AudioWorkletProcessor {
   // Overlap-add accumulator (stereo), length N
   private ola: Float32Array[] = [new Float32Array(N), new Float32Array(N)];
 
+  // COLA weight accumulator (channel-independent: the window is the
+  // same for both channels). olaW[i] holds the sum of the Hann window
+  // weights contributed to ola[*][i] so far. At 75% overlap the
+  // steady-state sum is 2.0; dividing each emitted sample by its
+  // accumulated weight keeps stretched output at unity gain instead
+  // of running 2x hot (measured: stretched sine RMS 0.6073 vs bypass
+  // 0.3041). Shifted alongside ola; reset wherever ola is reset.
+  private olaW = new Float32Array(N);
+
   // Output FIFO (stereo)
   private outFifo: Float32Array[] = [new Float32Array(4096), new Float32Array(4096)];
   private outCount = 0; // valid samples in fifo (from index 0)
@@ -152,6 +161,7 @@ class WsolaProcessor extends AudioWorkletProcessor {
         this.lastA = -1;
         this.ola[0].fill(0);
         this.ola[1].fill(0);
+        this.olaW.fill(0);
         this.resyncCount++;
         this.report('wsola-resync', { count: this.resyncCount });
         return false;
@@ -189,16 +199,22 @@ class WsolaProcessor extends AudioWorkletProcessor {
       }
     }
 
-    // Overlap-add the windowed grain
+    // Overlap-add the windowed grain, accumulating the window weight
+    // in parallel so the emit below can normalize (COLA).
     for (let ch = 0; ch < this.channels; ch++) {
       const ola = this.ola[ch];
       for (let i = 0; i < N; i++) {
         ola[i] += this.readRing(ch, aStar + i) * WIN[i];
       }
     }
+    for (let i = 0; i < N; i++) this.olaW[i] += WIN[i];
     this.lastA = aStar;
 
-    // Emit HS samples into the output FIFO
+    // Emit HS samples into the output FIFO, normalized by the
+    // accumulated window weight at each sample. Where the weight sum
+    // is below epsilon (grain edge / cold start) fall back to the
+    // steady-state COLA constant 2.0 so the sample stays finite and
+    // near silence instead of blowing up.
     const need = this.outCount + HS;
     if (need > this.outFifo[0].length) {
       // grow fifo (shouldn't happen in steady state)
@@ -209,16 +225,23 @@ class WsolaProcessor extends AudioWorkletProcessor {
       }
     }
     for (let ch = 0; ch < this.channels; ch++) {
-      this.outFifo[ch].set(this.ola[ch].subarray(0, HS), this.outCount);
+      const fifo = this.outFifo[ch];
+      const ola = this.ola[ch];
+      for (let i = 0; i < HS; i++) {
+        const w = this.olaW[i];
+        fifo[this.outCount + i] = w > 1e-6 ? ola[i] / w : ola[i] / 2.0;
+      }
     }
     this.outCount += HS;
 
-    // Shift ola left by Hs, zero the tail
+    // Shift ola and the weight accumulator left by Hs, zero the tail
     for (let ch = 0; ch < this.channels; ch++) {
       const ola = this.ola[ch];
       ola.copyWithin(0, HS);
       ola.fill(0, N - HS, N);
     }
+    this.olaW.copyWithin(0, HS);
+    this.olaW.fill(0, N - HS, N);
     return true;
   }
 
@@ -235,6 +258,7 @@ class WsolaProcessor extends AudioWorkletProcessor {
       this.lastA = -1;
       this.ola[0].fill(0);
       this.ola[1].fill(0);
+      this.olaW.fill(0);
       this.outCount = 0;
       this.errorCount++;
       this.report('wsola-error', { count: this.errorCount, message: String(err) });
@@ -312,6 +336,7 @@ class WsolaProcessor extends AudioWorkletProcessor {
       this.lastA = -1;
       this.ola[0].fill(0);
       this.ola[1].fill(0);
+      this.olaW.fill(0);
       this.outCount = 0;
       return true;
     }
@@ -348,6 +373,7 @@ class WsolaProcessor extends AudioWorkletProcessor {
       this.lastA = -1;
       this.ola[0].fill(0);
       this.ola[1].fill(0);
+      this.olaW.fill(0);
       this.outCount = 0;
       return true;
     }
