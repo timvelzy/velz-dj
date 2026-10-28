@@ -133,3 +133,48 @@ intro instead of skipping it), sampler behavior, autopilot, FX strip.
    artifacts. If any click remains, note whether it is at the press,
    during convergence, or steady-state — that discriminates the
    remaining cause.
+
+## Mixxx-style rework (proposal branch `sync/mixxx-style`, 2026-10-28, NOT merged)
+
+Tim approved studying Mixxx (GPLv2 — ideas only, no code copied) after
+hearing small fluctuations in synced playback. The holding loop was
+reworked to the Mixxx shape; the launch path above is unchanged:
+
+1. **One-time phase snap on sync engage.** `setSync(true)` on a deck
+   that is already playing against a playing master seeks ONCE to the
+   nearest bar-phase-aligned position (`snapPhaseToMaster`, inverse
+   of the beat counter via `timeAtBeats`). Skipped when paused, when
+   a loop is active, when a launch is queued, and inside the ±30ms
+   lock window. After the snap, syncTick never moves the playhead.
+2. **Dead zone 1% of a beat.** Errors under 0.01 beats draw no
+   correction and freeze the integral (was a 0.005-beat deadband
+   with the integral still able to hold a standing correction).
+3. **Holding authority ±5%.** `pllCorrection` clamp widened from ±3%.
+   P-gain 0.25 deliberately unchanged (measured behavior; retune is
+   a listen-test decision). The ±8% catch-up slew is launch-only
+   and unchanged.
+4. **Per-update change cap, named.** `slewSyncCorr` still moves at
+   most 0.5% per 50ms tick — scaled to our tick, not Mixxx's 2
+   points per ~12ms callback, to keep the verified click-free
+   handover from the glitch fix.
+5. **User-offset absorption.** While a nudge bends a synced follower,
+   phase correction freezes; when the bend ends, the nudged position
+   folds into `syncUserOffset` and decays back to grid phase (~4s
+   tau) instead of the loop fighting the human.
+6. **Instantaneous leader speed.** Already wired: `masterEffectiveBpm`
+   is grid BPM × the master's actual playback speed (tempo, bends,
+   correction), and `masterBeats` integrates the position at the live
+   rate. No change needed; documented.
+7. **Grain-rate latch (worklet).** The WSOLA grain advance is held
+   constant across 512-sample windows, moving at most 2% per
+   window. Bypass hysteresis still reads the smooth tempo. Trade-off:
+   large fader jumps now arrive over ~175ms instead of ~30ms.
+8. **Cadence.** The 50ms engine tick is ~2205 samples at 44.1kHz,
+   already coarser than 512–1024 samples, so it was left alone.
+
+Unchanged: center playhead, loops, CUE/QTZ semantics, sampler, AI
+channel, MIDI/S8, key handling (Camelot only), DEMO/AI labels.
+Listen-test additions for this branch: sync-engage snap (SYNC on
+mid-play, off-phase — one clean jump, then steady), nudge-while-
+synced (bend, release — holds, then glides back, no fight), dead
+zone (locked decks stay quiet — no flutter at ~0 error).
